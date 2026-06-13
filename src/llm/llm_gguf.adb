@@ -1,0 +1,388 @@
+---------------------------------------------------------------------
+-- LLM_GGUF body — GGUF v3 parser with POSIX I/O
+---------------------------------------------------------------------
+
+with Ada.Strings.Unbounded;
+with Ada.Text_IO;
+
+package body LLM_GGUF is
+
+   use Ada.Strings.Unbounded;
+
+   --------------------------------------------------------------------
+   -- POSIX I/O imports (thin bindings to libSystem)
+   --------------------------------------------------------------------
+   type C_Int is new Integer;
+   type C_Size is mod 2**64;
+   type C_Off is new Long_Long_Integer;
+
+   function C_Open  (Path : String; Flags : C_Int; Mode : C_Int) return C_Int
+     with Import, Convention => C, External_Name => "open";
+   function C_Read  (FD : C_Int; Buf : System.Address; Count : C_Size) return C_Int
+     with Import, Convention => C, External_Name => "read";
+   function C_LSeek (FD : C_Int; Offset : C_Off; Whence : C_Int) return C_Off
+     with Import, Convention => C, External_Name => "lseek";
+   function C_Close (FD : C_Int) return C_Int
+     with Import, Convention => C, External_Name => "close";
+
+   O_RDONLY : constant C_Int := 0;
+   SEEK_SET : constant C_Int := 0;
+   SEEK_CUR : constant C_Int := 1;
+
+   --------------------------------------------------------------------
+   -- Binary reader helpers
+   --------------------------------------------------------------------
+
+   subtype Byte_Array is String (1 .. 8);
+   Buf : Byte_Array;  -- reusable 8-byte buffer
+
+   procedure Read_Exact (FD : C_Int; Addr : System.Address; Count : Natural) is
+      N : C_Int;
+   begin
+      N := C_Read (FD, Addr, C_Size (Count));
+      if N /= C_Int (Count) then
+         raise Constraint_Error with "Short read from GGUF file";
+      end if;
+   end Read_Exact;
+
+   function Read_U32 (FD : C_Int) return U32 is
+      V : U32 := 0;
+   begin
+      Read_Exact (FD, V'Address, 4);
+      return V;
+   end Read_U32;
+
+   function Read_U64 (FD : C_Int) return U64 is
+      V : U64 := 0;
+   begin
+      Read_Exact (FD, V'Address, 8);
+      return V;
+   end Read_U64;
+
+   function Read_F32 (FD : C_Int) return Float is
+      V : Float := 0.0;
+   begin
+      Read_Exact (FD, V'Address, 4);
+      return V;
+   end Read_F32;
+
+   function Read_Bool (FD : C_Int) return Boolean is
+      V : U32;
+   begin
+      V := Read_U32 (FD);
+      return V /= 0;
+   end Read_Bool;
+
+   function Read_String (FD : C_Int) return String is
+      Len : constant U64 := Read_U64 (FD);
+      S   : String (1 .. Natural (Len));
+   begin
+      if Len > 0 then
+         Read_Exact (FD, S'Address, Natural (Len));
+      end if;
+      return S;
+   end Read_String;
+
+   --------------------------------------------------------------------
+   -- Metadata value types
+   --------------------------------------------------------------------
+
+   type GGUF_Value_Type is
+     (GGUF_TYPE_U8,    -- 0
+      GGUF_TYPE_I8,    -- 1
+      GGUF_TYPE_U16,   -- 2
+      GGUF_TYPE_I16,   -- 3
+      GGUF_TYPE_U32,   -- 4
+      GGUF_TYPE_I32,   -- 5
+      GGUF_TYPE_F32,   -- 6
+      GGUF_TYPE_BOOL,  -- 7
+      GGUF_TYPE_STR,   -- 8
+      GGUF_TYPE_ARR,   -- 9
+      GGUF_TYPE_U64,   -- 10
+      GGUF_TYPE_I64);  -- 11
+
+   function Read_Metadata_Value (FD : C_Int; VT : GGUF_Value_Type) return String is
+      V_Str : Unbounded_String;
+   begin
+      case VT is
+         when GGUF_TYPE_U8   => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U32 (FD))));
+         when GGUF_TYPE_I8   => V_Str := To_Unbounded_String (Integer'Image (Integer (Read_U32 (FD))));
+         when GGUF_TYPE_U16  => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U32 (FD))));
+         when GGUF_TYPE_I16  => V_Str := To_Unbounded_String (Integer'Image (Integer (Read_U32 (FD))));
+         when GGUF_TYPE_U32  => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U32 (FD))));
+         when GGUF_TYPE_I32  => V_Str := To_Unbounded_String (Integer'Image (Integer (Read_U32 (FD))));
+         when GGUF_TYPE_F32  => V_Str := To_Unbounded_String (Float'Image (Read_F32 (FD)));
+         when GGUF_TYPE_BOOL => V_Str := To_Unbounded_String (Boolean'Image (Read_Bool (FD)));
+         when GGUF_TYPE_STR  => V_Str := To_Unbounded_String (Read_String (FD));
+         when GGUF_TYPE_U64  => V_Str := To_Unbounded_String (U64'Image (Read_U64 (FD)));
+         when GGUF_TYPE_I64  =>
+            declare
+               V : U64 := Read_U64 (FD);
+            begin
+               V_Str := To_Unbounded_String (U64'Image (V));
+            end;
+         when GGUF_TYPE_ARR =>
+            declare
+               Arr_Type : constant GGUF_Value_Type := GGUF_Value_Type'Val (Read_U32 (FD));
+               Arr_Len  : constant U64 := Read_U64 (FD);
+            begin
+               V_Str := To_Unbounded_String ("[");
+               for I in 1 .. Natural (Arr_Len) loop
+                  if I > 1 then Append (V_Str, ", "); end if;
+                  Append (V_Str, Read_Metadata_Value (FD, Arr_Type));
+               end loop;
+               Append (V_Str, "]");
+            end;
+      end case;
+      return To_String (V_Str);
+   end Read_Metadata_Value;
+
+   --------------------------------------------------------------------
+   -- GGML type mapping
+   --------------------------------------------------------------------
+
+   function To_GGML_Type (V : U32) return GGML_Type is
+   begin
+      return GGML_Type'Val (Integer (V));
+   exception
+      when others =>
+         return GGML_TYPE_F32;
+   end To_GGML_Type;
+
+   --------------------------------------------------------------------
+   -- Open — parse the full GGUF header
+   --------------------------------------------------------------------
+
+   procedure Open (File : out GGUF_File; Path : String) is
+      FD     : C_Int;
+      Magic  : String (1 .. 4);
+      Version : U32;
+      N_Tensors : U64;
+      N_Meta    : U64;
+   begin
+      -- Open file via POSIX
+      FD := C_Open (Path, O_RDONLY, 0);
+      if FD < 0 then
+         Ada.Text_IO.Put_Line ("ERROR: cannot open " & Path);
+         return;
+      end if;
+
+      -- Read magic "GGUF"
+      Read_Exact (FD, Magic'Address, 4);
+      if Magic /= "GGUF" then
+         Ada.Text_IO.Put_Line ("ERROR: not a GGUF file");
+         declare
+            R : C_Int;
+         begin
+            R := C_Close (FD);
+         end;
+         return;
+      end if;
+
+      -- Version
+      Version := Read_U32 (FD);
+      if Version /= 2 and Version /= 3 then
+         Ada.Text_IO.Put_Line ("GGUF version" & U32'Image (Version) & " (expected v2 or v3)");
+      end if;
+
+      -- Tensor count + metadata count
+      N_Tensors := Read_U64 (FD);
+      N_Meta    := Read_U64 (FD);
+
+      File.Is_Open := True;
+      File.Path := To_Unbounded_String (Path);
+      File.Version := Version;
+      File.FD := Integer (FD);
+
+      Ada.Text_IO.Put_Line ("GGUF: version" & U32'Image (Version) &
+        ", tensors:" & U64'Image (N_Tensors) &
+        ", metadata:" & U64'Image (N_Meta));
+
+      -- Parse metadata key-value pairs
+      for I in 1 .. Natural (N_Meta) loop
+         declare
+            Key  : constant String := Read_String (FD);
+            VT_Int : constant U32   := Read_U32 (FD);
+            VT   : constant GGUF_Value_Type := GGUF_Value_Type'Val (Integer (VT_Int));
+            Val  : constant String := Read_Metadata_Value (FD, VT);
+            M    : Metadata_Entry;
+         begin
+            M.Key   := To_Unbounded_String (Key);
+            M.Value := To_Unbounded_String (Val);
+            File.Meta.Append (M);
+
+            -- Debug: print first few metadata entries
+            if I <= 5 then
+               Ada.Text_IO.Put_Line ("  meta: " & Key & " = " & Val &
+                 " (type=" & Integer'Image (Integer (VT_Int)) & ")");
+            end if;
+
+            -- Extract alignment from metadata
+            if Key = "general.alignment" then
+               File.Alignment_Val := U64'Value (Val);
+            end if;
+         end;
+      end loop;
+
+      -- Parse tensor info descriptors
+      for I in 1 .. Natural (N_Tensors) loop
+         declare
+            Info : Tensor_Info;
+            Name : constant String := Read_String (FD);
+            ND   : constant U32 := Read_U32 (FD);
+         begin
+            Info.Name := To_Unbounded_String (Name);
+            Info.N_Dims := ND;
+
+            -- Read dimension array (GGUF stores n_dims followed by that many u64 values)
+            for D in 1 .. Natural (ND) loop
+               Info.Dims (D) := Read_U64 (FD);
+            end loop;
+            -- Zero remaining dims
+            for D in Natural (ND) + 1 .. 4 loop
+               Info.Dims (D) := 0;
+            end loop;
+
+            -- Read GGML type + offset
+            Info.Kind := To_GGML_Type (Read_U32 (FD));
+            Info.Offset := Read_U64 (FD);
+
+            File.Tensors.Append (Info);
+         end;
+      end loop;
+
+      -- Remember current position as data start (though we use absolute offsets)
+      File.Data_Start := U64 (C_LSeek (FD, 0, SEEK_CUR));
+
+      Ada.Text_IO.Put_Line ("GGUF: parsed" & Integer'Image (Natural (N_Tensors)) &
+        " tensors, alignment=" & U64'Image (File.Alignment_Val));
+   end Open;
+
+   --------------------------------------------------------------------
+   -- Accessors
+   --------------------------------------------------------------------
+
+   function Is_Open (File : GGUF_File) return Boolean is
+   begin
+      return File.Is_Open;
+   end Is_Open;
+
+   function Tensor_Count (File : GGUF_File) return Natural is
+   begin
+      return Natural (File.Tensors.Length);
+   end Tensor_Count;
+
+   function Metadata_Count (File : GGUF_File) return Natural is
+   begin
+      return Natural (File.Meta.Length);
+   end Metadata_Count;
+
+   function Metadata (File : GGUF_File; Key : String) return String is
+   begin
+      for M of File.Meta loop
+         if To_String (M.Key) = Key then
+            return To_String (M.Value);
+         end if;
+      end loop;
+      return "";
+   end Metadata;
+
+   function Tensor_At (File : GGUF_File; Index : Positive) return Tensor_Info is
+   begin
+      return File.Tensors (Index);
+   end Tensor_At;
+
+   function Find_Tensor (File : GGUF_File; Name : String) return Tensor_Info is
+   begin
+      for I in 1 .. Natural (File.Tensors.Length) loop
+         if To_String (File.Tensors (I).Name) = Name then
+            return File.Tensors (I);
+         end if;
+      end loop;
+      raise Constraint_Error with "Tensor not found: " & Name;
+   end Find_Tensor;
+
+   procedure Read_Tensor_Raw
+     (File   : in out GGUF_File;
+      Info   : Tensor_Info;
+      Buffer : System.Address;
+      Buf_Size : Natural)
+   is
+      FD : constant C_Int := C_Int (File.FD);
+      Off : C_Off := C_Off (Info.Offset);
+      R : C_Off;
+   begin
+      R := C_LSeek (FD, Off, SEEK_SET);
+      Read_Exact (FD, Buffer, Buf_Size);
+   end Read_Tensor_Raw;
+
+   function Tensor_Byte_Size (Info : Tensor_Info) return U64 is
+      N_Elements : constant U64 := Tensor_Num_Elements (Info);
+   begin
+      case Info.Kind is
+         when GGML_TYPE_F32 => return N_Elements * 4;
+         when GGML_TYPE_F16 => return N_Elements * 2;
+         when GGML_TYPE_Q5_0 => return ((N_Elements + 31) / 32) * 64;
+         when GGML_TYPE_Q5_1 => return ((N_Elements + 31) / 32) * 64;
+         when GGML_TYPE_Q5_K => return (N_Elements / 256) * 304 + (N_Elements / 16) * 2;
+         when GGML_TYPE_Q8_0 => return N_Elements;
+         when others => return N_Elements * 4;
+      end case;
+   end Tensor_Byte_Size;
+
+   function Tensor_Num_Elements (Info : Tensor_Info) return U64 is
+      N : U64 := 1;
+   begin
+      for D in 1 .. Natural (Info.N_Dims) loop
+         N := N * Info.Dims (D);
+      end loop;
+      return N;
+   end Tensor_Num_Elements;
+
+   function Alignment (File : GGUF_File) return U64 is
+   begin
+      return File.Alignment_Val;
+   end Alignment;
+
+   procedure Close (File : in out GGUF_File) is
+      R : C_Int;
+   begin
+      if File.FD >= 0 then
+         R := C_Close (C_Int (File.FD));
+         File.FD := -1;
+      end if;
+      File.Is_Open := False;
+      File.Tensors.Clear;
+      File.Meta.Clear;
+   end Close;
+
+   function Is_GGUF (Path : String) return Boolean is
+      FD : C_Int;
+      Magic : String (1 .. 4);
+   begin
+      FD := C_Open (Path, O_RDONLY, 0);
+      if FD < 0 then
+         return False;
+      end if;
+      declare
+         N : C_Int;
+      begin
+         N := C_Read (FD, Magic'Address, 4);
+         if N /= 4 then
+            declare
+               R : C_Int;
+            begin
+               R := C_Close (FD);
+            end;
+            return False;
+         end if;
+      end;
+      declare
+         R : C_Int;
+      begin
+         R := C_Close (FD);
+      end;
+      return Magic = "GGUF";
+   end Is_GGUF;
+
+end LLM_GGUF;

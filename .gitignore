@@ -1,0 +1,28 @@
+# Build artifacts
+obj/
+lib/
+*.o
+*.ali
+*.stdout
+*.stderr
+
+*.log
+temp.log
+
+# Alire
+alire/
+.alire/
+
+# Models (large binary files)
+models/
+
+# Snaga local state
+.snaga/
+
+# IDE
+*.gpr.user
+*.cgpr
+
+# OS
+.DS_Store
+Thumbs.db
