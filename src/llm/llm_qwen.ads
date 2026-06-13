@@ -7,6 +7,7 @@
 
 with LLM_Tensor;
 with LLM_Qwen_Blk;
+with LLM_Tokenizer;
 
 package LLM_Qwen is
 
@@ -46,6 +47,7 @@ private
       N_Heads    : Integer;
       N_KV_Heads : Integer := 2;
       Ctx_Len    : Integer;
+      Tok        : LLM_Tokenizer.Tokenizer;
    end record;
 
    function "=" (Left, Right : Qwen_Model) return Boolean;

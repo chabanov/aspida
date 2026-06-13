@@ -15,7 +15,6 @@
 
 with LLM_Tensor;
 with LLM_GGUF;
-with Interfaces;
 
 package LLM_Dequant is
 

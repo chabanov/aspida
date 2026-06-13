@@ -2,8 +2,11 @@
 # ==================================================
 
 # ── Paths ────────────────────────────────────────────────────────────
-GNAT_BIN    := $(HOME)/.local/share/alire/toolchains/gnat_native_15.1.2_60748c54/bin
-GPRBUILD_BIN:= $(HOME)/.local/share/alire/toolchains/gprbuild_26.0.1_6bf7d80c/bin
+# Auto-detect the installed Alire toolchains (version-agnostic). Override by
+# passing GNAT_BIN=/path GPRBUILD_BIN=/path on the make command line.
+TOOLCHAINS  := $(HOME)/.local/share/alire/toolchains
+GNAT_BIN    ?= $(firstword $(wildcard $(TOOLCHAINS)/gnat_native_*/bin))
+GPRBUILD_BIN ?= $(firstword $(wildcard $(TOOLCHAINS)/gprbuild_*/bin))
 PATH        := $(GNAT_BIN):$(GPRBUILD_BIN):$(PATH)
 export PATH
 
@@ -82,6 +85,16 @@ check: build test ## Build + run tests (CI target)
 test-rmsnorm: ## Run RMSNorm unit test
 	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
 	./obj/test_rmsnorm
+
+.PHONY: test-llm
+test-llm: ## Build + run all LLM unit tests (rmsnorm, attention, moe, tokenizer, ssm)
+	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
+	./obj/test_rmsnorm
+	./obj/test_attention
+	./obj/test_moe
+	./obj/test_tokenizer
+	./obj/test_ssm
+	./obj/test_tensor
 
 .PHONY: prove
 prove: ## Run SPARK flow analysis

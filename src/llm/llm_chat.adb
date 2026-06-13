@@ -5,6 +5,7 @@
 
 with Ada.Text_IO;
 with Ada.Exceptions;
+with Ada.Environment_Variables;
 with LLM_Model;
 with LLM_Qwen;
 
@@ -25,8 +26,18 @@ package body LLM_Chat is
       Buffer : String (1 .. 4096);
       Last   : Integer;
 
-      QWEN_PATH : constant String :=
-        "/Users/ceo/.lmstudio/models/HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf";
+      -- Model path: override with the QWEN_MODEL_PATH environment variable;
+      -- otherwise fall back to the local LM Studio default.
+      function Resolve_Model_Path return String is
+         Var : constant String := "QWEN_MODEL_PATH";
+      begin
+         if Ada.Environment_Variables.Exists (Var) then
+            return Ada.Environment_Variables.Value (Var);
+         end if;
+         return "/Users/ceo/.lmstudio/models/HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf";
+      end Resolve_Model_Path;
+
+      QWEN_PATH : constant String := Resolve_Model_Path;
    begin
       -- Try Qwen 3.5 first
       begin

@@ -2,7 +2,6 @@
 -- LLM_GGUF body — GGUF v3 parser with POSIX I/O
 ---------------------------------------------------------------------
 
-with Ada.Strings.Unbounded;
 with Ada.Text_IO;
 
 package body LLM_GGUF is
@@ -29,12 +28,14 @@ package body LLM_GGUF is
    SEEK_SET : constant C_Int := 0;
    SEEK_CUR : constant C_Int := 1;
 
+   --  Explicitly discard the return code of a side-effecting POSIX call
+   --  (close/lseek) whose result we intentionally ignore.
+   procedure Ignore (Unused : C_Int)  is null;
+   procedure Ignore (Unused : C_Off)  is null;
+
    --------------------------------------------------------------------
    -- Binary reader helpers
    --------------------------------------------------------------------
-
-   subtype Byte_Array is String (1 .. 8);
-   Buf : Byte_Array;  -- reusable 8-byte buffer
 
    procedure Read_Exact (FD : C_Int; Addr : System.Address; Count : Natural) is
       N : C_Int;
@@ -117,7 +118,7 @@ package body LLM_GGUF is
          when GGUF_TYPE_U64  => V_Str := To_Unbounded_String (U64'Image (Read_U64 (FD)));
          when GGUF_TYPE_I64  =>
             declare
-               V : U64 := Read_U64 (FD);
+               V : constant U64 := Read_U64 (FD);
             begin
                V_Str := To_Unbounded_String (U64'Image (V));
             end;
@@ -171,11 +172,7 @@ package body LLM_GGUF is
       Read_Exact (FD, Magic'Address, 4);
       if Magic /= "GGUF" then
          Ada.Text_IO.Put_Line ("ERROR: not a GGUF file");
-         declare
-            R : C_Int;
-         begin
-            R := C_Close (FD);
-         end;
+         Ignore (C_Close (FD));
          return;
       end if;
 
@@ -204,22 +201,51 @@ package body LLM_GGUF is
             Key  : constant String := Read_String (FD);
             VT_Int : constant U32   := Read_U32 (FD);
             VT   : constant GGUF_Value_Type := GGUF_Value_Type'Val (Integer (VT_Int));
-            Val  : constant String := Read_Metadata_Value (FD, VT);
             M    : Metadata_Entry;
+            Val  : Unbounded_String;
          begin
+            if VT = GGUF_TYPE_ARR
+              and then (Key = "tokenizer.ggml.tokens"
+                        or else Key = "tokenizer.ggml.merges")
+            then
+               --  Capture string arrays element-by-element so token text
+               --  containing commas/brackets survives intact.
+               declare
+                  Arr_Type : constant GGUF_Value_Type :=
+                    GGUF_Value_Type'Val (Read_U32 (FD));
+                  Arr_Len  : constant U64 := Read_U64 (FD);
+               begin
+                  for J in 1 .. Natural (Arr_Len) loop
+                     declare
+                        S : constant String := Read_Metadata_Value (FD, Arr_Type);
+                     begin
+                        if Key = "tokenizer.ggml.tokens" then
+                           File.Tokens.Append (To_Unbounded_String (S));
+                        else
+                           File.Merges.Append (To_Unbounded_String (S));
+                        end if;
+                     end;
+                  end loop;
+                  Val := To_Unbounded_String
+                    ("[array:" & Natural'Image (Natural (Arr_Len)) & " ]");
+               end;
+            else
+               Val := To_Unbounded_String (Read_Metadata_Value (FD, VT));
+            end if;
+
             M.Key   := To_Unbounded_String (Key);
-            M.Value := To_Unbounded_String (Val);
+            M.Value := Val;
             File.Meta.Append (M);
 
             -- Debug: print first few metadata entries
             if I <= 5 then
-               Ada.Text_IO.Put_Line ("  meta: " & Key & " = " & Val &
+               Ada.Text_IO.Put_Line ("  meta: " & Key & " = " & To_String (Val) &
                  " (type=" & Integer'Image (Integer (VT_Int)) & ")");
             end if;
 
             -- Extract alignment from metadata
             if Key = "general.alignment" then
-               File.Alignment_Val := U64'Value (Val);
+               File.Alignment_Val := U64'Value (To_String (Val));
             end if;
          end;
       end loop;
@@ -287,6 +313,36 @@ package body LLM_GGUF is
       return "";
    end Metadata;
 
+   function Meta_Key_At (File : GGUF_File; Index : Positive) return String is
+   begin
+      return To_String (File.Meta (Index).Key);
+   end Meta_Key_At;
+
+   function Meta_Value_At (File : GGUF_File; Index : Positive) return String is
+   begin
+      return To_String (File.Meta (Index).Value);
+   end Meta_Value_At;
+
+   function Token_Count (File : GGUF_File) return Natural is
+   begin
+      return Natural (File.Tokens.Length);
+   end Token_Count;
+
+   function Token_At (File : GGUF_File; Index : Positive) return String is
+   begin
+      return To_String (File.Tokens (Index));
+   end Token_At;
+
+   function Merge_Count (File : GGUF_File) return Natural is
+   begin
+      return Natural (File.Merges.Length);
+   end Merge_Count;
+
+   function Merge_At (File : GGUF_File; Index : Positive) return String is
+   begin
+      return To_String (File.Merges (Index));
+   end Merge_At;
+
    function Tensor_At (File : GGUF_File; Index : Positive) return Tensor_Info is
    begin
       return File.Tensors (Index);
@@ -309,10 +365,9 @@ package body LLM_GGUF is
       Buf_Size : Natural)
    is
       FD : constant C_Int := C_Int (File.FD);
-      Off : C_Off := C_Off (Info.Offset);
-      R : C_Off;
+      Off : constant C_Off := C_Off (Info.Offset);
    begin
-      R := C_LSeek (FD, Off, SEEK_SET);
+      Ignore (C_LSeek (FD, Off, SEEK_SET));
       Read_Exact (FD, Buffer, Buf_Size);
    end Read_Tensor_Raw;
 
@@ -345,10 +400,9 @@ package body LLM_GGUF is
    end Alignment;
 
    procedure Close (File : in out GGUF_File) is
-      R : C_Int;
    begin
       if File.FD >= 0 then
-         R := C_Close (C_Int (File.FD));
+         Ignore (C_Close (C_Int (File.FD)));
          File.FD := -1;
       end if;
       File.Is_Open := False;
@@ -369,19 +423,11 @@ package body LLM_GGUF is
       begin
          N := C_Read (FD, Magic'Address, 4);
          if N /= 4 then
-            declare
-               R : C_Int;
-            begin
-               R := C_Close (FD);
-            end;
+            Ignore (C_Close (FD));
             return False;
          end if;
       end;
-      declare
-         R : C_Int;
-      begin
-         R := C_Close (FD);
-      end;
+      Ignore (C_Close (FD));
       return Magic = "GGUF";
    end Is_GGUF;
 

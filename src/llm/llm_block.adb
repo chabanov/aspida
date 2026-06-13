@@ -18,12 +18,12 @@ package body LLM_Block is
 
    function Forward (B : Transformer_Block; X : LLM_Autograd.Var) return LLM_Autograd.Var is
       -- Pre-norm + residual
-      Normed  : LLM_Autograd.Var := LLM_Layer.Forward (B.Attn_Norm, X);
-      Attn_Out : LLM_Autograd.Var := LLM_Attention.Forward (B.Attn, Normed);
-      X1       : LLM_Autograd.Var := X + Attn_Out;
+      Normed  : constant LLM_Autograd.Var := LLM_Layer.Forward (B.Attn_Norm, X);
+      Attn_Out : constant LLM_Autograd.Var := LLM_Attention.Forward (B.Attn, Normed);
+      X1       : constant LLM_Autograd.Var := X + Attn_Out;
 
-      Normed2 : LLM_Autograd.Var := LLM_Layer.Forward (B.MLP_Norm, X1);
-      MLP_Out : LLM_Autograd.Var := LLM_MLP.Forward (B.MLP, Normed2);
+      Normed2 : constant LLM_Autograd.Var := LLM_Layer.Forward (B.MLP_Norm, X1);
+      MLP_Out : constant LLM_Autograd.Var := LLM_MLP.Forward (B.MLP, Normed2);
    begin
       return X1 + MLP_Out;
    end Forward;

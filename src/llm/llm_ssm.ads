@@ -70,7 +70,7 @@ package LLM_SSM is
    function Forward
      (P    : SSM_Params;
       X    : LLM_Tensor.Tensor;   -- [dim] single token
-      State : in out LLM_Tensor.Tensor  -- [state_dim] hidden state (updated in-place)
+      State : in out LLM_Tensor.Tensor  -- [d_inner, d_state] state, self-sized
      ) return LLM_Tensor.Tensor;  -- [dim] output
 
    -- Reset state to zeros

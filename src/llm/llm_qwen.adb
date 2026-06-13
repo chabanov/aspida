@@ -8,13 +8,12 @@ with Ada.Strings;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Unchecked_Deallocation;
 with Ada.Exceptions;
-with System;
 with LLM_GGUF;    use LLM_GGUF;
 with LLM_Dequant; use LLM_Dequant;
 with LLM_Tensor;  use LLM_Tensor;
 with LLM_SSM;
 with LLM_MoE;
-with LLM_Qwen_Blk; use LLM_Qwen_Blk;
+with LLM_RMSNorm;
 
 package body LLM_Qwen is
 
@@ -62,15 +61,6 @@ package body LLM_Qwen is
               & Ada.Exceptions.Exception_Message (E));
             return New_Tensor ([1, 1]);
       end L;
-
-      -- Try to load optional tensor, return zero tensor if missing
-      function LO (Name : String; Default_Shape : Dims) return Tensor is
-      begin
-         return L (Name);
-      exception
-         when others =>
-            return New_Tensor (Default_Shape);
-      end LO;
 
    begin
       Ada.Text_IO.Put_Line ("Loading Qwen model from " & Path & " ...");
@@ -126,6 +116,11 @@ package body LLM_Qwen is
 
       -- Allocate block array
       M.Blocks := new Block_Array (1 .. N_Layers);
+
+      -- Persist dimensions on the model record. Without this, M.Model_Dim and
+      -- M.N_Blocks stay uninitialized and Forward/Param_Count read garbage.
+      M.Model_Dim := Dim;
+      M.N_Blocks  := N_Layers;
 
       Ada.Text_IO.Put_Line ("  dim=" & Img (Dim) & " layers=" & Img (N_Layers) &
         " heads=" & Img (M.N_Heads) & " vocab=" & Img (M.Vocab_Sz));
@@ -216,59 +211,67 @@ package body LLM_Qwen is
 
       Ada.Text_IO.Put_Line ("  DEBUG: loop finished, closing GGUF...");
 
+      -- Build the tokenizer from the GGUF vocab/merges (byte-level fallback
+      -- if the file has no tokenizer arrays).
+      M.Tok := LLM_Tokenizer.Create;
+      LLM_Tokenizer.Load_From_GGUF (M.Tok, G);
+      Ada.Text_IO.Put_Line ("  tokenizer: " &
+        Img (LLM_Tokenizer.Vocab_Size (M.Tok)) & " tokens.");
+
       Close (G);
       Ada.Text_IO.Put_Line ("  Qwen model loaded: " & Img (M.N_Blocks) & " blocks.");
       return M;
    end Load;
 
    --------------------------------------------------------------------
-   -- Forward pass (stub — to be completed)
+   -- Forward pass: token_ids [seq_len] → next-token logits [1, vocab]
    --------------------------------------------------------------------
 
    function Forward (M : Qwen_Model; Token_Ids : Tensor) return Tensor is
-      Dim : constant Integer := M.Model_Dim;
+      Dim     : constant Integer := M.Model_Dim;
       Seq_Len : constant Integer := Numel (Token_Ids);
-      H : Tensor := New_Tensor ((1, Dim));
+      H       : Tensor;
    begin
       if Seq_Len < 1 then
-         return New_Tensor ((1, M.Vocab_Sz));
+         return New_Tensor ([1, M.Vocab_Sz]);
       end if;
 
-      -- Embed tokens: average over sequence (simplified)
+      -- Build the embedding sequence [Seq_Len, Dim]: one row per token.
+      H := New_Tensor ([Seq_Len, Dim]);
       for Pos in 1 .. Seq_Len loop
          declare
-            Tid : constant Integer := Integer (Get_Flat (Token_Ids, Pos));
+            Tid : Integer := Integer (Get_Flat (Token_Ids, Pos));
          begin
-            if Tid >= 1 and Tid <= M.Vocab_Sz then
-               for D in 1 .. Dim loop
-                  Set_Flat (H, D,
-                    Get_Flat (H, D) + Get (M.Token_Emb, (Tid, D)));
-               end loop;
+            if Tid < 1 then
+               Tid := 1;
+            elsif Tid > M.Vocab_Sz then
+               Tid := M.Vocab_Sz;
             end if;
+            for D in 1 .. Dim loop
+               Set (H, [Pos, D], Get (M.Token_Emb, [Tid, D]));
+            end loop;
          end;
       end loop;
 
-      -- Average
-      declare
-         Scale : constant Float := 1.0 / Float (Seq_Len);
-      begin
-         for I in 1 .. Numel (H) loop
-            Set_Flat (H, I, Get_Flat (H, I) * Scale);
-         end loop;
-      end;
-
-      -- Pass through blocks
+      -- Run the transformer blocks over the whole sequence.
       for I in 1 .. M.N_Blocks loop
          H := LLM_Qwen_Blk.Forward (M.Blocks (I).all, H);
       end loop;
 
-      -- Final norm: element-wise multiply
-      for I in 1 .. Dim loop
-         Set_Flat (H, I, Get_Flat (H, I) * Get_Flat (M.Final_Norm, I));
-      end loop;
-
-      -- LM head: H [1, dim] @ LM_Head [dim, vocab] → [1, vocab]
-      return Matmul (H, M.LM_Head);
+      -- Final RMSNorm on the last position, then project to vocab logits.
+      declare
+         Last : Tensor := New_Tensor ([1, Dim]);
+      begin
+         for D in 1 .. Dim loop
+            Set_Flat (Last, D, Get (H, [Seq_Len, D]));
+         end loop;
+         declare
+            Normed : constant Tensor := LLM_RMSNorm.Forward (Last, M.Final_Norm);
+         begin
+            -- Normed [1, dim] @ LM_Head [dim, vocab] → [1, vocab]
+            return Matmul (Normed, M.LM_Head);
+         end;
+      end;
    end Forward;
 
    --------------------------------------------------------------------
@@ -276,89 +279,60 @@ package body LLM_Qwen is
    --------------------------------------------------------------------
 
    function Generate (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128) return String is
-      Result : String (1 .. 4096);
-      Result_Len : Integer := 0;
-      Max_Len : constant Integer := 4096;
       Ctx_Len : constant Integer := M.Ctx_Len;
-      Context : Tensor := New_Tensor ([1, 1]);
+      Ids     : constant LLM_Tokenizer.Token_Array := LLM_Tokenizer.Encode (M.Tok, Prompt);
+      Cap     : constant Integer := Integer'Max (1, Ids'Length + Max_New_Tokens);
+      Ctx     : array (1 .. Cap) of Integer := [others => 1];  -- 1-based embed rows
+      L       : Natural := 0;
+      Out_Buf : Unbounded_String := To_Unbounded_String (Prompt);
    begin
-      -- Tokenize prompt (character-level for now)
-      if Prompt'Length > 0 then
-         Context := New_Tensor ((1, Prompt'Length));
-         for I in 1 .. Prompt'Length loop
-            Set_Flat (Context, I, Float (Character'Pos (Prompt (I))));
-         end loop;
-      else
-         Context := New_Tensor ((1, 1));
-         Set_Flat (Context, 1, 0.0);
+      -- Seed the context with the prompt tokens as 1-based embedding rows
+      -- (row = id + 1, since token ids are 0-based but tensor rows are 1-based).
+      for I in Ids'Range loop
+         L := L + 1;
+         Ctx (L) := Ids (I) + 1;
+      end loop;
+      if L = 0 then
+         L := 1;
+         Ctx (1) := 1;
       end if;
 
-      -- Copy prompt to output
-      for I in Prompt'Range loop
-         Result_Len := Result_Len + 1;
-         Result (Result_Len) := Prompt (I);
-      end loop;
-
-      -- Autoregressive generation
+      -- Autoregressive generation: greedy argmax decoding.
       for Step in 1 .. Max_New_Tokens loop
-         -- Truncate context if too long
          declare
-            Ctx_Size : constant Integer := Numel (Context);
-            Use_Len : Integer := Ctx_Size;
-            Trimmed : Tensor;
+            Start   : constant Integer := Integer'Max (1, L - Ctx_Len + 1);
+            Use_Len : constant Integer := L - Start + 1;
+            Toks    : Tensor := New_Tensor ([1, Use_Len]);
          begin
-            if Use_Len > Ctx_Len then
-               Use_Len := Ctx_Len;
-               Trimmed := New_Tensor ((1, Use_Len));
-               for I in 1 .. Use_Len loop
-                  Set_Flat (Trimmed, I, Get_Flat (Context, Ctx_Size - Use_Len + I));
-               end loop;
-               Context := Trimmed;
-            end if;
-         end;
-
-         declare
-            Logits : constant Tensor := Forward (M, Context);
-            Best_Tok : Integer := 1;
-            Best_Score : Float := Float'First;
-         begin
-            -- Argmax
-            for I in 1 .. Numel (Logits) loop
-               declare
-                  Score : constant Float := Get_Flat (Logits, I);
-               begin
-                  if Score > Best_Score then
-                     Best_Score := Score;
-                     Best_Tok := I;
-                  end if;
-               end;
+            for I in 1 .. Use_Len loop
+               Set_Flat (Toks, I, Float (Ctx (Start + I - 1)));
             end loop;
 
-            -- Detokenize: ASCII printable range
-            if Best_Tok >= 32 and Best_Tok <= 126 then
-               if Result_Len < Max_Len then
-                  Result_Len := Result_Len + 1;
-                  Result (Result_Len) := Character'Val (Best_Tok);
-               end if;
-            elsif Best_Tok = 0 or Best_Tok >= M.Vocab_Sz then
-               exit;  -- EOS
-            end if;
-
-            -- Append to context
             declare
-               Old_Len : constant Integer := Numel (Context);
-               New_Ctx : Tensor := New_Tensor ((1, Old_Len + 1));
+               Logits   : constant Tensor := Forward (M, Toks);
+               Best_Row : Integer := 1;
+               Best_S   : Float := Float'First;
             begin
-               for I in 1 .. Old_Len loop
-                  Set_Flat (New_Ctx, I, Get_Flat (Context, I));
+               for I in 1 .. Numel (Logits) loop
+                  if Get_Flat (Logits, I) > Best_S then
+                     Best_S := Get_Flat (Logits, I);
+                     Best_Row := I;
+                  end if;
                end loop;
-               Set_Flat (New_Ctx, Old_Len + 1, Float (Best_Tok));
-               Context := New_Ctx;
+
+               exit when Best_Row < 1 or else Best_Row > M.Vocab_Sz;
+
+               -- Best_Row is the 1-based embedding row; token id is Best_Row - 1.
+               Append (Out_Buf, LLM_Tokenizer.Decode_One (M.Tok, Best_Row - 1));
+
+               exit when L >= Cap;
+               L := L + 1;
+               Ctx (L) := Best_Row;
             end;
          end;
       end loop;
 
-      return Result (1 .. Result_Len);
+      return To_String (Out_Buf);
    end Generate;
 
    -- Parameter count (total FP32 params after dequantization)
