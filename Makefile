@@ -96,6 +96,11 @@ test-llm: ## Build + run all LLM unit tests (rmsnorm, attention, moe, tokenizer,
 	./obj/test_ssm
 	./obj/test_tensor
 
+.PHONY: test-tokenizer-real
+test-tokenizer-real: ## Validate the tokenizer against the real GGUF vocab (needs model)
+	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
+	./obj/test_tokenizer_real
+
 .PHONY: prove
 prove: ## Run SPARK flow analysis
 	$(GNATPROVE) $(SPARK_FLAGS)
