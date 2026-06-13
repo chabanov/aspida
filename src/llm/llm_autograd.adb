@@ -21,7 +21,7 @@ package body LLM_Autograd is
    --------------------------------------------------------------------
 
    function New_Var (Data : Tensor) return Var is
-      V : Var := new Var_Rec;
+      V : constant Var := new Var_Rec;
    begin
       V.Value := new Tensor'(Copy (Data));
       V.Gradient := new Tensor'(New_Tensor (Shape (Data)));
@@ -73,6 +73,7 @@ package body LLM_Autograd is
          Into := Into + From;
       end if;
    end Accumulate;
+   pragma Unreferenced (Accumulate);
 
    procedure Backward_Rec (V : Var; Grad_Out : Tensor) is
    begin
@@ -122,7 +123,7 @@ package body LLM_Autograd is
    --------------------------------------------------------------------
 
    function Make_Op (Left, Right : Var; Op : Op_Kind) return Var is
-      V : Var := new Var_Rec;
+      V : constant Var := new Var_Rec;
    begin
       V.Op := Op;
       V.Left := Left;
@@ -131,7 +132,7 @@ package body LLM_Autograd is
    end Make_Op;
 
    function "+" (A, B : Var) return Var is
-      V : Var := Make_Op (A, B, Op_Add);
+      V : constant Var := Make_Op (A, B, Op_Add);
    begin
       V.Value := new Tensor'(A.Value.all + B.Value.all);
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -139,7 +140,7 @@ package body LLM_Autograd is
    end "+";
 
    function "-" (A, B : Var) return Var is
-      V : Var := Make_Op (A, B, Op_Sub);
+      V : constant Var := Make_Op (A, B, Op_Sub);
    begin
       V.Value := new Tensor'(A.Value.all - B.Value.all);
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -147,7 +148,7 @@ package body LLM_Autograd is
    end "-";
 
    function "*" (A, B : Var) return Var is
-      V : Var := Make_Op (A, B, Op_Mul);
+      V : constant Var := Make_Op (A, B, Op_Mul);
    begin
       V.Value := new Tensor'(A.Value.all * B.Value.all);
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -155,7 +156,7 @@ package body LLM_Autograd is
    end "*";
 
    function Matmul (A, B : Var) return Var is
-      V : Var := Make_Op (A, B, Op_Matmul);
+      V : constant Var := Make_Op (A, B, Op_Matmul);
    begin
       V.Value := new Tensor'(LLM_Tensor.Matmul (A.Value.all, B.Value.all));
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -163,7 +164,7 @@ package body LLM_Autograd is
    end Matmul;
 
    function Relu (A : Var) return Var is
-      V : Var := Make_Op (A, null, Op_Relu);
+      V : constant Var := Make_Op (A, null, Op_Relu);
    begin
       V.Value := new Tensor'(LLM_Tensor.Relu (A.Value.all));
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -171,7 +172,7 @@ package body LLM_Autograd is
    end Relu;
 
    function Gelu (A : Var) return Var is
-      V : Var := Make_Op (A, null, Op_Gelu);
+      V : constant Var := Make_Op (A, null, Op_Gelu);
    begin
       V.Value := new Tensor'(LLM_Tensor.Gelu (A.Value.all));
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -179,7 +180,7 @@ package body LLM_Autograd is
    end Gelu;
 
    function Softmax (A : Var) return Var is
-      V : Var := Make_Op (A, null, Op_Softmax);
+      V : constant Var := Make_Op (A, null, Op_Softmax);
    begin
       V.Value := new Tensor'(LLM_Tensor.Softmax (A.Value.all));
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -187,7 +188,7 @@ package body LLM_Autograd is
    end Softmax;
 
    function Layer_Norm (A : Var) return Var is
-      V : Var := Make_Op (A, null, Op_LayerNorm);
+      V : constant Var := Make_Op (A, null, Op_LayerNorm);
    begin
       V.Value := new Tensor'(LLM_Tensor.Layer_Norm (A.Value.all));
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -196,7 +197,7 @@ package body LLM_Autograd is
 
    function Sum (A : Var) return Var is
       S : constant Float := LLM_Tensor.Sum (A.Value.all);
-      V : Var := Make_Op (A, null, Op_Sum);
+      V : constant Var := Make_Op (A, null, Op_Sum);
    begin
       V.Value := new Tensor'(New_Scalar (S));
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -205,7 +206,7 @@ package body LLM_Autograd is
 
    function Mean (A : Var) return Var is
       M : constant Float := LLM_Tensor.Mean (A.Value.all);
-      V : Var := Make_Op (A, null, Op_Mean);
+      V : constant Var := Make_Op (A, null, Op_Mean);
    begin
       V.Value := new Tensor'(New_Scalar (M));
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -213,7 +214,7 @@ package body LLM_Autograd is
    end Mean;
 
    function Reshape (A : Var; New_Shape : Dims) return Var is
-      V : Var := Make_Op (A, null, Op_Reshape);
+      V : constant Var := Make_Op (A, null, Op_Reshape);
    begin
       V.Value := new Tensor'(LLM_Tensor.Reshape (A.Value.all, New_Shape));
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));
@@ -221,7 +222,7 @@ package body LLM_Autograd is
    end Reshape;
 
    function Cross_Entropy (Logits, Targets : Var) return Var is
-      V : Var := Make_Op (Logits, Targets, Op_CrossEntropy);
+      V : constant Var := Make_Op (Logits, Targets, Op_CrossEntropy);
    begin
       V.Value := new Tensor'(New_Scalar (0.0));
       V.Gradient := new Tensor'(New_Tensor (Shape (V.Value.all)));

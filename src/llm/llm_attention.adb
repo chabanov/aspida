@@ -1,5 +1,4 @@
 with LLM_Tensor;
-with LLM_Autograd;
 
 package body LLM_Attention is
    function New_Attention (Dim, N_Heads : Integer) return Attention_Layer is

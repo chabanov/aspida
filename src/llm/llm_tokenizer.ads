@@ -1,16 +1,50 @@
 ---------------------------------------------------------------------
--- LLM_Tokenizer — Simple BPE (Byte Pair Encoding) tokenizer
--- GPT-2 compatible vocabulary
+-- LLM_Tokenizer — byte-level BPE tokenizer
+--
+-- Integer-id interface (ids are integers, not characters). When loaded
+-- with a vocabulary + merge table (from GGUF) it performs greedy
+-- byte-pair encoding by merge rank; with no vocabulary it falls back to
+-- a 1-id-per-byte encoding so callers always get a usable result.
+--
+-- NOTE: real GGUF vocabularies use the GPT-2 byte->unicode remapping;
+-- mapping raw input bytes through that bijection is a remaining
+-- refinement (pieces not found in the vocab fall back to per-byte ids).
 ---------------------------------------------------------------------
+
+with LLM_GGUF;
 
 package LLM_Tokenizer is
 
-   -- Encode string → token ids (GPT-2 BPE)
-   function Encode (Text : String) return String;
-   -- Decode token ids → string
-   function Decode (Tokens : String) return String;
+   type Token_Array is array (Positive range <>) of Integer;
 
-   -- Vocab size
-   Vocab_Size : constant Integer := 50257;
+   type Tokenizer is private;
+
+   -- Empty tokenizer (byte-level fallback until a vocab is added).
+   function Create return Tokenizer;
+
+   -- Populate from a parsed GGUF file (tokenizer.ggml.tokens / .merges).
+   procedure Load_From_GGUF (T : in out Tokenizer; G : LLM_GGUF.GGUF_File);
+
+   -- Manual construction (used by tests).
+   procedure Add_Token (T : in out Tokenizer; Piece : String; Id : Integer);
+   --  Pair is the GGUF "left right" form (single space separator).
+   procedure Add_Merge (T : in out Tokenizer; Pair : String; Rank : Integer);
+   procedure Mark_Loaded (T : in out Tokenizer);
+
+   -- True once a vocabulary has been loaded (otherwise byte-level mode).
+   function Is_Loaded (T : Tokenizer) return Boolean;
+   function Vocab_Size (T : Tokenizer) return Integer;
+
+   -- Text -> token ids.
+   function Encode (T : Tokenizer; Text : String) return Token_Array;
+   -- Token ids -> text.
+   function Decode (T : Tokenizer; Ids : Token_Array) return String;
+   -- Single id -> its piece (for streaming generation).
+   function Decode_One (T : Tokenizer; Id : Integer) return String;
+
+private
+
+   type Tokenizer_Data;
+   type Tokenizer is access Tokenizer_Data;
 
 end LLM_Tokenizer;

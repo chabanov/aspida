@@ -149,7 +149,7 @@ package body LLM_Model is
       
       -- Weight tying: LM head uses transposed token embedding
       M.LM_Head.W := New_Var (Transpose (Data (M.Token_Emb.W)));
-      M.LM_Head.B := New_Var (New_Tensor ((1, Vocab)));
+      M.LM_Head.B := New_Var (New_Tensor ([1, Vocab]));
       
       return M;
    end Load_GPT2;
@@ -207,12 +207,12 @@ package body LLM_Model is
 
       -- Embedding lookup: pool all token embeddings into one vector
       -- For simplicity: average the embeddings of all input tokens
-      H : Tensor := New_Tensor ((1, Dim));
+      H : Tensor := New_Tensor ([1, Dim]);
 
       -- Sum token + position embeddings
    begin
       if Seq_Len < 1 then
-         return New_Tensor ((1, M.Config.Vocab_Size));
+         return New_Tensor ([1, M.Config.Vocab_Size]);
       end if;
 
       -- Average token embeddings
@@ -284,7 +284,7 @@ package body LLM_Model is
       Result : String (1 .. 1024);
       Result_Len : Integer := 0;
       Max_Len : constant Integer := 1024;
-      Context : Tensor := New_Tensor ((1, 1));
+      Context : Tensor := New_Tensor ([1, 1]);
    begin
       -- Copy prompt into result
       for I in Prompt'Range loop
@@ -296,12 +296,12 @@ package body LLM_Model is
 
       -- Build initial context from prompt (character-level tokenization)
       if Prompt'Length > 0 then
-         Context := New_Tensor ((1, Prompt'Length));
+         Context := New_Tensor ([1, Prompt'Length]);
          for I in 1 .. Prompt'Length loop
             Set_Flat (Context, I, Float (Character'Pos (Prompt (I))));
          end loop;
       else
-         Context := New_Tensor ((1, 1));
+         Context := New_Tensor ([1, 1]);
          Set_Flat (Context, 1, 0.0);
       end if;
 
@@ -341,7 +341,7 @@ package body LLM_Model is
             -- Append to context
             declare
                Old_Len : constant Integer := Numel (Context);
-               New_Ctx : Tensor := New_Tensor ((1, Old_Len + 1));
+               New_Ctx : Tensor := New_Tensor ([1, Old_Len + 1]);
             begin
                for I in 1 .. Old_Len loop
                   Set_Flat (New_Ctx, I, Get_Flat (Context, I));

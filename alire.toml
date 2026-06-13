@@ -2,7 +2,7 @@
 # Build: alr build
 
 name = "aspida"
-description = "Type-safe HTTP client generator from OpenAPI / custom TS DSL"
+description = "ADA/SPARK monorepo: HTTP client generator (WIP) + native Qwen GGUF LLM inference"
 version = "0.1.0-dev"
 authors = ["Aspida contributors"]
 licenses = "MIT"

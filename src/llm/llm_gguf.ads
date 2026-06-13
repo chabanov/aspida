@@ -96,6 +96,10 @@ package LLM_GGUF is
    -- Look up metadata by key. Returns empty string if not found.
    function Metadata (File : GGUF_File; Key : String) return String;
 
+   -- Iterate metadata entries by 1-based index (for dumping/inspection).
+   function Meta_Key_At   (File : GGUF_File; Index : Positive) return String;
+   function Meta_Value_At (File : GGUF_File; Index : Positive) return String;
+
    -- Get tensor descriptor by index (1-based)
    function Tensor_At (File : GGUF_File; Index : Positive) return Tensor_Info
      with Pre => Index <= Tensor_Count (File);
@@ -128,7 +132,27 @@ package LLM_GGUF is
    -- Quick helper: is this a valid GGUF file at path?
    function Is_GGUF (Path : String) return Boolean;
 
+   --------------------------------------------------------------------
+   -- Tokenizer arrays (captured structurally during Open so that token
+   -- strings containing commas/brackets are preserved, unlike the
+   -- comma-joined Metadata string form).
+   --------------------------------------------------------------------
+
+   -- Number of vocabulary tokens (tokenizer.ggml.tokens), 0 if absent.
+   function Token_Count (File : GGUF_File) return Natural;
+   -- Vocabulary token by 1-based index (id = Index - 1).
+   function Token_At (File : GGUF_File; Index : Positive) return String;
+
+   -- Number of BPE merge rules (tokenizer.ggml.merges), 0 if absent.
+   function Merge_Count (File : GGUF_File) return Natural;
+   -- Merge rule by 1-based index, in the GGUF "left right" form.
+   function Merge_At (File : GGUF_File; Index : Positive) return String;
+
 private
+
+   package Str_Vectors is new Ada.Containers.Vectors
+     (Positive, Ada.Strings.Unbounded.Unbounded_String,
+      Ada.Strings.Unbounded."=");
 
    type GGUF_File is record
       Is_Open       : Boolean := False;
@@ -136,6 +160,8 @@ private
       Version       : U32 := 0;
       Tensors       : Tensor_Info_Vectors.Vector;
       Meta          : Metadata_Vectors.Vector;
+      Tokens        : Str_Vectors.Vector;  -- tokenizer.ggml.tokens
+      Merges        : Str_Vectors.Vector;  -- tokenizer.ggml.merges
       Alignment_Val : U64 := 32;  -- default alignment
       Data_Start    : U64 := 0;   -- byte offset where tensor data begins
       FD            : Integer := -1;  -- POSIX file descriptor (via C import)

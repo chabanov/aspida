@@ -73,9 +73,9 @@ package LLM_Qwen_Blk is
       N_KV_Heads    : Integer)
       return Qwen_Block;
 
-   -- Forward pass through one block
-   -- X: input [1, dim]
-   -- Returns: output [1, dim]
+   -- Forward pass through one block over a whole sequence.
+   -- X: input [Seq_Len, dim]
+   -- Returns: output [Seq_Len, dim]
    function Forward (B : Qwen_Block; X : LLM_Tensor.Tensor) return LLM_Tensor.Tensor;
 
    -- Equality (required for Ada.Containers.Vectors)

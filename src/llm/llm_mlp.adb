@@ -13,8 +13,8 @@ package body LLM_MLP is
    end New_MLP;
 
    function Forward (M : MLP_Layer; X : LLM_Autograd.Var) return LLM_Autograd.Var is
-      H : LLM_Autograd.Var := LLM_Layer.Forward (M.FC1, X);
-      H_Act : LLM_Autograd.Var := LLM_Autograd.Gelu (H);
+      H : constant LLM_Autograd.Var := LLM_Layer.Forward (M.FC1, X);
+      H_Act : constant LLM_Autograd.Var := LLM_Autograd.Gelu (H);
    begin
       return LLM_Layer.Forward (M.FC2, H_Act);
    end Forward;

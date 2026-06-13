@@ -10,7 +10,6 @@ package body LLM_Dequant is
    use LLM_Tensor;
 
    subtype Byte is Interfaces.Unsigned_8;
-   type Byte_Array is array (Positive range <>) of Byte;
 
    --------------------------------------------------------------------
    -- F16 → F32 conversion
@@ -103,7 +102,6 @@ package body LLM_Dequant is
               Byte (Character'Pos (X (Pos))),
               Byte (Character'Pos (X (Pos + 1))));
             Scales : array (1 .. 16) of Float;
-            Mins   : array (1 .. 16) of Float;
             QS     : array (1 .. 192) of Byte;
             QH     : array (1 .. 32) of Byte;
          begin
@@ -117,21 +115,9 @@ package body LLM_Dequant is
                Pos := Pos + 2;
             end loop;
 
-            -- 16 × int8 mins (stored as bytes, treated as signed)
-            for I in 1 .. 16 loop
-               declare
-                  Raw_B : constant Byte := Byte (Character'Pos (X (Pos)));
-                  Val   : Integer;
-               begin
-                  if Raw_B > 127 then
-                     Val := Integer (Raw_B) - 256;
-                  else
-                     Val := Integer (Raw_B);
-                  end if;
-                  Mins (I) := Float (Val) * D;
-               end;
-               Pos := Pos + 1;
-            end loop;
+            -- 16 × int8 mins (stored as bytes): not used by this dequant
+            -- path, so skip over the 16-byte region without decoding.
+            Pos := Pos + 16;
 
             -- qs: 192 bytes (256 elements × 6 bit / 8 = 192)
             for I in 1 .. 192 loop
@@ -158,7 +144,7 @@ package body LLM_Dequant is
                        Shift_Left (Unsigned_32 (High_Nibble), 2));
                      QVal     : constant Integer := Low + High;
                   begin
-                     Set_Flat (Q, Q_Pos, Scales (SB) * Float (QVal - 32));
+                     Set_Flat (Q, Q_Pos, D * Scales (SB) * Float (QVal - 32));
                      Q_Pos := Q_Pos + 1;
                   end;
                end loop;
@@ -342,14 +328,13 @@ package body LLM_Dequant is
       return Tensor
    is
       N : constant Natural := Dequant_Num_Elements (Info);
-      Result : Tensor := New_Tensor ((1, N));
+      Result : Tensor := New_Tensor ([1, N]);
    begin
       case Info.Kind is
          when LLM_GGUF.GGML_TYPE_F32 =>
             -- Direct copy: each 4 bytes → 1 float
             declare
                Pos : Natural := Raw'First;
-               F   : Float;
             begin
                for I in 1 .. N loop
                   declare

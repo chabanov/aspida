@@ -3,6 +3,8 @@
 -- Pure ADA, no external dependencies. FP32 precision.
 ---------------------------------------------------------------------
 
+with Ada.Finalization;
+
 package LLM_Tensor is
 
    -- Dimension of a tensor. Always rank 1..3 for our use case.
@@ -77,8 +79,18 @@ private
 
    type Tensor_Data is access Tensor_Data_Rec;
 
+   --  Owning, value-semantics handle for the heap-allocated tensor data:
+   --  deep-copies on assignment (Adjust) and frees on scope exit (Finalize),
+   --  so tensors neither leak nor alias each other's storage.
+   type Data_Handle is new Ada.Finalization.Controlled with record
+      Ptr : Tensor_Data := null;
+   end record;
+
+   overriding procedure Adjust   (H : in out Data_Handle);
+   overriding procedure Finalize (H : in out Data_Handle);
+
    type Tensor is record
-      Data  : Tensor_Data;
+      Data  : Data_Handle;
       Shape : Dims (1 .. 4);  -- rank up to 4
       Rank  : Natural := 0;
    end record;

@@ -38,12 +38,12 @@ package body LLM_Weights is
 
    function Load_Vector (Path : String; N : Integer) return Var is
    begin
-      return Load_Tensor (Path, (1, N));
+      return Load_Tensor (Path, [1, N]);
    end Load_Vector;
 
    function Load_Matrix (Path : String; Rows, Cols : Integer) return Var is
    begin
-      return Load_Tensor (Path, (Rows, Cols));
+      return Load_Tensor (Path, [Rows, Cols]);
    end Load_Matrix;
 
 end LLM_Weights;

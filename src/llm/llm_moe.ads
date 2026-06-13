@@ -9,16 +9,18 @@
 --
 --   Final output = sum(router_weight[i] * expert[i](x)) + shared_expert(x)
 --
--- Qwen Tensor layout (3D: last dim = num_experts):
---   ffn_gate_exps.weight [dim, intermed, 256] — router gating
---   ffn_up_exps.weight   [dim, intermed, 256] — expert up-projection
---   ffn_down_exps.weight  [intermed, dim, 256] — expert down-projection
---   ffn_gate_inp.weight   [dim, 256]           — router input projection
+-- Implemented weight layout (2D, expert-major — the row-major flatten
+-- of the GGUF 3D expert tensors; see llm_moe.adb):
+--   ffn_gate_inp.weight   [n_experts, dim]            — router logits
+--   ffn_gate_exps.weight  [n_experts*intermed, dim]   — per-expert gate
+--   ffn_up_exps.weight    [n_experts*intermed, dim]   — per-expert up
+--   ffn_down_exps.weight  [n_experts*dim, intermed]   — per-expert down
 --
---   ffn_gate_shexp.weight [dim, intermed]      — shared expert gate
---   ffn_up_shexp.weight   [dim, intermed]      — shared expert up
---   ffn_down_shexp.weight  [intermed, dim]      — shared expert down
---   ffn_gate_inp_shexp.weight [dim]             — shared expert router
+--   ffn_gate_shexp.weight [intermed, dim]      — shared expert gate
+--   ffn_up_shexp.weight   [intermed, dim]      — shared expert up
+--   ffn_down_shexp.weight [dim, intermed]      — shared expert down
+--   ffn_gate_inp_shexp.weight [1, dim]         — shared expert sigmoid gate
+--                                                (optional; skipped if absent)
 ---------------------------------------------------------------------
 
 with LLM_Tensor;

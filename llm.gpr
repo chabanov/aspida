@@ -11,7 +11,9 @@ project LLM is
    for Main use ("llm_main.adb");
 
    package Compiler is
-      for Default_Switches ("Ada") use ("-gnatwa", "-gnatX", "-g");
+      --  -gnatwa: all warnings; -gnatwe: treat warnings as errors (kept clean);
+      --  -gnatX: extensions ([] aggregates); -g: debug info.
+      for Default_Switches ("Ada") use ("-gnatwa", "-gnatwe", "-gnatX", "-g");
    end Compiler;
 
    package Linker is

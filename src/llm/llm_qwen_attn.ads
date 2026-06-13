@@ -16,7 +16,6 @@
 ---------------------------------------------------------------------
 
 with LLM_Tensor;   use LLM_Tensor;
-with LLM_RMSNorm;  use LLM_RMSNorm;
 with LLM_RoPE;     use LLM_RoPE;
 
 package LLM_Qwen_Attn is
@@ -39,10 +38,11 @@ package LLM_Qwen_Attn is
       Use_Gate  : Boolean;
    end record;
 
-   -- Forward pass for a single token
-   -- X: input [1, dim]
-   -- Pos: token position
-   -- Returns: attention output [1, dim]
+   -- Forward pass over a whole sequence.
+   -- X:   input [Seq_Len, dim]
+   -- Pos: absolute position of the first row (0-based; used for RoPE)
+   -- Returns: attention output [Seq_Len, dim], computed with a causal
+   --          mask and softmax-normalised attention weights.
    function Forward (P : Qwen_Attn_Params; X : Tensor; Pos : Integer) return Tensor;
 
    -- Constructor
