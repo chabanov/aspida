@@ -1,0 +1,28 @@
+-- llm.gpr — Native LLM Chat
+--
+-- Build: gprbuild -P llm.gpr -XSDKROOT=$(xcrun --show-sdk-path)
+-- Run:   ./obj/llm_main [dim] [layers]
+
+project LLM is
+
+   for Source_Dirs use ("src", "src/llm");
+   for Object_Dir use "obj";
+   for Exec_Dir use "obj";
+   for Main use ("llm_main.adb");
+
+   package Compiler is
+      for Default_Switches ("Ada") use ("-gnatwa", "-gnatX", "-g");
+   end Compiler;
+
+   package Linker is
+      for Default_Switches ("Ada") use
+        ("-L" & external ("SDKROOT", "") & "/usr/lib",
+         "-Wl,-syslibroot," & external ("SDKROOT", ""),
+         "-Wl,-framework,Accelerate");
+   end Linker;
+
+   package Binder is
+      for Default_Switches ("Ada") use ("-E");
+   end Binder;
+
+end LLM;

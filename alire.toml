@@ -1,0 +1,17 @@
+# Alire package manifest for Aspida
+# Build: alr build
+
+name = "aspida"
+description = "Type-safe HTTP client generator from OpenAPI / custom TS DSL"
+version = "0.1.0-dev"
+authors = ["Aspida contributors"]
+licenses = "MIT"
+maintainers = ["aspida@example.com"]
+website = "https://github.com/aspida/aspida"
+
+[[depends-on]]
+gnat = ">=12"
+
+[configuration]
+disabled = false
+output_dir = "lib"

@@ -1,0 +1,26 @@
+-- aspida_tests.gpr — Aspida Test Suite
+--
+-- Build: gprbuild -P tests/aspida_tests.gpr -XSDKROOT=$(xcrun --show-sdk-path)
+
+project Aspida_Tests is
+
+   for Source_Dirs use ("../src", "../src/llm", ".");
+   for Object_Dir use "../obj/tests";
+   for Exec_Dir use "../obj";
+   for Main use ("test_runner.adb");
+
+   package Compiler is
+      for Default_Switches ("Ada") use ("-gnatwa", "-gnatwe");
+   end Compiler;
+
+   package Linker is
+      for Default_Switches ("Ada") use
+        ("-L" & external ("SDKROOT", "") & "/usr/lib",
+         "-Wl,-syslibroot," & external ("SDKROOT", ""));
+   end Linker;
+
+   package Binder is
+      for Default_Switches ("Ada") use ("-E");
+   end Binder;
+
+end Aspida_Tests;

@@ -1,0 +1,32 @@
+-- aspida.gpr — GNAT Project File for Aspida HTTP Client Generator
+-- Targets: native (macOS aarch64), with SPARK_Mode => On for verification
+
+project Aspida is
+
+   for Source_Dirs use ("src", "src/llm");
+   for Object_Dir use "obj";
+   for Main use ("main.adb");
+
+   -- Build modes — use scenario variable BUILD (e.g. gprbuild -XBUILD=spark)
+   type Build_Kind is ("debug", "release", "coverage", "spark");
+   Build_Mode : Build_Kind := external ("BUILD", "debug");
+
+   package Compiler is
+      for Default_Switches ("Ada") use ("-gnatwa", "-gnatwe");
+   end Compiler;
+
+   package Linker is
+      for Default_Switches ("Ada") use
+        ("-L" & external ("SDKROOT", "") & "/usr/lib",
+         "-Wl,-syslibroot," & external ("SDKROOT", ""));
+   end Linker;
+
+   package Builder is
+      for Default_Switches ("Ada") use ("-j" & external ("JOBS", "0"));
+   end Builder;
+
+   package Binder is
+      for Default_Switches ("Ada") use ("-E");
+   end Binder;
+
+end Aspida;
