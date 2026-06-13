@@ -1,5 +1,11 @@
 ---------------------------------------------------------------------
--- LLM_Tokenizer body — byte-level BPE (greedy merge by rank)
+-- LLM_Tokenizer body — GPT-2 byte-level BPE (greedy merge by rank)
+--
+-- Byte-level mode (GGUF tokenizer.ggml.model = "gpt2") maps each input
+-- byte through the GPT-2 byte->unicode bijection (e.g. space -> U+0120
+-- "Ġ") before BPE, and inverts it on decode, so raw bytes match the
+-- UTF-8 vocab pieces. Without a vocab the tokenizer is a 1-id-per-byte
+-- fallback.
 ---------------------------------------------------------------------
 
 with Ada.Containers.Indefinite_Ordered_Maps;
@@ -16,11 +22,74 @@ package body LLM_Tokenizer is
      (Key_Type => Integer, Element_Type => String);
 
    type Tokenizer_Data is record
-      Vocab  : Str_Int_Maps.Map;   -- piece -> id
-      Id2Tok : Int_Str_Maps.Map;   -- id -> piece
-      Merges : Str_Int_Maps.Map;   -- "left<NUL>right" -> rank
-      Loaded : Boolean := False;
+      Vocab      : Str_Int_Maps.Map;   -- piece -> id
+      Id2Tok     : Int_Str_Maps.Map;   -- id -> piece
+      Merges     : Str_Int_Maps.Map;   -- "left<NUL>right" -> rank
+      Loaded     : Boolean := False;
+      Byte_Level : Boolean := False;   -- GPT-2 byte->unicode remap
    end record;
+
+   --------------------------------------------------------------------
+   -- GPT-2 byte <-> unicode bijection (computed once at elaboration)
+   --------------------------------------------------------------------
+
+   Byte_CP : array (0 .. 255) of Natural;          -- byte -> code point
+   CP_Byte : array (0 .. 511) of Integer := [others => -1];  -- code point -> byte
+
+   function Is_Printable (B : Natural) return Boolean is
+   begin
+      return B in 33 .. 126 or else B in 161 .. 172 or else B in 174 .. 255;
+   end Is_Printable;
+
+   --  UTF-8 encode a code point (<= 0x7FF here, so 1 or 2 bytes).
+   function CP_UTF8 (CP : Natural) return String is
+   begin
+      if CP < 16#80# then
+         return R : String (1 .. 1) do
+            R (1) := Character'Val (CP);
+         end return;
+      else
+         return R : String (1 .. 2) do
+            R (1) := Character'Val (16#C0# + CP / 16#40#);
+            R (2) := Character'Val (16#80# + CP mod 16#40#);
+         end return;
+      end if;
+   end CP_UTF8;
+
+   --  Map one input byte to its GPT-2 unicode UTF-8 piece.
+   function Byte_To_Piece (B : Natural) return String is
+   begin
+      return CP_UTF8 (Byte_CP (B));
+   end Byte_To_Piece;
+
+   --  Invert: a UTF-8 string of GPT-2 code points -> original bytes.
+   function Unmap_Bytes (S : String) return String is
+      R : Unbounded_String;
+      I : Integer := S'First;
+   begin
+      while I <= S'Last loop
+         declare
+            Lead : constant Natural := Character'Pos (S (I));
+            CP   : Natural;
+         begin
+            if Lead < 16#80# then
+               CP := Lead;
+               I := I + 1;
+            elsif I < S'Last then
+               CP := (Lead mod 16#20#) * 16#40#
+                     + (Character'Pos (S (I + 1)) mod 16#40#);
+               I := I + 2;
+            else
+               CP := Lead;        -- malformed tail; pass through
+               I := I + 1;
+            end if;
+            if CP <= CP_Byte'Last and then CP_Byte (CP) >= 0 then
+               Append (R, Character'Val (CP_Byte (CP)));
+            end if;
+         end;
+      end loop;
+      return To_String (R);
+   end Unmap_Bytes;
 
    --------------------------------------------------------------------
    -- Construction
@@ -84,6 +153,7 @@ package body LLM_Tokenizer is
       for I in 1 .. NM loop
          Add_Merge (T, LLM_GGUF.Merge_At (G, I), I);      -- rank = file order
       end loop;
+      T.Byte_Level := LLM_GGUF.Metadata (G, "tokenizer.ggml.model") = "gpt2";
       T.Loaded := NT > 0;
    end Load_From_GGUF;
 
@@ -111,7 +181,15 @@ package body LLM_Tokenizer is
    function Decode_One (T : Tokenizer; Id : Integer) return String is
    begin
       if T /= null and then T.Id2Tok.Contains (Id) then
-         return T.Id2Tok.Element (Id);
+         declare
+            Piece : constant String := T.Id2Tok.Element (Id);
+         begin
+            if T.Byte_Level then
+               return Unmap_Bytes (Piece);
+            else
+               return Piece;
+            end if;
+         end;
       elsif Id in 0 .. 255 then
          return R : String (1 .. 1) do
             R (1) := Character'Val (Id);
@@ -155,9 +233,16 @@ package body LLM_Tokenizer is
          N      : Natural := Text'Length;
       begin
          for I in 1 .. Text'Length loop
-            --  length-1 slice avoids an array aggregate
-            Pieces (I) :=
-              To_Unbounded_String (Text (Text'First + I - 1 .. Text'First + I - 1));
+            declare
+               B : constant Natural := Character'Pos (Text (Text'First + I - 1));
+            begin
+               if T.Byte_Level then
+                  Pieces (I) := To_Unbounded_String (Byte_To_Piece (B));
+               else
+                  Pieces (I) :=
+                    To_Unbounded_String (Text (Text'First + I - 1 .. Text'First + I - 1));
+               end if;
+            end;
          end loop;
 
          loop
@@ -196,8 +281,6 @@ package body LLM_Tokenizer is
                begin
                   if T.Vocab.Contains (P) then
                      R (I) := T.Vocab.Element (P);
-                  elsif P'Length = 1 then
-                     R (I) := Character'Pos (P (P'First));  -- per-byte fallback
                   else
                      R (I) := 0;  -- unknown piece
                   end if;
@@ -207,4 +290,21 @@ package body LLM_Tokenizer is
       end;
    end Encode;
 
+begin
+   --  Build the GPT-2 byte<->unicode bijection once.
+   declare
+      N : Natural := 0;
+   begin
+      for B in 0 .. 255 loop
+         if Is_Printable (B) then
+            Byte_CP (B) := B;
+         else
+            Byte_CP (B) := 256 + N;
+            N := N + 1;
+         end if;
+      end loop;
+      for B in 0 .. 255 loop
+         CP_Byte (Byte_CP (B)) := B;
+      end loop;
+   end;
 end LLM_Tokenizer;
