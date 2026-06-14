@@ -101,6 +101,11 @@ test-tokenizer-real: ## Validate the tokenizer against the real GGUF vocab (need
 	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
 	./obj/test_tokenizer_real
 
+.PHONY: test-weights-real
+test-weights-real: ## Validate GGUF load + dequant on real tensors (needs model)
+	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
+	./obj/test_weights_real
+
 .PHONY: prove
 prove: ## Run SPARK flow analysis
 	$(GNATPROVE) $(SPARK_FLAGS)

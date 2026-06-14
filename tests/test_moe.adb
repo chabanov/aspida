@@ -45,7 +45,7 @@ procedure Test_MoE is
    Dim      : constant := 2;
    Intermed : constant := 2;
 
-   --  Deterministic, distinct-per-seed weight filler.
+   --  Deterministic, distinct-per-seed 2D weight filler.
    function Mk (Rows, Cols, Seed : Integer) return Tensor is
       T : Tensor := New_Tensor ([Rows, Cols]);
    begin
@@ -57,14 +57,29 @@ procedure Test_MoE is
       return T;
    end Mk;
 
-   Gate_Inp : constant Tensor := Mk (N_Exp, Dim, 1);                 -- [n_exp, dim]
-   Gate_Exp : constant Tensor := Mk (N_Exp * Intermed, Dim, 2);      -- [n_exp*ff, dim]
-   Up_W     : constant Tensor := Mk (N_Exp * Intermed, Dim, 3);
-   Down_W   : constant Tensor := Mk (N_Exp * Dim, Intermed, 4);      -- [n_exp*dim, ff]
-   Sh_Gate  : constant Tensor := Mk (Intermed, Dim, 5);             -- [ff, dim]
+   --  Deterministic 3D filler (matches the real [expert, *, *] layout).
+   function Mk3 (D1, D2, D3, Seed : Integer) return Tensor is
+      T : Tensor := New_Tensor ([D1, D2, D3]);
+   begin
+      for A in 1 .. D1 loop
+         for B in 1 .. D2 loop
+            for C in 1 .. D3 loop
+               Set (T, [A, B, C],
+                 0.1 * Float (((A * 13 + B * 7 + C * 3 + Seed) mod 11) - 5));
+            end loop;
+         end loop;
+      end loop;
+      return T;
+   end Mk3;
+
+   Gate_Inp : constant Tensor := Mk (N_Exp, Dim, 1);                  -- [n_exp, dim]
+   Gate_Exp : constant Tensor := Mk3 (N_Exp, Intermed, Dim, 2);       -- [e, ff, dim]
+   Up_W     : constant Tensor := Mk3 (N_Exp, Intermed, Dim, 3);       -- [e, ff, dim]
+   Down_W   : constant Tensor := Mk3 (N_Exp, Dim, Intermed, 4);       -- [e, dim, ff]
+   Sh_Gate  : constant Tensor := Mk (Intermed, Dim, 5);              -- [ff, dim]
    Sh_Up    : constant Tensor := Mk (Intermed, Dim, 6);
-   Sh_Down  : constant Tensor := Mk (Dim, Intermed, 7);            -- [dim, ff]
-   Sh_GInp  : constant Tensor := New_Tensor ([1, 1]);              -- dummy => no gate
+   Sh_Down  : constant Tensor := Mk (Dim, Intermed, 7);             -- [dim, ff]
+   Sh_GInp  : constant Tensor := New_Tensor ([1, 1]);               -- dummy => no gate
 
    X : Tensor := New_Tensor ([1, Dim]);
 
@@ -72,9 +87,8 @@ procedure Test_MoE is
    type Vec is array (1 .. Dim) of Float;
    type HVec is array (1 .. Intermed) of Float;
 
-   function Ref_SwiGLU
-     (Gate, Up, Down : Tensor; G_Base, D_Base : Integer) return Vec
-   is
+   --  Reference for expert E with 3D weights: Gate/Up [e,ff,dim], Down [e,dim,ff].
+   function Ref_SwiGLU (Gate, Up, Down : Tensor; E : Integer) return Vec is
       H : HVec;
       Y : Vec := [others => 0.0];
    begin
@@ -84,19 +98,44 @@ procedure Test_MoE is
             U : Float := 0.0;
          begin
             for D in 1 .. Dim loop
-               G := G + Get (Gate, [G_Base + J, D]) * Get_Flat (X, D);
-               U := U + Get (Up,   [G_Base + J, D]) * Get_Flat (X, D);
+               G := G + Get (Gate, [E, J, D]) * Get_Flat (X, D);
+               U := U + Get (Up,   [E, J, D]) * Get_Flat (X, D);
             end loop;
             H (J) := Silu (G) * U;
          end;
       end loop;
       for I in 1 .. Dim loop
          for J in 1 .. Intermed loop
-            Y (I) := Y (I) + Get (Down, [D_Base + I, J]) * H (J);
+            Y (I) := Y (I) + Get (Down, [E, I, J]) * H (J);
          end loop;
       end loop;
       return Y;
    end Ref_SwiGLU;
+
+   --  Reference for the (2D) shared expert: Gate/Up [ff,dim], Down [dim,ff].
+   function Ref_Shared (Gate, Up, Down : Tensor) return Vec is
+      H : HVec;
+      Y : Vec := [others => 0.0];
+   begin
+      for J in 1 .. Intermed loop
+         declare
+            G : Float := 0.0;
+            U : Float := 0.0;
+         begin
+            for D in 1 .. Dim loop
+               G := G + Get (Gate, [J, D]) * Get_Flat (X, D);
+               U := U + Get (Up,   [J, D]) * Get_Flat (X, D);
+            end loop;
+            H (J) := Silu (G) * U;
+         end;
+      end loop;
+      for I in 1 .. Dim loop
+         for J in 1 .. Intermed loop
+            Y (I) := Y (I) + Get (Down, [I, J]) * H (J);
+         end loop;
+      end loop;
+      return Y;
+   end Ref_Shared;
 
    function Reference (Top_K : Integer) return Vec is
       P     : array (1 .. N_Exp) of Float;
@@ -154,9 +193,7 @@ procedure Test_MoE is
             declare
                E : constant Integer := Idx (K);
                W : constant Float := Wgt (K) / Sum_W;
-               Y : constant Vec :=
-                 Ref_SwiGLU (Gate_Exp, Up_W, Down_W,
-                             (E - 1) * Intermed, (E - 1) * Dim);
+               Y : constant Vec := Ref_SwiGLU (Gate_Exp, Up_W, Down_W, E);
             begin
                for I in 1 .. Dim loop
                   Out_V (I) := Out_V (I) + W * Y (I);
@@ -167,7 +204,7 @@ procedure Test_MoE is
 
       --  Shared expert (dummy gate input => ungated)
       declare
-         Y : constant Vec := Ref_SwiGLU (Sh_Gate, Sh_Up, Sh_Down, 0, 0);
+         Y : constant Vec := Ref_Shared (Sh_Gate, Sh_Up, Sh_Down);
       begin
          for I in 1 .. Dim loop
             Out_V (I) := Out_V (I) + Y (I);

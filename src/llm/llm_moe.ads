@@ -9,12 +9,11 @@
 --
 --   Final output = sum(router_weight[i] * expert[i](x)) + shared_expert(x)
 --
--- Implemented weight layout (2D, expert-major — the row-major flatten
--- of the GGUF 3D expert tensors; see llm_moe.adb):
+-- Implemented weight layout (row-major logical shapes = GGUF dims reversed):
 --   ffn_gate_inp.weight   [n_experts, dim]            — router logits
---   ffn_gate_exps.weight  [n_experts*intermed, dim]   — per-expert gate
---   ffn_up_exps.weight    [n_experts*intermed, dim]   — per-expert up
---   ffn_down_exps.weight  [n_experts*dim, intermed]   — per-expert down
+--   ffn_gate_exps.weight  [n_experts, intermed, dim]  — per-expert gate (3D)
+--   ffn_up_exps.weight    [n_experts, intermed, dim]  — per-expert up   (3D)
+--   ffn_down_exps.weight  [n_experts, dim, intermed]  — per-expert down (3D)
 --
 --   ffn_gate_shexp.weight [intermed, dim]      — shared expert gate
 --   ffn_up_shexp.weight   [intermed, dim]      — shared expert up

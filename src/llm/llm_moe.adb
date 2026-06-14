@@ -1,12 +1,12 @@
 ---------------------------------------------------------------------
 -- LLM_MoE body — Router + SwiGLU expert FFN (top-k mixture of experts)
 --
--- Implemented weight layout (2D, expert-major — the row-major flatten
--- of the GGUF 3D expert tensors):
+-- Implemented weight layout (row-major logical shapes, i.e. GGUF dims
+-- reversed — see llm_dequant Logical_Shape):
 --   Gate_Inp_W : [n_experts, dim]              router logits
---   Gate_Exp_W : [n_experts*intermed, dim]     per-expert gate proj
---   Up_W       : [n_experts*intermed, dim]     per-expert up proj
---   Down_W     : [n_experts*dim, intermed]     per-expert down proj
+--   Gate_Exp_W : [n_experts, intermed, dim]    per-expert gate proj  (3D)
+--   Up_W       : [n_experts, intermed, dim]    per-expert up proj    (3D)
+--   Down_W     : [n_experts, dim, intermed]    per-expert down proj  (3D)
 --   Shexp_Gate_W / Shexp_Up_W : [intermed, dim]
 --   Shexp_Down_W              : [dim, intermed]
 --   Shexp_Gate_Inp_W          : [1, dim]  (optional sigmoid gate)
@@ -57,9 +57,11 @@ package body LLM_MoE is
       M.Dim := Shape (Gate_Inp_W) (2);
       --  Never select more experts than exist.
       M.Top_K := Integer'Min (8, N_Experts);
-      --  Gate/Up are [n_experts*intermed, dim]; recover intermed.
-      if Shape (Up_W) (1) > 1 then
-         M.Intermed := Shape (Up_W) (1) / M.N_Experts;
+      --  Gate_Exp is [n_experts, intermed, dim]; intermed is the 2nd axis.
+      if Rank (Gate_Exp_W) >= 3 then
+         M.Intermed := Shape (Gate_Exp_W) (2);
+      elsif Numel (Shexp_Gate_W) > 1 then
+         M.Intermed := Shape (Shexp_Gate_W) (1);
       else
          M.Intermed := 512;
       end if;
@@ -69,13 +71,12 @@ package body LLM_MoE is
 
    --------------------------------------------------------------------
    -- One SwiGLU expert E:  y = Down_E · ( silu(Gate_E · x) * (Up_E · x) )
-   -- Gate_Base / Down_Base are the row offsets of expert E in the
-   -- flattened weight tensors.
+   -- Gate/Up are [n_experts, intermed, dim]; Down is [n_experts, dim, intermed].
    --------------------------------------------------------------------
 
    procedure SwiGLU
      (Gate_W, Up_W, Down_W : Tensor;
-      Gate_Base, Down_Base : Integer;
+      E      : Integer;
       X      : Tensor;
       Dim    : Integer;
       Intermed : Integer;
@@ -89,8 +90,8 @@ package body LLM_MoE is
             U : Float := 0.0;
          begin
             for D in 1 .. Dim loop
-               G := G + Get (Gate_W, [Gate_Base + J, D]) * Get_Flat (X, D);
-               U := U + Get (Up_W,   [Gate_Base + J, D]) * Get_Flat (X, D);
+               G := G + Get (Gate_W, [E, J, D]) * Get_Flat (X, D);
+               U := U + Get (Up_W,   [E, J, D]) * Get_Flat (X, D);
             end loop;
             H (J) := Silu (G) * U;
          end;
@@ -101,7 +102,7 @@ package body LLM_MoE is
             Acc : Float := 0.0;
          begin
             for J in 1 .. Intermed loop
-               Acc := Acc + Get (Down_W, [Down_Base + I, J]) * H (J);
+               Acc := Acc + Get (Down_W, [E, I, J]) * H (J);
             end loop;
             Set_Flat (Y, I, Acc);
          end;
@@ -196,8 +197,7 @@ package body LLM_MoE is
          declare
             E : constant Integer := Top_Idx (K);
          begin
-            SwiGLU (M.Gate_Exp_W, M.Up_W, M.Down_W,
-                    (E - 1) * Intermed, (E - 1) * Dim,
+            SwiGLU (M.Gate_Exp_W, M.Up_W, M.Down_W, E,
                     X, Dim, Intermed, Exp_Out);
             for I in 1 .. Dim loop
                Set_Flat (Result, I,

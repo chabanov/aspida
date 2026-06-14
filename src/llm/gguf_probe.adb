@@ -106,6 +106,24 @@ begin
    Dump_Tensor ("blk.1.ssm_in.weight");
 
    New_Line;
+   Put_Line ("===== ALL blk.0 / blk.1 TENSORS =====");
+   for I in 1 .. Tensor_Count (File) loop
+      declare
+         T    : constant Tensor_Info := Tensor_At (File, I);
+         Name : constant String := Ada.Strings.Unbounded.To_String (T.Name);
+      begin
+         if Name'Length >= 6
+           and then Name (Name'First .. Name'First + 3) = "blk."
+           and then Name (Name'First + 4) in '2' .. '4'
+           and then Name (Name'First + 5) = '.'
+         then
+            Put_Line ("  " & Name & "  [" & Dims_Img (T) & " ]  "
+                      & GGML_Type'Image (T.Kind));
+         end if;
+      end;
+   end loop;
+
+   New_Line;
    Put_Line ("===== FIRST TOKENS =====");
    for I in 1 .. Integer'Min (8, Token_Count (File)) loop
       Put_Line ("  [" & Integer'Image (I - 1) & "] = '" & Token_At (File, I) & "'");
