@@ -3,6 +3,7 @@
 ---------------------------------------------------------------------
 
 with Ada.Text_IO;
+with LLM_Parallel;
 with Ada.Strings.Fixed;
 with Ada.Strings;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
@@ -11,9 +12,12 @@ with Ada.Exceptions;
 with LLM_GGUF;    use LLM_GGUF;
 with LLM_Dequant; use LLM_Dequant;
 with LLM_Tensor;  use LLM_Tensor;
-with LLM_SSM;
 with LLM_MoE;
 with LLM_RMSNorm;
+with LLM_FullAttn;
+with LLM_DeltaNet_Blk;
+with LLM_RoPE;
+with LLM_Weight;
 
 package body LLM_Qwen is
 
@@ -61,6 +65,21 @@ package body LLM_Qwen is
               & Ada.Exceptions.Exception_Message (E));
             return New_Tensor ([1, 1]);
       end L;
+
+      --  Load a weight WITHOUT dequantizing — keeps raw quantized bytes so the
+      --  model fits in RAM; projections matvec it on the fly (LLM_Weight).
+      function LQ (Name : String) return LLM_Weight.Weight is
+         Info : constant Tensor_Info := Find_Tensor (G, Name);
+         Size : constant Natural := Natural (Tensor_Byte_Size (Info));
+         B    : constant LLM_Weight.Byte_Data := new String (1 .. Size);
+      begin
+         Read_Tensor_Raw (G, Info, B.all'Address, Size);
+         return LLM_Weight.From_Quant (Info, B);
+      exception
+         when others =>
+            Ada.Text_IO.Put_Line ("  WARNING: tensor not found: " & Name);
+            return LLM_Weight.From_Dense (New_Tensor ([1, 1]));
+      end LQ;
 
    begin
       Ada.Text_IO.Put_Line ("Loading Qwen model from " & Path & " ...");
@@ -143,69 +162,58 @@ package body LLM_Qwen is
       Ada.Text_IO.Put_Line ("  Loading transformer blocks...");
       Ada.Text_IO.Flush;
 
-      -- Load all transformer blocks
+      -- Load all transformer blocks. Layer type: full attention when
+      -- L mod 4 = 3 (full_attention_interval), gated delta-net otherwise.
       for I in 0 .. N_Layers - 1 loop
          declare
-            Pre : constant String := "blk." & Img (I) & ".";
-            Is_Full_Attn : constant Boolean := (I mod 4) = 0;
+            Pre     : constant String := "blk." & Img (I) & ".";
+            Is_Full : constant Boolean := (I mod 4) = 3;
+            Blk     : LLM_Qwen_Blk.Qwen_Block;
          begin
             Ada.Text_IO.Put_Line ("  loading block" & Img (I) &
-              (if Is_Full_Attn then " [full-attn]" else " [SSM]"));
+              (if Is_Full then " [full-attn]" else " [delta-net]"));
             Ada.Text_IO.Flush;
 
-            declare
-               -- Only norms are guaranteed on every layer
-               Attn_Norm : constant Tensor := L (Pre & "attn_norm.weight");
-               Post_Attn_Norm : constant Tensor := L (Pre & "post_attention_norm.weight");
+            Blk.Is_Full_Attn     := Is_Full;
+            Blk.Dim              := Dim;
+            Blk.Attn_Norm_W      := L (Pre & "attn_norm.weight");
+            Blk.Post_Attn_Norm_W := L (Pre & "post_attention_norm.weight");
 
-               -- Everything else: try L first, fallback to LO (empty tensor)
-               function Try_Load (Name : String; Row, Col : Integer) return Tensor is
-               begin
-                  return L (Name);
-               exception
-                  when others =>
-                     return New_Tensor ([Row, Col]);
-               end Try_Load;
+            if Is_Full then
+               Blk.Full := LLM_FullAttn.Create
+                 (LQ (Pre & "attn_q.weight"),
+                  LQ (Pre & "attn_k.weight"),
+                  LQ (Pre & "attn_v.weight"),
+                  L  (Pre & "attn_q_norm.weight"),
+                  L  (Pre & "attn_k_norm.weight"),
+                  LQ (Pre & "attn_output.weight"),
+                  LLM_RoPE.Create_Qwen_RoPE);
+            else
+               Blk.DNet := LLM_DeltaNet_Blk.Create
+                 (LQ (Pre & "attn_qkv.weight"),
+                  L  (Pre & "ssm_conv1d.weight"),
+                  L  (Pre & "ssm_a"),
+                  L  (Pre & "ssm_dt.bias"),
+                  LQ (Pre & "ssm_alpha.weight"),
+                  LQ (Pre & "ssm_beta.weight"),
+                  L  (Pre & "ssm_norm.weight"),
+                  LQ (Pre & "ssm_out.weight"),
+                  LQ (Pre & "attn_gate.weight"));
+            end if;
 
-               QKV       : constant Tensor := Try_Load (Pre & "attn_qkv.weight", 1, 1);
-               Attn_Gate : constant Tensor := Try_Load (Pre & "attn_gate.weight", 1, Dim);
-               OW        : constant Tensor := Try_Load (Pre & "attn_output.weight", 1, 1);
+            --  MoE FFN on every block.
+            Blk.MoE := LLM_MoE.Create_MoE
+              (LQ (Pre & "ffn_gate_inp.weight"),
+               LQ (Pre & "ffn_gate_exps.weight"),
+               LQ (Pre & "ffn_up_exps.weight"),
+               LQ (Pre & "ffn_down_exps.weight"),
+               LQ (Pre & "ffn_gate_shexp.weight"),
+               LQ (Pre & "ffn_up_shexp.weight"),
+               LQ (Pre & "ffn_down_shexp.weight"),
+               L  (Pre & "ffn_gate_inp_shexp.weight"),
+               256);
 
-               C1D   : constant Tensor := Try_Load (Pre & "ssm_conv1d.weight", 1, 1);
-               SA    : constant Tensor := Try_Load (Pre & "ssm_a.weight", 1, 1);
-               SDT   : constant Tensor := Try_Load (Pre & "ssm_dt.weight", 1, 1);
-               SN    : constant Tensor := Try_Load (Pre & "ssm_norm.weight", 1, Dim);
-               SO    : constant Tensor := Try_Load (Pre & "ssm_out.weight", 1, Dim);
-               SAlpha: constant Tensor := Try_Load (Pre & "ssm_alpha.weight", 1, 1);
-               SBeta : constant Tensor := Try_Load (Pre & "ssm_beta.weight", 1, 1);
-
-               Ssm_P : LLM_SSM.SSM_Params;
-            begin
-               if not Is_Full_Attn then
-                  Ssm_P := LLM_SSM.Create_SSM (C1D, SA, SDT, SN, SO, SAlpha, SBeta);
-               end if;
-
-               -- MoE layer (present on all blocks)
-               declare
-                  Moe_L : constant LLM_MoE.MoE_Layer := LLM_MoE.Create_MoE (
-                     Try_Load (Pre & "ffn_gate_inp.weight", 1, Dim),
-                     Try_Load (Pre & "ffn_gate_exps.weight", 1, 1),
-                     Try_Load (Pre & "ffn_down_exps.weight", 1, 1),
-                     Try_Load (Pre & "ffn_up_exps.weight", 1, 1),
-                     Try_Load (Pre & "ffn_gate_shexp.weight", 1, Dim),
-                     Try_Load (Pre & "ffn_down_shexp.weight", 1, 1),
-                     Try_Load (Pre & "ffn_up_shexp.weight", 1, 1),
-                     Try_Load (Pre & "ffn_gate_inp_shexp.weight", 1, Dim),
-                     256);
-               begin
-                  M.Blocks (I + 1) := new LLM_Qwen_Blk.Qwen_Block'(
-                     LLM_Qwen_Blk.Create_Qwen_Block (
-                        QKV, Attn_Gate, OW,
-                        Attn_Norm, Post_Attn_Norm,
-                        Ssm_P, Moe_L,
-                        Is_Full_Attn, Dim, M.N_Heads, M.N_KV_Heads));
-               end;
-            end;
+            M.Blocks (I + 1) := new LLM_Qwen_Blk.Qwen_Block'(Blk);
          end;
       end loop;
 
@@ -268,18 +276,25 @@ package body LLM_Qwen is
          declare
             Normed : constant Tensor := LLM_RMSNorm.Forward (Last, M.Final_Norm);
             Logits : Tensor := New_Tensor ([1, M.Vocab_Sz]);
+
+            --  output.weight is [vocab, dim] (row-major); logits[v] = Normed . row v.
+            procedure LM_Rows (Lo, Hi : Integer) is
+            begin
+               for V in Lo .. Hi loop
+                  declare
+                     Acc : Float := 0.0;
+                  begin
+                     for D in 1 .. Dim loop
+                        Acc := Acc + Get_Flat (Normed, D) * Get (M.LM_Head, [V, D]);
+                     end loop;
+                     Set_Flat (Logits, V, Acc);
+                  end;
+               end loop;
+            end LM_Rows;
+
+            procedure Par_LM is new LLM_Parallel (LM_Rows);
          begin
-            -- output.weight is [vocab, dim] (row-major); logits[v] = Normed . row v
-            for V in 1 .. M.Vocab_Sz loop
-               declare
-                  Acc : Float := 0.0;
-               begin
-                  for D in 1 .. Dim loop
-                     Acc := Acc + Get_Flat (Normed, D) * Get (M.LM_Head, [V, D]);
-                  end loop;
-                  Set_Flat (Logits, V, Acc);
-               end;
-            end loop;
+            Par_LM (1, M.Vocab_Sz, 512);
             return Logits;
          end;
       end;
@@ -360,34 +375,30 @@ package body LLM_Qwen is
    function Param_Count (M : Qwen_Model) return Long_Long_Integer is
       C : Long_Long_Integer := 0;
    begin
-      C := Safe_N (M.Token_Emb);
-      C := C + Safe_N (M.LM_Head);
-      C := C + Safe_N (M.Final_Norm);
+      C := Safe_N (M.Token_Emb) + Safe_N (M.LM_Head) + Safe_N (M.Final_Norm);
       for I in 1 .. M.N_Blocks loop
          declare
             B : LLM_Qwen_Blk.Qwen_Block renames M.Blocks (I).all;
          begin
-            C := C + Safe_N (B.QKV_W)
-                     + Safe_N (B.Attn_Gate_W)
-                     + Safe_N (B.O_W)
-                     + Safe_N (B.Attn_Norm_W)
-                     + Safe_N (B.Post_Attn_Norm_W);
-            if not B.Is_Full_Attn then
-               C := C + Safe_N (B.SSM.Conv_Weight)
-                       + Safe_N (B.SSM.A_Diag)
-                       + Safe_N (B.SSM.Dt_Bias)
-                       + Safe_N (B.SSM.Gamma)
-                       + Safe_N (B.SSM.Out_Weight)
-                       + Safe_N (B.SSM.Alpha_W)
-                       + Safe_N (B.SSM.Beta_W);
+            C := C + Safe_N (B.Attn_Norm_W) + Safe_N (B.Post_Attn_Norm_W);
+            if B.Is_Full_Attn then
+               C := C + LLM_Weight.Count (B.Full.Q_W) + LLM_Weight.Count (B.Full.K_W)
+                      + LLM_Weight.Count (B.Full.V_W) + Safe_N (B.Full.Q_Norm)
+                      + Safe_N (B.Full.K_Norm) + LLM_Weight.Count (B.Full.O_W);
+            else
+               C := C + LLM_Weight.Count (B.DNet.QKV_W) + Safe_N (B.DNet.Conv_W)
+                      + Safe_N (B.DNet.A_W) + Safe_N (B.DNet.Dt_W)
+                      + LLM_Weight.Count (B.DNet.Alpha_W) + LLM_Weight.Count (B.DNet.Beta_W)
+                      + Safe_N (B.DNet.Norm_W) + LLM_Weight.Count (B.DNet.Out_W)
+                      + LLM_Weight.Count (B.DNet.Gate_W);
             end if;
-            C := C + Safe_N (B.MoE.Gate_Inp_W)
-                    + Safe_N (B.MoE.Gate_Exp_W)
-                    + Safe_N (B.MoE.Up_W)
-                    + Safe_N (B.MoE.Down_W)
-                    + Safe_N (B.MoE.Shexp_Gate_W)
-                    + Safe_N (B.MoE.Shexp_Up_W)
-                    + Safe_N (B.MoE.Shexp_Down_W)
+            C := C + LLM_Weight.Count (B.MoE.Gate_Inp_W)
+                    + LLM_Weight.Count (B.MoE.Gate_Exp_W)
+                    + LLM_Weight.Count (B.MoE.Up_W)
+                    + LLM_Weight.Count (B.MoE.Down_W)
+                    + LLM_Weight.Count (B.MoE.Shexp_Gate_W)
+                    + LLM_Weight.Count (B.MoE.Shexp_Up_W)
+                    + LLM_Weight.Count (B.MoE.Shexp_Down_W)
                     + Safe_N (B.MoE.Shexp_Gate_Inp_W);
          end;
       end loop;

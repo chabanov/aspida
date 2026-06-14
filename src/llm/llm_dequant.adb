@@ -4,6 +4,7 @@
 
 with Ada.Text_IO;
 with Interfaces; use Interfaces;
+with LLM_Parallel;
 
 package body LLM_Dequant is
 
@@ -396,17 +397,14 @@ package body LLM_Dequant is
       end return;
    end Logical_Shape;
 
-   function Dequantize
-     (Info : LLM_GGUF.Tensor_Info;
-      Raw  : String)
-      return Tensor
+   --  Dequantize into a caller-provided (already-allocated) tensor — no heap
+   --  allocation, so it can be called in a hot/parallel loop with a reused buffer.
+   procedure Fill
+     (Info : LLM_GGUF.Tensor_Info; Raw : String; Result : in out Tensor; N : Natural)
    is
-      N : constant Natural := Dequant_Num_Elements (Info);
-      Result : Tensor := New_Tensor (Logical_Shape (Info));
    begin
       case Info.Kind is
          when LLM_GGUF.GGML_TYPE_F32 =>
-            -- Direct copy: each 4 bytes → 1 float
             declare
                Pos : Natural := Raw'First;
             begin
@@ -436,25 +434,78 @@ package body LLM_Dequant is
                end;
             end loop;
 
-         when LLM_GGUF.GGML_TYPE_Q5_K =>
-            Dequant_Q5_K (Raw, Result, N);
-
-         when LLM_GGUF.GGML_TYPE_Q8_K =>
-            Dequant_Q8_K (Raw, Result, N);
-
-         when LLM_GGUF.GGML_TYPE_Q6_K =>
-            Dequant_Q6_K (Raw, Result, N);
-
-         when LLM_GGUF.GGML_TYPE_Q4_K =>
-            Dequant_Q4_K (Raw, Result, N);
+         when LLM_GGUF.GGML_TYPE_Q5_K => Dequant_Q5_K (Raw, Result, N);
+         when LLM_GGUF.GGML_TYPE_Q8_K => Dequant_Q8_K (Raw, Result, N);
+         when LLM_GGUF.GGML_TYPE_Q6_K => Dequant_Q6_K (Raw, Result, N);
+         when LLM_GGUF.GGML_TYPE_Q4_K => Dequant_Q4_K (Raw, Result, N);
 
          when others =>
             Ada.Text_IO.Put_Line ("Dequantize: unsupported type " &
               LLM_GGUF.GGML_Type'Image (Info.Kind));
-            -- Zero-initialized already
-            null;
       end case;
-      return Result;
+   end Fill;
+
+   function Dequantize
+     (Info : LLM_GGUF.Tensor_Info;
+      Raw  : String)
+      return Tensor
+   is
+      N : constant Natural := Dequant_Num_Elements (Info);
+   begin
+      return Result : Tensor := New_Tensor (Logical_Shape (Info)) do
+         Fill (Info, Raw, Result, N);
+      end return;
    end Dequantize;
+
+   --------------------------------------------------------------------
+   -- Streaming quantized matrix-vector
+   --------------------------------------------------------------------
+
+   function QMatVec
+     (Info : LLM_GGUF.Tensor_Info;
+      Raw  : String;
+      X    : Tensor)
+      return Tensor
+   is
+      In_Dim   : constant Integer := Integer (Info.Dims (1));   -- GGUF ne0 = in
+      Out_Dim  : constant Integer := Integer (Info.Dims (2));   -- GGUF ne1 = out
+      Row_Info : LLM_GGUF.Tensor_Info := Info;
+      BPR      : Natural;
+   begin
+      --  One-row view [in, 1]; Logical_Shape = [1, in].
+      Row_Info.N_Dims := 2;
+      Row_Info.Dims   := [Info.Dims (1), 1, 0, 0];
+      BPR := Natural (LLM_GGUF.Tensor_Byte_Size (Row_Info));
+
+      return Y : Tensor := New_Tensor ([1, Out_Dim]) do
+         declare
+            --  Dequantize rows Lo..Hi and write the dot products into Y. A single
+            --  row buffer is reused across the range (no per-row heap allocation,
+            --  so parallel tasks don't contend on the allocator lock).
+            procedure Rows (Lo, Hi : Integer) is
+               Row_T : Tensor := New_Tensor ([1, In_Dim]);
+            begin
+               for O in Lo .. Hi loop
+                  declare
+                     Start : constant Natural := Raw'First + (O - 1) * BPR;
+                     Acc   : Float := 0.0;
+                  begin
+                     Fill (Row_Info, Raw (Start .. Start + BPR - 1), Row_T, In_Dim);
+                     for I in 1 .. In_Dim loop
+                        Acc := Acc + Get_Flat (Row_T, I) * Get_Flat (X, I);
+                     end loop;
+                     Set_Flat (Y, O, Acc);
+                  end;
+               end loop;
+            end Rows;
+
+            --  Only parallelise large matvecs here; small ones (e.g. MoE
+            --  experts) are parallelised one level up, at the expert loop.
+            procedure Par_Rows is new LLM_Parallel (Rows);
+         begin
+            Par_Rows (1, Out_Dim, Min_Grain => 2048);
+         end;
+      end return;
+   end QMatVec;
 
 end LLM_Dequant;

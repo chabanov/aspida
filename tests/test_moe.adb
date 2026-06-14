@@ -12,6 +12,7 @@ with Ada.Command_Line;
 with Ada.Numerics.Elementary_Functions;
 use Ada.Numerics.Elementary_Functions;
 with LLM_Tensor; use LLM_Tensor;
+with LLM_Weight;
 with LLM_MoE;
 
 procedure Test_MoE is
@@ -215,8 +216,11 @@ procedure Test_MoE is
    end Reference;
 
    M : LLM_MoE.MoE_Layer :=
-     LLM_MoE.Create_MoE (Gate_Inp, Gate_Exp, Up_W, Down_W,
-                         Sh_Gate, Sh_Up, Sh_Down, Sh_GInp, N_Exp);
+     LLM_MoE.Create_MoE
+       (LLM_Weight.From_Dense (Gate_Inp), LLM_Weight.From_Dense (Gate_Exp),
+        LLM_Weight.From_Dense (Up_W), LLM_Weight.From_Dense (Down_W),
+        LLM_Weight.From_Dense (Sh_Gate), LLM_Weight.From_Dense (Sh_Up),
+        LLM_Weight.From_Dense (Sh_Down), Sh_GInp, N_Exp);
 
 begin
    Put_Line ("=== MoE Test Suite ===");

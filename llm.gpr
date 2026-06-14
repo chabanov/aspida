@@ -11,16 +11,17 @@ project LLM is
    for Main use ("llm_main.adb");
 
    package Compiler is
-      --  -gnatwa: all warnings; -gnatwe: treat warnings as errors (kept clean);
-      --  -gnatX: extensions ([] aggregates); -g: debug info.
-      for Default_Switches ("Ada") use ("-gnatwa", "-gnatwe", "-gnatX", "-g");
+      --  -gnatwa: all warnings; -gnatwe: warnings as errors; -gnatX: extensions;
+      --  -O3 + -march=native: optimise & auto-vectorise the math (pure Ada).
+      for Default_Switches ("Ada") use
+        ("-gnatwa", "-gnatwe", "-gnatX", "-O3", "-march=native");
    end Compiler;
 
+   --  Self-contained: no external BLAS/inference libraries are linked.
    package Linker is
       for Default_Switches ("Ada") use
         ("-L" & external ("SDKROOT", "") & "/usr/lib",
-         "-Wl,-syslibroot," & external ("SDKROOT", ""),
-         "-Wl,-framework,Accelerate");
+         "-Wl,-syslibroot," & external ("SDKROOT", ""));
    end Linker;
 
    package Binder is

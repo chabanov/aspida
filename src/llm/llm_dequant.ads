@@ -43,4 +43,14 @@ package LLM_Dequant is
    -- Get the number of FP32 elements this tensor produces after dequantization
    function Dequant_Num_Elements (Info : LLM_GGUF.Tensor_Info) return Natural;
 
+   -- Streaming quantized matrix-vector: y[out] = W[out,in] . x[in], where W is
+   -- the (still-quantized) 2D tensor described by Info and held raw in Raw.
+   -- Dequantizes ONE output row at a time, so the full F32 weight is never
+   -- materialised (peak extra memory = one row). X is [1, in]; result [1, out].
+   function QMatVec
+     (Info : LLM_GGUF.Tensor_Info;
+      Raw  : String;
+      X    : LLM_Tensor.Tensor)
+      return LLM_Tensor.Tensor;
+
 end LLM_Dequant;
