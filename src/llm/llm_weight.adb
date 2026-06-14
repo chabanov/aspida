@@ -2,11 +2,80 @@
 -- LLM_Weight body
 ---------------------------------------------------------------------
 
+with Ada.Environment_Variables;
+with Ada.Text_IO;
 with LLM_Dequant;
 
 package body LLM_Weight is
 
    use LLM_Tensor;
+
+   --------------------------------------------------------------------
+   -- Dense weight cache (OPT-IN — off by default, enable with LLM_WEIGHT_CACHE)
+   --
+   -- During generation the same 2D weights are re-dequantized from Q5_K/
+   -- Q6_K on every token. This caches their dense F32 form on first use and
+   -- serves subsequent matvecs via the fast flat MatVec_Rows — no per-token
+   -- decode. Only 2D weights are cached (the always-used attention / delta /
+   -- shared-expert / router projections, ~5.3 GB); the 256-per-layer routed
+   -- experts stay quantized (decoded on demand). Result is bit-identical to
+   -- QMatVec (same Fill dequant, same ascending dot order); lookup/fill run
+   -- only on the main thread (experts use the 3D MatVec_Expert), so no lock.
+   --
+   -- MEASURED: on this Apple-silicon CPU it is a small *regression* — the
+   -- fused QMatVec decode is already cheap on NEON, and the dense F32 set is
+   -- 4x the Q5_K bytes, so it thrashes the CPU caches and costs more RSS
+   -- (~+5.3 GB) than the decode it saves. Kept opt-in because it can pay off
+   -- where decode dominates (slower-decode formats, or a future backend).
+   --------------------------------------------------------------------
+
+   Cache_Enabled : constant Boolean :=
+     Ada.Environment_Variables.Exists ("LLM_WEIGHT_CACHE");
+   Budget_Bytes : constant Long_Long_Integer := 16 * 1024 ** 3;  -- 16 GiB cap
+
+   type Tensor_Access is access LLM_Tensor.Tensor;
+   type Cache_Entry is record
+      Key : Byte_Data    := null;
+      Val : Tensor_Access := null;
+   end record;
+
+   Max_Entries : constant := 4096;
+   Cache       : array (1 .. Max_Entries) of Cache_Entry;
+   N_Cached    : Natural := 0;
+   Used_Bytes  : Long_Long_Integer := 0;
+
+   --  Dense [out, in] form of a quantized 2D weight, or null if not cacheable
+   --  (cache full / over budget) so the caller falls back to streaming QMatVec.
+   function Cached_Dense (W : Weight) return Tensor_Access is
+      Sz : constant Long_Long_Integer :=
+        Long_Long_Integer (Rows (W)) * Long_Long_Integer (Cols (W)) * 4;
+   begin
+      for I in 1 .. N_Cached loop
+         if Cache (I).Key = W.Bytes then
+            return Cache (I).Val;
+         end if;
+      end loop;
+      if N_Cached >= Max_Entries or else Used_Bytes + Sz > Budget_Bytes then
+         return null;
+      end if;
+      declare
+         use type LLM_GGUF.GGML_Type;
+         T : constant Tensor_Access :=
+           new LLM_Tensor.Tensor'(LLM_Dequant.Dequantize (W.Info, W.Bytes.all));
+      begin
+         N_Cached := N_Cached + 1;
+         Cache (N_Cached) := (Key => W.Bytes, Val => T);
+         Used_Bytes := Used_Bytes + Sz;
+         if Ada.Environment_Variables.Exists ("LLM_CACHE_DEBUG") then
+            Ada.Text_IO.Put_Line
+              ("  [wcache] #" & Natural'Image (N_Cached)
+               & " kind=" & LLM_GGUF.GGML_Type'Image (W.Info.Kind)
+               & " " & Integer'Image (Rows (W)) & " x" & Integer'Image (Cols (W))
+               & "  total_MB=" & Long_Long_Integer'Image (Used_Bytes / 1024 / 1024));
+         end if;
+         return T;
+      end;
+   end Cached_Dense;
 
    function From_Dense (T : Tensor) return Weight is
    begin
@@ -84,6 +153,15 @@ package body LLM_Weight is
    function MatVec (W : Weight; X : Tensor) return Tensor is
    begin
       if W.Is_Quant then
+         if Cache_Enabled and then Natural (W.Info.N_Dims) = 2 then
+            declare
+               D : constant Tensor_Access := Cached_Dense (W);
+            begin
+               if D /= null then
+                  return MatVec_Rows (D.all, X);
+               end if;
+            end;
+         end if;
          return LLM_Dequant.QMatVec (W.Info, W.Bytes.all, X);
       else
          return Dense_MatVec (W.Dense, X);

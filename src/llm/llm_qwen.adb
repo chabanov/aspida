@@ -3,7 +3,8 @@
 ---------------------------------------------------------------------
 
 with Ada.Text_IO;
-with LLM_Parallel;
+with Ada.Environment_Variables;
+with Ada.Numerics.Elementary_Functions;
 with Ada.Strings.Fixed;
 with Ada.Strings;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
@@ -22,6 +23,10 @@ with LLM_Weight;
 package body LLM_Qwen is
 
    use Ada.Strings.Fixed;
+
+   --  Debug: dump residual-stream norm per layer when LLM_DEBUG_NORMS is set.
+   Debug_Norms : constant Boolean :=
+     Ada.Environment_Variables.Exists ("LLM_DEBUG_NORMS");
 
    function "=" (Left, Right : Qwen_Model) return Boolean is
    begin
@@ -264,6 +269,22 @@ package body LLM_Qwen is
       -- Run the transformer blocks over the whole sequence.
       for I in 1 .. M.N_Blocks loop
          H := LLM_Qwen_Blk.Forward (M.Blocks (I).all, H);
+         if Debug_Norms then
+            declare
+               SS : Float := 0.0;
+            begin
+               for D in 1 .. Dim loop
+                  SS := SS + Get (H, [Seq_Len, D]) ** 2;
+               end loop;
+               Ada.Text_IO.Put_Line ("  [L" & Img (I) & "] "
+                 & (if M.Blocks (I).all.Is_Full_Attn then "full " else "dnet ")
+                 & "|H|=" & Float'Image (Ada.Numerics.Elementary_Functions.Sqrt (SS))
+                 & "  h0..3=" & Float'Image (Get (H, [Seq_Len, 1]))
+                 & Float'Image (Get (H, [Seq_Len, 2]))
+                 & Float'Image (Get (H, [Seq_Len, 3]))
+                 & Float'Image (Get (H, [Seq_Len, 4])));
+            end;
+         end if;
       end loop;
 
       -- Final RMSNorm on the last position, then project to vocab logits.
@@ -275,27 +296,9 @@ package body LLM_Qwen is
          end loop;
          declare
             Normed : constant Tensor := LLM_RMSNorm.Forward (Last, M.Final_Norm);
-            Logits : Tensor := New_Tensor ([1, M.Vocab_Sz]);
-
-            --  output.weight is [vocab, dim] (row-major); logits[v] = Normed . row v.
-            procedure LM_Rows (Lo, Hi : Integer) is
-            begin
-               for V in Lo .. Hi loop
-                  declare
-                     Acc : Float := 0.0;
-                  begin
-                     for D in 1 .. Dim loop
-                        Acc := Acc + Get_Flat (Normed, D) * Get (M.LM_Head, [V, D]);
-                     end loop;
-                     Set_Flat (Logits, V, Acc);
-                  end;
-               end loop;
-            end LM_Rows;
-
-            procedure Par_LM is new LLM_Parallel (LM_Rows);
          begin
-            Par_LM (1, M.Vocab_Sz, 512);
-            return Logits;
+            --  output.weight is [vocab, dim] (row-major); flat parallel matvec.
+            return MatVec_Rows (M.LM_Head, Normed);
          end;
       end;
    end Forward;
@@ -305,56 +308,73 @@ package body LLM_Qwen is
    --------------------------------------------------------------------
 
    function Generate (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128) return String is
-      Ctx_Len : constant Integer := M.Ctx_Len;
+      Dim     : constant Integer := M.Model_Dim;
       Ids     : constant LLM_Tokenizer.Token_Array := LLM_Tokenizer.Encode (M.Tok, Prompt);
       Cap     : constant Integer := Integer'Max (1, Ids'Length + Max_New_Tokens);
-      Ctx     : array (1 .. Cap) of Integer := [others => 1];  -- 1-based embed rows
-      L       : Natural := 0;
       Out_Buf : Unbounded_String := To_Unbounded_String (Prompt);
+
+      --  Per-layer decode state (KV cache for full-attn, recurrent state +
+      --  conv window for delta-net), threaded across tokens. One forward
+      --  step now costs O(1) matmuls instead of recomputing the sequence.
+      Cache : array (1 .. M.N_Blocks) of LLM_Qwen_Blk.Block_State;
+
+      --  Decode one token (1-based embedding row) through the cached stack,
+      --  advancing every layer's state; returns next-token logits [1, vocab].
+      function Decode (Embed_Row : Integer) return Tensor is
+         H : Tensor := New_Tensor ([1, Dim]);
+      begin
+         for D in 1 .. Dim loop
+            Set_Flat (H, D, Get (M.Token_Emb, [Embed_Row, D]));
+         end loop;
+         for I in 1 .. M.N_Blocks loop
+            H := LLM_Qwen_Blk.Step (M.Blocks (I).all, Cache (I), H);
+         end loop;
+         declare
+            Normed : constant Tensor := LLM_RMSNorm.Forward (H, M.Final_Norm);
+         begin
+            return MatVec_Rows (M.LM_Head, Normed);
+         end;
+      end Decode;
+
+      function Argmax (Logits : Tensor) return Integer is
+         Best_Row : Integer := 1;
+         Best_S   : Float := Float'First;
+      begin
+         for I in 1 .. Numel (Logits) loop
+            if Get_Flat (Logits, I) > Best_S then
+               Best_S := Get_Flat (Logits, I);
+               Best_Row := I;
+            end if;
+         end loop;
+         return Best_Row;
+      end Argmax;
+
+      Last_Logits : Tensor;
    begin
-      -- Seed the context with the prompt tokens as 1-based embedding rows
-      -- (row = id + 1, since token ids are 0-based but tensor rows are 1-based).
-      for I in Ids'Range loop
-         L := L + 1;
-         Ctx (L) := Ids (I) + 1;
+      for I in 1 .. M.N_Blocks loop
+         Cache (I) := LLM_Qwen_Blk.Init_State (M.Blocks (I).all, Cap);
       end loop;
-      if L = 0 then
-         L := 1;
-         Ctx (1) := 1;
+
+      --  Prefill: feed the prompt tokens (row = id + 1, since ids are 0-based
+      --  but embedding rows are 1-based). The last step's logits predict the
+      --  first generated token.
+      if Ids'Length = 0 then
+         Last_Logits := Decode (1);
+      else
+         for I in Ids'Range loop
+            Last_Logits := Decode (Ids (I) + 1);
+         end loop;
       end if;
 
-      -- Autoregressive generation: greedy argmax decoding.
+      --  Greedy autoregressive decode.
       for Step in 1 .. Max_New_Tokens loop
          declare
-            Start   : constant Integer := Integer'Max (1, L - Ctx_Len + 1);
-            Use_Len : constant Integer := L - Start + 1;
-            Toks    : Tensor := New_Tensor ([1, Use_Len]);
+            Best_Row : constant Integer := Argmax (Last_Logits);
          begin
-            for I in 1 .. Use_Len loop
-               Set_Flat (Toks, I, Float (Ctx (Start + I - 1)));
-            end loop;
-
-            declare
-               Logits   : constant Tensor := Forward (M, Toks);
-               Best_Row : Integer := 1;
-               Best_S   : Float := Float'First;
-            begin
-               for I in 1 .. Numel (Logits) loop
-                  if Get_Flat (Logits, I) > Best_S then
-                     Best_S := Get_Flat (Logits, I);
-                     Best_Row := I;
-                  end if;
-               end loop;
-
-               exit when Best_Row < 1 or else Best_Row > M.Vocab_Sz;
-
-               -- Best_Row is the 1-based embedding row; token id is Best_Row - 1.
-               Append (Out_Buf, LLM_Tokenizer.Decode_One (M.Tok, Best_Row - 1));
-
-               exit when L >= Cap;
-               L := L + 1;
-               Ctx (L) := Best_Row;
-            end;
+            exit when Best_Row < 1 or else Best_Row > M.Vocab_Sz;
+            Append (Out_Buf, LLM_Tokenizer.Decode_One (M.Tok, Best_Row - 1));
+            exit when Step = Max_New_Tokens;
+            Last_Logits := Decode (Best_Row);
          end;
       end loop;
 

@@ -39,4 +39,21 @@ package LLM_DeltaNet_Blk is
    function Forward (L : DeltaNet_Layer; X : LLM_Tensor.Tensor)
       return LLM_Tensor.Tensor;
 
+   --------------------------------------------------------------------
+   -- Incremental decode (one token at a time, O(1) per step).
+   --
+   -- DNet_State carries the per-head recurrent state S and the causal
+   -- conv1d window across decode steps. Step processes a single token
+   -- [1, Dim] and returns [1, Dim], mutating the state in place.
+   --------------------------------------------------------------------
+   type DNet_State is record
+      S_All     : LLM_Tensor.Tensor;  -- packed states [N_V_Heads*Key_Head_Dim, Value_Head_Dim]
+      Conv_Hist : LLM_Tensor.Tensor;  -- last (Kernel-1) raw qkv rows [Kernel-1, QKV_Out]
+   end record;
+
+   function Init_State (L : DeltaNet_Layer) return DNet_State;
+
+   function Step (L : DeltaNet_Layer; St : in out DNet_State; X : LLM_Tensor.Tensor)
+      return LLM_Tensor.Tensor;
+
 end LLM_DeltaNet_Blk;

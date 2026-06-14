@@ -18,7 +18,7 @@ procedure Forward_Probe is
    Ctx : Tensor := New_Tensor ([1, 1]);   -- single token (1-based embed row)
    T0  : Time;
 begin
-   Set_Flat (Ctx, 1, 100.0);   -- arbitrary token id
+   Set_Flat (Ctx, 1, 761.0);  -- token "The" (id 760, 1-based row)
    Put_Line ("Running one forward pass...");
    Flush;
    T0 := Clock;

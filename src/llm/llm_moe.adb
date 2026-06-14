@@ -9,9 +9,12 @@
 with Ada.Numerics.Generic_Elementary_Functions;
 with LLM_Tensor; use LLM_Tensor;
 with LLM_Weight; use LLM_Weight;
-with LLM_Parallel;
+with LLM_Pool;
 
 package body LLM_MoE is
+
+   --  Hot per-token kernel (router + 8 experts); indices derive from dims.
+   pragma Suppress (All_Checks);
 
    package Float_Math is new Ada.Numerics.Generic_Elementary_Functions (Float);
    use Float_Math;
@@ -121,7 +124,8 @@ package body LLM_MoE is
       declare
          Exp_Y : Tensor := New_Tensor ([Top_K, Dim]);
 
-         procedure Do_Experts (Lo, Hi : Integer) is
+         type Experts_Op is new LLM_Pool.Parallel_Op with null record;
+         overriding procedure Execute (Op : in out Experts_Op; Lo, Hi : Integer) is
          begin
             for K in Lo .. Hi loop
                declare
@@ -135,11 +139,11 @@ package body LLM_MoE is
                   end loop;
                end;
             end loop;
-         end Do_Experts;
+         end Execute;
 
-         procedure Par_Experts is new LLM_Parallel (Do_Experts);
+         Experts : Experts_Op;
       begin
-         Par_Experts (1, Top_K, Min_Grain => 2);
+         LLM_Pool.Run (Experts, 1, Top_K, Min_Grain => 2);
          for K in 1 .. Top_K loop
             for I in 1 .. Dim loop
                Set_Flat (Result, I, Get_Flat (Result, I) + Get (Exp_Y, [K, I]));

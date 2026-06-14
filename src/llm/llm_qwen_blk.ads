@@ -28,4 +28,19 @@ package LLM_Qwen_Blk is
    function Forward (B : Qwen_Block; X : LLM_Tensor.Tensor)
       return LLM_Tensor.Tensor;
 
+   --------------------------------------------------------------------
+   -- Incremental decode (one token at a time, with cached attn state).
+   --------------------------------------------------------------------
+   type Block_State is record
+      Is_Full : Boolean := False;
+      Full_St : LLM_FullAttn.Attn_State;
+      DNet_St : LLM_DeltaNet_Blk.DNet_State;
+   end record;
+
+   function Init_State (B : Qwen_Block; Max_Len : Integer) return Block_State;
+
+   --  X [1, dim] -> [1, dim].
+   function Step (B : Qwen_Block; St : in out Block_State; X : LLM_Tensor.Tensor)
+      return LLM_Tensor.Tensor;
+
 end LLM_Qwen_Blk;

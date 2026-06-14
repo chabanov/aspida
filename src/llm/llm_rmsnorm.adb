@@ -6,6 +6,9 @@ with Ada.Numerics.Elementary_Functions;
 
 package body LLM_RMSNorm is
 
+   --  Called per token per layer; indices derive from the vector length.
+   pragma Suppress (All_Checks);
+
    function Forward (X : Tensor; Weight : Tensor) return Tensor is
       N : constant Integer := Numel (X);
       -- Compute mean of squares

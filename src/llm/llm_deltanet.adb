@@ -8,6 +8,9 @@ with LLM_Tensor; use LLM_Tensor;
 
 package body LLM_DeltaNet is
 
+   --  Hot per-token recurrence; indices derive from head dims.
+   pragma Suppress (All_Checks);
+
    function L2_Normalize (T : Tensor) return Tensor is
       N  : constant Integer := Numel (T);
       SS : Float := 0.0;
@@ -37,7 +40,8 @@ package body LLM_DeltaNet is
       V    : Tensor;
       G    : Float;
       Beta : Float;
-      O    : out Tensor)
+      O    : out Tensor;
+      Base : Integer := 0)
    is
       Dk    : constant Integer := Numel (Q);
       Dv    : constant Integer := Numel (V);
@@ -52,7 +56,7 @@ package body LLM_DeltaNet is
             Retr : Float := 0.0;
          begin
             for Ki in 1 .. Dk loop
-               Retr := Retr + G * Get (S, [Ki, Vi]) * Get_Flat (KN, Ki);
+               Retr := Retr + G * Get (S, [Base + Ki, Vi]) * Get_Flat (KN, Ki);
             end loop;
             Corr (Vi) := Beta * (Get_Flat (V, Vi) - Retr);
          end;
@@ -64,7 +68,8 @@ package body LLM_DeltaNet is
             Kk : constant Float := Get_Flat (KN, Ki);
          begin
             for Vi in 1 .. Dv loop
-               Set (S, [Ki, Vi], G * Get (S, [Ki, Vi]) + Kk * Corr (Vi));
+               Set (S, [Base + Ki, Vi],
+                    G * Get (S, [Base + Ki, Vi]) + Kk * Corr (Vi));
             end loop;
          end;
       end loop;
@@ -75,7 +80,7 @@ package body LLM_DeltaNet is
             Acc : Float := 0.0;
          begin
             for Ki in 1 .. Dk loop
-               Acc := Acc + Get (S, [Ki, Vi]) * Get_Flat (QN, Ki);
+               Acc := Acc + Get (S, [Base + Ki, Vi]) * Get_Flat (QN, Ki);
             end loop;
             Set_Flat (O, Vi, Acc * Scale);
          end;

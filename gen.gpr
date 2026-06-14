@@ -1,0 +1,21 @@
+-- fprobe.gpr — one-forward-pass probe on the real model
+project Gen is
+   for Source_Dirs use ("src", "src/llm");
+   for Object_Dir use "obj";
+   for Exec_Dir use "obj";
+   for Main use ("gen_probe.adb");
+
+   package Compiler is
+      for Default_Switches ("Ada") use ("-gnatwn", "-gnatX", "-O3", "-march=native");
+   end Compiler;
+
+   package Linker is
+      for Default_Switches ("Ada") use
+        ("-L" & external ("SDKROOT", "") & "/usr/lib",
+         "-Wl,-syslibroot," & external ("SDKROOT", ""));
+   end Linker;
+
+   package Binder is
+      for Default_Switches ("Ada") use ("-E");
+   end Binder;
+end Gen;
