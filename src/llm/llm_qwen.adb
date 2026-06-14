@@ -456,8 +456,41 @@ package body LLM_Qwen is
       end if;
    end Marker;
 
+   function Role_Str (R : Role_Kind) return String is
+     (case R is when Role_User => "user", when Role_Assistant => "assistant");
+
+   --  Token ids for one message: <|im_start|>{role}\n{text}<|im_end|>\n
+   function Msg_Ids (M : Qwen_Model; Msg : Message)
+      return LLM_Tokenizer.Token_Array
+   is
+      LF : constant String := [1 => ASCII.LF];
+      use type LLM_Tokenizer.Token_Array;
+   begin
+      return One (M.Im_Start_Id)
+        & LLM_Tokenizer.Encode (M.Tok, Role_Str (Msg.Role) & LF)
+        & LLM_Tokenizer.Encode (M.Tok, To_String (Msg.Text))
+        & One (M.Im_End_Id)
+        & LLM_Tokenizer.Encode (M.Tok, LF);
+   end Msg_Ids;
+
+   --  Token ids for messages First .. Last (recursive concat; avoids growing
+   --  a constrained array).
+   function Conv_Ids
+     (M : Qwen_Model; Conv : Message_Array; I : Positive)
+      return LLM_Tokenizer.Token_Array
+   is
+      use type LLM_Tokenizer.Token_Array;
+   begin
+      if I >= Conv'Last then
+         return Msg_Ids (M, Conv (I));
+      else
+         return Msg_Ids (M, Conv (I)) & Conv_Ids (M, Conv, I + 1);
+      end if;
+   end Conv_Ids;
+
    function Chat
-     (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256;
+     (M : Qwen_Model; Conversation : Message_Array;
+      Max_New_Tokens : Integer := 256;
       Sink : access Token_Sink'Class := null) return String
    is
       LF : constant String := [1 => ASCII.LF];
@@ -465,21 +498,16 @@ package body LLM_Qwen is
    begin
       --  Fall back to raw generation if the model has no ChatML tokens.
       if M.Im_Start_Id < 0 or else M.Im_End_Id < 0 then
-         return Generate (M, User, Max_New_Tokens, Sink);
+         return Generate
+           (M, To_String (Conversation (Conversation'Last).Text),
+            Max_New_Tokens, Sink);
       end if;
 
-      --  ChatML with thinking disabled — prefill an empty <think></think> so
-      --  the model answers directly instead of spending the token budget on a
-      --  long reasoning trace (Qwen3 enable_thinking=False convention):
-      --    <|im_start|>user\n{User}<|im_end|>\n
-      --    <|im_start|>assistant\n<think>\n\n</think>\n\n
+      --  Full transcript, then the assistant turn with thinking disabled
+      --  (empty <think></think> — Qwen3 enable_thinking=False convention).
       declare
          Ids : constant LLM_Tokenizer.Token_Array :=
-           One (M.Im_Start_Id)
-           & LLM_Tokenizer.Encode (M.Tok, "user" & LF)
-           & LLM_Tokenizer.Encode (M.Tok, User)
-           & One (M.Im_End_Id)
-           & LLM_Tokenizer.Encode (M.Tok, LF)
+           Conv_Ids (M, Conversation, Conversation'First)
            & One (M.Im_Start_Id)
            & LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
            & Marker (M, "<think>")
@@ -491,6 +519,16 @@ package body LLM_Qwen is
       begin
          return Strip_Think (Raw);
       end;
+   end Chat;
+
+   function Chat
+     (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256;
+      Sink : access Token_Sink'Class := null) return String
+   is
+   begin
+      return Chat
+        (M, Message_Array'(1 => (Role_User, To_Unbounded_String (User))),
+         Max_New_Tokens, Sink);
    end Chat;
 
    -- Parameter count (total FP32 params after dequantization)

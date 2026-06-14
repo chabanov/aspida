@@ -1,0 +1,30 @@
+-- crypto_tests.gpr — RFC test-vector suite for the crypto library.
+--
+-- Build & run:
+--   gprbuild -P crypto_tests.gpr -XSDKROOT=$(xcrun --show-sdk-path)
+--   ./obj/test_crypto
+
+with "crypto.gpr";
+with "session.gpr";
+
+project Crypto_Tests is
+
+   for Source_Dirs use ("tests/crypto");
+   for Object_Dir use "obj/crypto_tests";
+   for Exec_Dir use "obj";
+   for Main use ("test_crypto.adb", "test_hash.adb", "test_random.adb",
+                 "test_x25519.adb", "test_channel.adb",
+                 "test_pbkdf2.adb", "test_atrest.adb");
+
+   package Compiler is
+      for Default_Switches ("Ada") use
+        ("-gnatwa", "-gnatwe", "-gnatX", "-O2");
+   end Compiler;
+
+   package Linker is
+      for Default_Switches ("Ada") use
+        ("-L" & external ("SDKROOT", "") & "/usr/lib",
+         "-Wl,-syslibroot," & external ("SDKROOT", ""));
+   end Linker;
+
+end Crypto_Tests;

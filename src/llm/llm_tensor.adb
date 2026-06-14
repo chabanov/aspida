@@ -273,7 +273,9 @@ package body LLM_Tensor is
       Cols : constant Integer := W.Shape (2);
       WD   : Float_Array renames W.Data.Ptr.Data;
       XL   : Float_Array (1 .. Cols);                 -- local FP32 copy of X
-      Y    : Tensor := New_Tensor ([1, Rows]);
+      --  Constant handle: rows are written through Y.Data.Ptr.Data (the
+      --  worker op), so the handle itself is never reassigned.
+      Y    : constant Tensor := New_Tensor ([1, Rows]);
 
       C4 : constant Integer := (Cols / 4) * 4;        -- vectorised prefix length
 
