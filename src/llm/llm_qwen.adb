@@ -222,8 +222,6 @@ package body LLM_Qwen is
          end;
       end loop;
 
-      Ada.Text_IO.Put_Line ("  DEBUG: loop finished, closing GGUF...");
-
       -- Build the tokenizer from the GGUF vocab/merges (byte-level fallback
       -- if the file has no tokenizer arrays).
       M.Tok := LLM_Tokenizer.Create;
@@ -325,7 +323,8 @@ package body LLM_Qwen is
      (M              : Qwen_Model;
       Prompt_Ids     : LLM_Tokenizer.Token_Array;
       Max_New_Tokens : Integer;
-      Stop1, Stop2   : Integer) return String
+      Stop1, Stop2   : Integer;
+      Sink           : access Token_Sink'Class) return String
    is
       Dim     : constant Integer := M.Model_Dim;
       Cap     : constant Integer :=
@@ -373,11 +372,15 @@ package body LLM_Qwen is
       end loop;
 
       --  Prefill (row = id + 1: ids are 0-based, embedding rows 1-based).
+      --  Tick per token so a UI shows progress before the first output token.
       if Prompt_Ids'Length = 0 then
          Last_Logits := Decode (1);
       else
          for I in Prompt_Ids'Range loop
             Last_Logits := Decode (Prompt_Ids (I) + 1);
+            if Sink /= null then
+               Sink.Tick;
+            end if;
          end loop;
       end if;
 
@@ -388,7 +391,14 @@ package body LLM_Qwen is
          begin
             exit when Best_Row < 1 or else Best_Row > M.Vocab_Sz;
             exit when Tid = Stop1 or else Tid = Stop2;     -- stop tokens
-            Append (Out_Buf, LLM_Tokenizer.Decode_One (M.Tok, Tid));
+            declare
+               Piece : constant String := LLM_Tokenizer.Decode_One (M.Tok, Tid);
+            begin
+               Append (Out_Buf, Piece);
+               if Sink /= null then            -- stream this token now
+                  Sink.Emit (Piece);
+               end if;
+            end;
             exit when Step = Max_New_Tokens;
             Last_Logits := Decode (Best_Row);
          end;
@@ -397,11 +407,14 @@ package body LLM_Qwen is
       return To_String (Out_Buf);
    end Decode_Tokens;
 
-   function Generate (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128) return String is
+   function Generate
+     (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128;
+      Sink : access Token_Sink'Class := null) return String
+   is
       Ids : constant LLM_Tokenizer.Token_Array := LLM_Tokenizer.Encode (M.Tok, Prompt);
    begin
       --  Raw completion: no chat template, no stop token (legacy behaviour).
-      return Prompt & Decode_Tokens (M, Ids, Max_New_Tokens, -1, -1);
+      return Prompt & Decode_Tokens (M, Ids, Max_New_Tokens, -1, -1, Sink);
    end Generate;
 
    --  Drop a leading <think>...</think> reasoning block and any whitespace
@@ -443,13 +456,16 @@ package body LLM_Qwen is
       end if;
    end Marker;
 
-   function Chat (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256) return String is
+   function Chat
+     (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256;
+      Sink : access Token_Sink'Class := null) return String
+   is
       LF : constant String := [1 => ASCII.LF];
       use type LLM_Tokenizer.Token_Array;
    begin
       --  Fall back to raw generation if the model has no ChatML tokens.
       if M.Im_Start_Id < 0 or else M.Im_End_Id < 0 then
-         return Generate (M, User, Max_New_Tokens);
+         return Generate (M, User, Max_New_Tokens, Sink);
       end if;
 
       --  ChatML with thinking disabled — prefill an empty <think></think> so
@@ -471,7 +487,7 @@ package body LLM_Qwen is
            & Marker (M, "</think>")
            & LLM_Tokenizer.Encode (M.Tok, LF & LF);
          Raw : constant String :=
-           Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id);
+           Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id, Sink);
       begin
          return Strip_Think (Raw);
       end;
