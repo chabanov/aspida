@@ -19,13 +19,26 @@ package LLM_Qwen is
    -- Forward pass: token_ids [seq_len] → logits [vocab_size]
    function Forward (M : Qwen_Model; Token_Ids : LLM_Tensor.Tensor) return LLM_Tensor.Tensor;
 
+   -- Streaming sink for real-time output. Override Emit to receive each
+   -- generated token's text as soon as it is produced; Tick fires once per
+   -- prompt token during prefill (so a UI can show progress before the first
+   -- token). Pass an access to a concrete sink to Generate/Chat; null = no
+   -- streaming (the full string is still returned either way).
+   type Token_Sink is abstract tagged null record;
+   procedure Emit (Sink : in out Token_Sink; Piece : String) is abstract;
+   procedure Tick (Sink : in out Token_Sink) is null;
+
    -- Generate text from prompt (raw completion; no chat template, no stop).
-   function Generate (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128) return String;
+   function Generate
+     (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128;
+      Sink : access Token_Sink'Class := null) return String;
 
    -- Single-turn chat: wraps User in the Qwen ChatML template, generates the
    -- assistant reply (stopping at <|im_end|>/EOS), and strips the model's
    -- <think>...</think> reasoning. Returns just the assistant's answer.
-   function Chat (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256) return String;
+   function Chat
+     (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256;
+      Sink : access Token_Sink'Class := null) return String;
 
    -- Model params count (total, not activated)
    function Param_Count (M : Qwen_Model) return Long_Long_Integer;

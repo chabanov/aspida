@@ -1,27 +1,54 @@
 ---------------------------------------------------------------------
--- LLM_Chat body — interactive chat loop
--- Supports Qwen 3.5 GGUF, GPT-2 weights, and tiny random models
+-- LLM_Chat body — interactive chat loop (Qwen 3.5 MoE, streaming)
 ---------------------------------------------------------------------
 
 with Ada.Text_IO;
+with Ada.Calendar;
+with Ada.Strings.Fixed;
+with Ada.Strings;
 with Ada.Exceptions;
 with Ada.Environment_Variables;
-with LLM_Model;
 with LLM_Qwen;
 
 package body LLM_Chat is
 
+   function Img (N : Integer) return String is
+     (Ada.Strings.Fixed.Trim (Integer'Image (N), Ada.Strings.Left));
+
+   --  Streams a model's tokens to the console in real time: a dot per prompt
+   --  token while the prefill runs (so there is no silent wait), then the
+   --  answer printed token-by-token as it is generated. Counts tokens so the
+   --  caller can show a throughput footer.
+   type Console_Sink is new LLM_Qwen.Token_Sink with record
+      Started : Boolean := False;
+      Count   : Natural := 0;
+   end record;
+   --  Specs immediately after the type (before it freezes); bodies below.
+   overriding procedure Emit (S : in out Console_Sink; Piece : String);
+   overriding procedure Tick (S : in out Console_Sink);
+
+   overriding procedure Emit (S : in out Console_Sink; Piece : String) is
+   begin
+      if not S.Started then
+         Ada.Text_IO.New_Line;          -- close the prefill "...." line
+         S.Started := True;
+      end if;
+      Ada.Text_IO.Put (Piece);
+      Ada.Text_IO.Flush;
+      S.Count := S.Count + 1;
+   end Emit;
+
+   overriding procedure Tick (S : in out Console_Sink) is
+   begin
+      Ada.Text_IO.Put ('.');
+      Ada.Text_IO.Flush;
+   end Tick;
+
    procedure Run (Model_Dim : Integer := 64; N_Layers : Integer := 2) is
       use Ada.Text_IO;
+      pragma Unreferenced (Model_Dim, N_Layers);  -- legacy tiny-model knobs
 
-      -- Qwen model (from GGUF)
-      Qwen_M : LLM_Qwen.Qwen_Model;
-      -- GPT-2 model (from our converter)
-      GPT2_M : LLM_Model.GPT_Model;
-      -- Which backend is active
-      Use_Qwen : Boolean := False;
-      Use_GPT2 : Boolean := False;
-
+      Qwen_M : LLM_Qwen.Qwen_Model;               -- Qwen 3.5 model (from GGUF)
       Params : Long_Long_Integer := 0;
       Buffer : String (1 .. 4096);
       Last   : Integer;
@@ -39,29 +66,14 @@ package body LLM_Chat is
 
       QWEN_PATH : constant String := Resolve_Model_Path;
    begin
-      -- Try Qwen 3.5 first
       begin
          Qwen_M := LLM_Qwen.Load (QWEN_PATH);
          Put_Line ("=== Aspida LLM Chat (Qwen 3.5 MoE) ===");
-         Use_Qwen := True;
          Params := LLM_Qwen.Param_Count (Qwen_M);
       exception
          when E : others =>
             Put_Line ("Qwen load failed: " & Ada.Exceptions.Exception_Message (E));
-            Put_Line ("Trying GPT-2 fallback...");
-            -- Try GPT-2 next
-            begin
-               GPT2_M := LLM_Model.Load_GPT2 ("models/gpt2_small");
-               Put_Line ("=== Aspida LLM Chat (GPT-2 Small) ===");
-               Use_GPT2 := True;
-               Params := Long_Long_Integer (LLM_Model.Param_Count (GPT2_M));
-            exception
-               when others =>
-                  Put_Line ("GPT-2 not found, using random tiny model.");
-                  GPT2_M := LLM_Model.New_Tiny (Model_Dim, N_Layers);
-                  Use_GPT2 := True;
-                  Params := Long_Long_Integer (LLM_Model.Param_Count (GPT2_M));
-            end;
+            return;
       end;
 
       Put_Line ("Params: " & Long_Long_Integer'Image (Params));
@@ -89,43 +101,34 @@ package body LLM_Chat is
                Put_Line ("Context cleared.");
 
             elsif Input = "/model" then
-               if Use_Qwen then
-                  Put_Line ("Qwen 3.5 MoE | " &
-                    Integer'Image (LLM_Qwen.Block_Count (Qwen_M)) & " blocks, " &
-                    Integer'Image (LLM_Qwen.Dim (Qwen_M)) & "d, " &
-                    Long_Long_Integer'Image (Params) & " params");
-               elsif Use_GPT2 then
-                  Put_Line ("GPT-2 Small | " &
-                    Integer'Image (LLM_Model.Param_Count (GPT2_M)) & " params");
-               else
-                  Put_Line ("Tiny random model");
-               end if;
+               Put_Line ("Qwen 3.5 MoE | " &
+                 Integer'Image (LLM_Qwen.Block_Count (Qwen_M)) & " blocks, " &
+                 Integer'Image (LLM_Qwen.Dim (Qwen_M)) & "d, " &
+                 Long_Long_Integer'Image (Params) & " params");
 
             else
+               --  Stream the reply token-by-token in real time (dots during
+               --  prefill, then the answer as it is produced), then a footer.
                declare
-                  Response : String (1 .. 4096);
-                  Resp_Len : Integer := 0;
+                  Sink : aliased Console_Sink;
+                  T0   : constant Ada.Calendar.Time := Ada.Calendar.Clock;
+                  R    : constant String :=
+                    LLM_Qwen.Chat (Qwen_M, Input, 256, Sink'Access);
+                  Dt   : constant Duration :=
+                    Ada.Calendar."-" (Ada.Calendar.Clock, T0);
+                  pragma Unreferenced (R);   -- already streamed via Sink
+                  Secs : constant Float := Float (Dt);
+                  TPS10 : constant Integer :=
+                    (if Secs > 0.0
+                     then Integer (Float (Sink.Count) / Secs * 10.0) else 0);
                begin
-                  if Use_Qwen then
-                     declare
-                        --  Chat applies the ChatML template, stops at
-                        --  <|im_end|>/EOS and strips the <think> reasoning.
-                        R : constant String := LLM_Qwen.Chat (Qwen_M, Input, 256);
-                        N : constant Integer :=
-                          Integer'Min (R'Length, Response'Length);
-                     begin
-                        Response (1 .. N) := R (R'First .. R'First + N - 1);
-                        Resp_Len := N;
-                     end;
-                  else
-                     declare
-                        R : constant String := LLM_Model.Generate (GPT2_M, Input, 100);
-                     begin
-                        Response (1 .. R'Length) := R;
-                        Resp_Len := R'Length;
-                     end;
+                  if not Sink.Started then
+                     New_Line;              -- model produced no tokens
                   end if;
-                  Put_Line (Response (1 .. Resp_Len));
+                  New_Line;
+                  Put_Line ("  ["  & Img (Sink.Count) & " токенів • "
+                    & Img (Integer (Secs)) & " с • "
+                    & Img (TPS10 / 10) & "." & Img (TPS10 mod 10) & " ток/с]");
                end;
             end if;
          end;
