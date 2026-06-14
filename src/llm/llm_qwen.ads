@@ -19,8 +19,13 @@ package LLM_Qwen is
    -- Forward pass: token_ids [seq_len] → logits [vocab_size]
    function Forward (M : Qwen_Model; Token_Ids : LLM_Tensor.Tensor) return LLM_Tensor.Tensor;
 
-   -- Generate text from prompt
+   -- Generate text from prompt (raw completion; no chat template, no stop).
    function Generate (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128) return String;
+
+   -- Single-turn chat: wraps User in the Qwen ChatML template, generates the
+   -- assistant reply (stopping at <|im_end|>/EOS), and strips the model's
+   -- <think>...</think> reasoning. Returns just the assistant's answer.
+   function Chat (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256) return String;
 
    -- Model params count (total, not activated)
    function Param_Count (M : Qwen_Model) return Long_Long_Integer;
@@ -48,6 +53,10 @@ private
       N_KV_Heads : Integer := 2;
       Ctx_Len    : Integer;
       Tok        : LLM_Tokenizer.Tokenizer;
+      --  Resolved special-token ids for ChatML (-1 if absent).
+      Eos_Id       : Integer := -1;
+      Im_Start_Id  : Integer := -1;
+      Im_End_Id    : Integer := -1;
    end record;
 
    function "=" (Left, Right : Qwen_Model) return Boolean;

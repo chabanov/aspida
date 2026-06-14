@@ -239,6 +239,15 @@ package body LLM_FullAttn is
       Attn  : Tensor := New_Tensor ([1, Att_Dim]);
       Row   : constant Integer := St.Len + 1;         -- cache row for this token
    begin
+      --  Guard the KV cache bound (checks are suppressed in this unit): the
+      --  cache is sized to Max_Len at Init_State, so decoding past it would be
+      --  a silent out-of-bounds write. Fail loudly instead.
+      if Row > Shape (St.K_Cache) (1) then
+         raise Constraint_Error
+           with "FullAttn: KV cache overflow at position" & Integer'Image (Row)
+                & " (max" & Integer'Image (Shape (St.K_Cache) (1)) & ")";
+      end if;
+
       --  1. Project q(+gate), QK-norm + partial RoPE; append k, v to the cache.
       for H in 1 .. NQ loop
          declare

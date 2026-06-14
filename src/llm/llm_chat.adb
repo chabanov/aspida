@@ -108,10 +108,14 @@ package body LLM_Chat is
                begin
                   if Use_Qwen then
                      declare
-                        R : constant String := LLM_Qwen.Generate (Qwen_M, Input, 100);
+                        --  Chat applies the ChatML template, stops at
+                        --  <|im_end|>/EOS and strips the <think> reasoning.
+                        R : constant String := LLM_Qwen.Chat (Qwen_M, Input, 256);
+                        N : constant Integer :=
+                          Integer'Min (R'Length, Response'Length);
                      begin
-                        Response (1 .. R'Length) := R;
-                        Resp_Len := R'Length;
+                        Response (1 .. N) := R (R'First .. R'First + N - 1);
+                        Resp_Len := N;
                      end;
                   else
                      declare

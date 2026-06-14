@@ -17,7 +17,17 @@ package body LLM_Pool is
    --  Only the (single) top-level caller dispatches to the pool; any call
    --  made while the pool is already busy (nested matvec inside a parallel
    --  expert, or a worker re-entering Run) falls back to serial execution.
+   --
+   --  INVARIANT: at most one task initiates a top-level Run at a time. The
+   --  engine's generation loop is single-threaded above the pool, so this
+   --  holds; Pool_Busy then needs no locking (workers and nested calls only
+   --  read it). If you ever drive Run from multiple threads concurrently,
+   --  add a mutex around the busy flag.
    Pool_Busy : Boolean := False with Atomic;
+
+   --  Set by a worker (or the caller's own chunk) if its Op.Execute raised, so
+   --  Run can surface the failure instead of returning a partial result.
+   Worker_Failed : Boolean := False with Atomic;
 
    --  Counts outstanding worker chunks for the current dispatch.
    protected Barrier is
@@ -63,7 +73,15 @@ package body LLM_Pool is
          or
             terminate;
          end select;
-         My_Op.Execute (L, H);
+         --  A worker must ALWAYS Signal (else Barrier.Wait blocks forever) and
+         --  must survive (else it stops serving future work). Record the fault
+         --  so Run can raise on the caller side.
+         begin
+            My_Op.Execute (L, H);
+         exception
+            when others =>
+               Worker_Failed := True;
+         end;
          Barrier.Signal;
       end loop;
    end Worker;
@@ -87,18 +105,19 @@ package body LLM_Pool is
          return;
       end if;
 
+      Worker_Failed := False;
       Pool_Busy := True;
       declare
          NN     : constant Integer := Integer'Min (N_Workers + 1, Count);
          Chunk  : constant Integer := (Count + NN - 1) / NN;
-         Acc    : Op_Access := Op'Unchecked_Access;
+         Acc    : constant Op_Access := Op'Unchecked_Access;
          Posted : Natural := 0;
+         Caller_Failed : Boolean := False;
       begin
          --  Dispatch chunks 2 .. NN to the workers; run chunk 1 here.
          for I in 2 .. NN loop
             declare
                Lo : constant Integer := First + (I - 1) * Chunk;
-               Hi : constant Integer := Integer'Min (First + I * Chunk - 1, Last);
             begin
                exit when Lo > Last;
                Posted := Posted + 1;
@@ -117,12 +136,27 @@ package body LLM_Pool is
             end;
          end loop;
 
-         --  Calling thread takes chunk 1.
-         Op.Execute (First, Integer'Min (First + Chunk - 1, Last));
+         --  Calling thread takes chunk 1. Capture (don't propagate) a fault
+         --  here so we still drain the barrier — the workers are running and
+         --  WILL Signal; leaving without waiting would let them write into a
+         --  result the caller has already abandoned.
+         begin
+            Op.Execute (First, Integer'Min (First + Chunk - 1, Last));
+         exception
+            when others =>
+               Caller_Failed := True;
+         end;
 
          Barrier.Wait;
+         Pool_Busy := False;
+
+         if Caller_Failed or else Worker_Failed then
+            Worker_Failed := False;
+            raise Program_Error
+              with "LLM_Pool: a parallel operation raised an exception";
+         end if;
       end;
-      Pool_Busy := False;
+      return;
    end Run;
 
 end LLM_Pool;

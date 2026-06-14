@@ -199,6 +199,15 @@ package body LLM_Tokenizer is
       end if;
    end Decode_One;
 
+   function Token_To_Id (T : Tokenizer; Piece : String) return Integer is
+   begin
+      if T /= null and then T.Vocab.Contains (Piece) then
+         return T.Vocab.Element (Piece);
+      else
+         return -1;
+      end if;
+   end Token_To_Id;
+
    function Decode (T : Tokenizer; Ids : Token_Array) return String is
       R : Unbounded_String;
    begin

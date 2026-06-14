@@ -231,6 +231,17 @@ package body LLM_Qwen is
       Ada.Text_IO.Put_Line ("  tokenizer: " &
         Img (LLM_Tokenizer.Vocab_Size (M.Tok)) & " tokens.");
 
+      --  Resolve ChatML control tokens for the chat layer (-1 if absent).
+      M.Im_Start_Id := LLM_Tokenizer.Token_To_Id (M.Tok, "<|im_start|>");
+      M.Im_End_Id   := LLM_Tokenizer.Token_To_Id (M.Tok, "<|im_end|>");
+      begin
+         M.Eos_Id := Integer'Value (Metadata (G, "tokenizer.ggml.eos_token_id"));
+      exception
+         when others => M.Eos_Id := M.Im_End_Id;
+      end;
+      Ada.Text_IO.Put_Line ("  chat tokens: im_start=" & Img (M.Im_Start_Id)
+        & " im_end=" & Img (M.Im_End_Id) & " eos=" & Img (M.Eos_Id));
+
       Close (G);
       Ada.Text_IO.Put_Line ("  Qwen model loaded: " & Img (M.N_Blocks) & " blocks.");
       return M;
@@ -307,19 +318,25 @@ package body LLM_Qwen is
    -- Generate (autoregressive loop)
    --------------------------------------------------------------------
 
-   function Generate (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128) return String is
+   --  Shared cached-decode core: prefill the prompt token ids, then greedily
+   --  generate up to Max_New_Tokens, stopping early at Stop1/Stop2 (ids; -1 =
+   --  none). Returns the decoded text of the GENERATED tokens only.
+   function Decode_Tokens
+     (M              : Qwen_Model;
+      Prompt_Ids     : LLM_Tokenizer.Token_Array;
+      Max_New_Tokens : Integer;
+      Stop1, Stop2   : Integer) return String
+   is
       Dim     : constant Integer := M.Model_Dim;
-      Ids     : constant LLM_Tokenizer.Token_Array := LLM_Tokenizer.Encode (M.Tok, Prompt);
-      Cap     : constant Integer := Integer'Max (1, Ids'Length + Max_New_Tokens);
-      Out_Buf : Unbounded_String := To_Unbounded_String (Prompt);
+      Cap     : constant Integer :=
+        Integer'Max (1, Prompt_Ids'Length + Max_New_Tokens);
+      Out_Buf : Unbounded_String;
 
       --  Per-layer decode state (KV cache for full-attn, recurrent state +
       --  conv window for delta-net), threaded across tokens. One forward
-      --  step now costs O(1) matmuls instead of recomputing the sequence.
+      --  step costs O(1) matmuls instead of recomputing the sequence.
       Cache : array (1 .. M.N_Blocks) of LLM_Qwen_Blk.Block_State;
 
-      --  Decode one token (1-based embedding row) through the cached stack,
-      --  advancing every layer's state; returns next-token logits [1, vocab].
       function Decode (Embed_Row : Integer) return Tensor is
          H : Tensor := New_Tensor ([1, Dim]);
       begin
@@ -355,31 +372,110 @@ package body LLM_Qwen is
          Cache (I) := LLM_Qwen_Blk.Init_State (M.Blocks (I).all, Cap);
       end loop;
 
-      --  Prefill: feed the prompt tokens (row = id + 1, since ids are 0-based
-      --  but embedding rows are 1-based). The last step's logits predict the
-      --  first generated token.
-      if Ids'Length = 0 then
+      --  Prefill (row = id + 1: ids are 0-based, embedding rows 1-based).
+      if Prompt_Ids'Length = 0 then
          Last_Logits := Decode (1);
       else
-         for I in Ids'Range loop
-            Last_Logits := Decode (Ids (I) + 1);
+         for I in Prompt_Ids'Range loop
+            Last_Logits := Decode (Prompt_Ids (I) + 1);
          end loop;
       end if;
 
-      --  Greedy autoregressive decode.
       for Step in 1 .. Max_New_Tokens loop
          declare
             Best_Row : constant Integer := Argmax (Last_Logits);
+            Tid      : constant Integer := Best_Row - 1;   -- 0-based token id
          begin
             exit when Best_Row < 1 or else Best_Row > M.Vocab_Sz;
-            Append (Out_Buf, LLM_Tokenizer.Decode_One (M.Tok, Best_Row - 1));
+            exit when Tid = Stop1 or else Tid = Stop2;     -- stop tokens
+            Append (Out_Buf, LLM_Tokenizer.Decode_One (M.Tok, Tid));
             exit when Step = Max_New_Tokens;
             Last_Logits := Decode (Best_Row);
          end;
       end loop;
 
       return To_String (Out_Buf);
+   end Decode_Tokens;
+
+   function Generate (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128) return String is
+      Ids : constant LLM_Tokenizer.Token_Array := LLM_Tokenizer.Encode (M.Tok, Prompt);
+   begin
+      --  Raw completion: no chat template, no stop token (legacy behaviour).
+      return Prompt & Decode_Tokens (M, Ids, Max_New_Tokens, -1, -1);
    end Generate;
+
+   --  Drop a leading <think>...</think> reasoning block and any whitespace
+   --  before the answer; if the block never closed (ran past the budget),
+   --  keep the raw text so nothing is silently lost.
+   function Strip_Think (S : String) return String is
+      Close_Tag : constant String := "</think>";
+      Idx       : constant Natural := Index (S, Close_Tag);
+      First     : Integer;
+   begin
+      if Idx = 0 then
+         return S;
+      end if;
+      First := Idx + Close_Tag'Length;
+      while First <= S'Last
+        and then (S (First) = ' ' or else S (First) = ASCII.LF
+                  or else S (First) = ASCII.CR or else S (First) = ASCII.HT)
+      loop
+         First := First + 1;
+      end loop;
+      return S (First .. S'Last);
+   end Strip_Think;
+
+   function One (Id : Integer) return LLM_Tokenizer.Token_Array is
+     [1 => Id];
+
+   --  A control marker resolved to its single special-token id if the vocab
+   --  has one, else its byte-BPE pieces — works whether <think> etc. are
+   --  special tokens or plain text.
+   function Marker (M : Qwen_Model; Piece : String)
+      return LLM_Tokenizer.Token_Array
+   is
+      Id : constant Integer := LLM_Tokenizer.Token_To_Id (M.Tok, Piece);
+   begin
+      if Id >= 0 then
+         return One (Id);
+      else
+         return LLM_Tokenizer.Encode (M.Tok, Piece);
+      end if;
+   end Marker;
+
+   function Chat (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256) return String is
+      LF : constant String := [1 => ASCII.LF];
+      use type LLM_Tokenizer.Token_Array;
+   begin
+      --  Fall back to raw generation if the model has no ChatML tokens.
+      if M.Im_Start_Id < 0 or else M.Im_End_Id < 0 then
+         return Generate (M, User, Max_New_Tokens);
+      end if;
+
+      --  ChatML with thinking disabled — prefill an empty <think></think> so
+      --  the model answers directly instead of spending the token budget on a
+      --  long reasoning trace (Qwen3 enable_thinking=False convention):
+      --    <|im_start|>user\n{User}<|im_end|>\n
+      --    <|im_start|>assistant\n<think>\n\n</think>\n\n
+      declare
+         Ids : constant LLM_Tokenizer.Token_Array :=
+           One (M.Im_Start_Id)
+           & LLM_Tokenizer.Encode (M.Tok, "user" & LF)
+           & LLM_Tokenizer.Encode (M.Tok, User)
+           & One (M.Im_End_Id)
+           & LLM_Tokenizer.Encode (M.Tok, LF)
+           & One (M.Im_Start_Id)
+           & LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
+           & Marker (M, "<think>")
+           & LLM_Tokenizer.Encode (M.Tok, LF & LF)
+           & Marker (M, "</think>")
+           & LLM_Tokenizer.Encode (M.Tok, LF & LF);
+         Raw : constant String :=
+           Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id);
+      begin
+         return Strip_Think (Raw);
+      end;
+   end Chat;
 
    -- Parameter count (total FP32 params after dequantization)
    -- Safe addition: only add if tensor has elements (skip uninit tensors)
