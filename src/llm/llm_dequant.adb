@@ -140,9 +140,20 @@ package body LLM_Dequant is
             SC_H : constant Natural := SC_Base + Half * 8;
             Y_H  : constant Natural := Half * 128;   -- block-local base
          begin
-            for L in 0 .. 31 loop
+            --  Each half splits into two 16-element groups (Is = L/16) that
+            --  share four scales. Hoist the scale lookups out of the element
+            --  loop (no per-element S8 call or division) so the branchless
+            --  extraction + scale of all four quant streams vectorises.
+            for IG in 0 .. 1 loop
                declare
-                  Is_Idx : constant Natural := L / 16;
+                  DS1 : constant Float := D * Float (S8 (SC_H + IG + 0));
+                  DS2 : constant Float := D * Float (S8 (SC_H + IG + 2));
+                  DS3 : constant Float := D * Float (S8 (SC_H + IG + 4));
+                  DS4 : constant Float := D * Float (S8 (SC_H + IG + 6));
+                  LB  : constant Natural := IG * 16;
+               begin
+            for L in LB .. LB + 15 loop
+               declare
                   QL_L   : constant Unsigned_32 :=
                     Unsigned_32 (Character'Pos (X (QL_H + L)));
                   QL_L32 : constant Unsigned_32 :=
@@ -161,10 +172,12 @@ package body LLM_Dequant is
                     Integer (Shift_Right (QL_L32, 4)
                              or Shift_Left (Shift_Right (QH_L, 6) and 3, 4)) - 32;
                begin
-                  B (Y_H + L + 1)  := D * Float (S8 (SC_H + Is_Idx + 0)) * Float (Q1);
-                  B (Y_H + L + 33) := D * Float (S8 (SC_H + Is_Idx + 2)) * Float (Q2);
-                  B (Y_H + L + 65) := D * Float (S8 (SC_H + Is_Idx + 4)) * Float (Q3);
-                  B (Y_H + L + 97) := D * Float (S8 (SC_H + Is_Idx + 6)) * Float (Q4);
+                  B (Y_H + L + 1)  := DS1 * Float (Q1);
+                  B (Y_H + L + 33) := DS2 * Float (Q2);
+                  B (Y_H + L + 65) := DS3 * Float (Q3);
+                  B (Y_H + L + 97) := DS4 * Float (Q4);
+               end;
+            end loop;
                end;
             end loop;
          end;
@@ -489,6 +502,16 @@ package body LLM_Dequant is
       --  (no Tensor access indirection), so the compiler can vectorise (FMA).
       XL : array (1 .. In_Dim) of Float;
    begin
+      --  K-quants only exist for 256-element super-blocks; the fused path
+      --  drops a partial trailing block. Guard explicitly (checks are
+      --  suppressed in this unit) so a malformed tensor fails loudly here
+      --  rather than silently producing a wrong dot product.
+      if (Is_Q5K or else Is_Q6K) and then In_Dim mod 256 /= 0 then
+         raise Constraint_Error
+           with "QMatVec: K-quant in-dim" & Integer'Image (In_Dim)
+                & " is not a multiple of 256";
+      end if;
+
       Row_Info.N_Dims := 2;
       Row_Info.Dims   := [Info.Dims (1), 1, 0, 0];
       BPR := Natural (LLM_GGUF.Tensor_Byte_Size (Row_Info));

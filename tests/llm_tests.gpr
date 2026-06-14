@@ -12,7 +12,8 @@ project LLM_Tests is
    for Main use ("test_rmsnorm.adb", "test_attention.adb", "test_moe.adb",
                  "test_tokenizer.adb", "test_ssm.adb", "test_tensor.adb",
                  "test_deltanet.adb", "test_deltanet_blk.adb", "test_fullattn.adb", "test_block.adb",
-                 "test_tokenizer_real.adb", "test_weights_real.adb", "test_qmatvec_real.adb");
+                 "test_tokenizer_real.adb", "test_weights_real.adb", "test_qmatvec_real.adb",
+                 "test_pool.adb");
 
    package Compiler is
       for Default_Switches ("Ada") use LLM.Compiler'Default_Switches ("Ada");

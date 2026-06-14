@@ -42,6 +42,10 @@ package LLM_Tokenizer is
    -- Single id -> its piece (for streaming generation).
    function Decode_One (T : Tokenizer; Id : Integer) return String;
 
+   -- Exact piece -> id, or -1 if absent. Resolves special/control tokens
+   -- (e.g. "<|im_start|>", "<|im_end|>") that byte-level Encode would split.
+   function Token_To_Id (T : Tokenizer; Piece : String) return Integer;
+
 private
 
    type Tokenizer_Data;
