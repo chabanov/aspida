@@ -28,26 +28,23 @@ package body LLM_RoPE is
       Theta    : Float;
       Cos_Val  : Float;
       Sin_Val  : Float;
-      X_Rot    : Float;
-      X_Pass   : Float;
+      X1, X2   : Float;
    begin
-      -- Compute inv_freq: theta_i = pos / (freq_base ^ (2i / dim))
+      --  NeoX / rotate_half convention (Qwen, Llama): pair dimension i with
+      --  i + dim/2 (first half with second half), NOT adjacent (2i, 2i+1).
+      --    theta_i = pos / freq_base^(2i/dim)
+      --    out[i]          = x[i]*cos - x[i+d/2]*sin
+      --    out[i+d/2]      = x[i+d/2]*cos + x[i]*sin
       for I in 0 .. Half_Dim - 1 loop
          Theta := Float (Pos) / (P.Freq_Base ** (Float (2 * I) / Float (P.Dim)));
-
          Cos_Val := Cos (Theta);
          Sin_Val := Sin (Theta);
 
-         -- Rotate pair (x_2i, x_2i+1):
-         --   new_x_2i   = x_2i * cos - x_2i+1 * sin
-         --   new_x_2i+1 = x_2i+1 * cos + x_2i * sin
-         X_Rot  := Get_Flat (X, 2 * I + 1);
-         X_Pass := Get_Flat (X, 2 * I + 2);
+         X1 := Get_Flat (X, I + 1);              -- first half
+         X2 := Get_Flat (X, I + Half_Dim + 1);   -- second half
 
-         Set_Flat (Result, 2 * I + 1,
-           X_Rot * Cos_Val - X_Pass * Sin_Val);
-         Set_Flat (Result, 2 * I + 2,
-           X_Pass * Cos_Val + X_Rot * Sin_Val);
+         Set_Flat (Result, I + 1,            X1 * Cos_Val - X2 * Sin_Val);
+         Set_Flat (Result, I + Half_Dim + 1, X2 * Cos_Val + X1 * Sin_Val);
       end loop;
 
       return Result;

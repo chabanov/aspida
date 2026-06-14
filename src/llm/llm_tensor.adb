@@ -7,8 +7,16 @@ with Ada.Text_IO;
 with Ada.Numerics.Generic_Elementary_Functions;
 with Ada.Numerics;
 with Ada.Unchecked_Deallocation;
+with LLM_Pool;
 
 package body LLM_Tensor is
+
+   --  Tensor element access (Get/Set/Get_Flat/Set_Flat) and the flat matvec
+   --  are the per-element primitives of every layer. Their indices come from
+   --  loop bounds derived from the tensors' own shapes, so the range/index
+   --  checks are redundant; suppressing them removes per-access overhead in
+   --  the hottest loops and lets MatVec_Rows vectorise cleanly.
+   pragma Suppress (All_Checks);
 
    package Float_Math is new Ada.Numerics.Generic_Elementary_Functions (Float);
    use Float_Math;
@@ -255,6 +263,58 @@ package body LLM_Tensor is
       end loop;
       return R;
    end Matmul;
+
+   --------------------------------------------------------------------
+   -- Flat dense matrix-vector product (parallel, vectorisable)
+   --------------------------------------------------------------------
+
+   function MatVec_Rows (W : Tensor; X : Tensor) return Tensor is
+      Rows : constant Integer := W.Shape (1);
+      Cols : constant Integer := W.Shape (2);
+      WD   : Float_Array renames W.Data.Ptr.Data;
+      XL   : Float_Array (1 .. Cols);                 -- local FP32 copy of X
+      Y    : Tensor := New_Tensor ([1, Rows]);
+
+      C4 : constant Integer := (Cols / 4) * 4;        -- vectorised prefix length
+
+      type Rows_Op is new LLM_Pool.Parallel_Op with null record;
+      overriding procedure Execute (Op : in out Rows_Op; Lo, Hi : Integer) is
+      begin
+         for R in Lo .. Hi loop
+            declare
+               Base : constant Integer := (R - 1) * Cols;
+               --  Four lanes break the FP reduction dependency chain → NEON.
+               A0, A1, A2, A3 : Float := 0.0;
+               C  : Integer := 1;
+            begin
+               while C <= C4 loop
+                  A0 := A0 + WD (Base + C)     * XL (C);
+                  A1 := A1 + WD (Base + C + 1) * XL (C + 1);
+                  A2 := A2 + WD (Base + C + 2) * XL (C + 2);
+                  A3 := A3 + WD (Base + C + 3) * XL (C + 3);
+                  C := C + 4;
+               end loop;
+               declare
+                  Acc : Float := (A0 + A1) + (A2 + A3);
+               begin
+                  while C <= Cols loop           -- tail (Cols not /4)
+                     Acc := Acc + WD (Base + C) * XL (C);
+                     C := C + 1;
+                  end loop;
+                  Y.Data.Ptr.Data (R) := Acc;
+               end;
+            end;
+         end loop;
+      end Execute;
+
+      Op : Rows_Op;
+   begin
+      for C in 1 .. Cols loop
+         XL (C) := X.Data.Ptr.Data (C);
+      end loop;
+      LLM_Pool.Run (Op, 1, Rows, Min_Grain => 512);
+      return Y;
+   end MatVec_Rows;
 
    --------------------------------------------------------------------
    -- Dot product (1D vectors)

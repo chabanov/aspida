@@ -24,13 +24,16 @@ package LLM_DeltaNet is
    function Init_State (Dk, Dv : Integer) return LLM_Tensor.Tensor;
 
    -- One token step for one head. Q,K are [1,Dk]; V,O are [1,Dv].
-   -- State S [Dk, Dv] is updated in place; O receives the output.
+   -- The head's state occupies rows Base+1 .. Base+Dk of S (Base=0 for a
+   -- standalone [Dk,Dv] state; >0 to address one head's slice of a packed
+   -- [n_heads*Dk, Dv] state in place, avoiding an unpack/repack copy).
    procedure Step
      (S    : in out LLM_Tensor.Tensor;
       Q, K : LLM_Tensor.Tensor;
       V    : LLM_Tensor.Tensor;
       G    : Float;
       Beta : Float;
-      O    : out LLM_Tensor.Tensor);
+      O    : out LLM_Tensor.Tensor;
+      Base : Integer := 0);
 
 end LLM_DeltaNet;

@@ -70,4 +70,51 @@ package body LLM_Qwen_Blk is
       return H;
    end Forward;
 
+   --------------------------------------------------------------------
+   -- Incremental decode
+   --------------------------------------------------------------------
+
+   function Init_State (B : Qwen_Block; Max_Len : Integer) return Block_State is
+   begin
+      return St : Block_State do
+         St.Is_Full := B.Is_Full_Attn;
+         if B.Is_Full_Attn then
+            St.Full_St := LLM_FullAttn.Init_State (B.Full, Max_Len);
+         else
+            St.DNet_St := LLM_DeltaNet_Blk.Init_State (B.DNet);
+         end if;
+      end return;
+   end Init_State;
+
+   function Step (B : Qwen_Block; St : in out Block_State; X : Tensor)
+      return Tensor
+   is
+      Dim      : constant Integer := B.Dim;
+      H        : Tensor := X;   -- residual stream [1, dim]
+      Norm_X   : constant Tensor := LLM_RMSNorm.Forward (X, B.Attn_Norm_W);
+      Attn_Out : Tensor;
+   begin
+      --  Step 1: pre-attention RMSNorm + (attention | delta-net) + residual.
+      if B.Is_Full_Attn then
+         Attn_Out := LLM_FullAttn.Step (B.Full, St.Full_St, Norm_X);
+      else
+         Attn_Out := LLM_DeltaNet_Blk.Step (B.DNet, St.DNet_St, Norm_X);
+      end if;
+      for I in 1 .. Dim loop
+         Set_Flat (H, I, Get_Flat (H, I) + Get_Flat (Attn_Out, I));
+      end loop;
+
+      --  Step 2: post-attention RMSNorm + MoE + residual.
+      declare
+         NR      : constant Tensor := LLM_RMSNorm.Forward (H, B.Post_Attn_Norm_W);
+         Moe_Row : constant Tensor := LLM_MoE.Forward (B.MoE, NR);
+      begin
+         for I in 1 .. Dim loop
+            Set_Flat (H, I, Get_Flat (H, I) + Get_Flat (Moe_Row, I));
+         end loop;
+      end;
+
+      return H;
+   end Step;
+
 end LLM_Qwen_Blk;

@@ -10,6 +10,9 @@ with LLM_Weight; use LLM_Weight;
 
 package body LLM_FullAttn is
 
+   --  Hot per-token kernel; indices derive from the layer's own dims.
+   pragma Suppress (All_Checks);
+
    function Sigmoid (X : Float) return Float is (1.0 / (1.0 + Exp (-X)));
 
    function Create
@@ -201,5 +204,136 @@ package body LLM_FullAttn is
 
       return Out_T;
    end Forward;
+
+   --------------------------------------------------------------------
+   -- Incremental decode
+   --------------------------------------------------------------------
+
+   function Init_State (L : Full_Attn_Layer; Max_Len : Integer) return Attn_State is
+      KV_Dim : constant Integer := L.N_KV_Heads * L.Head_Dim;
+   begin
+      return St : Attn_State do
+         St.K_Cache := New_Tensor ([Integer'Max (1, Max_Len), KV_Dim]);
+         St.V_Cache := New_Tensor ([Integer'Max (1, Max_Len), KV_Dim]);
+         St.Len     := 0;
+      end return;
+   end Init_State;
+
+   function Step (L : Full_Attn_Layer; St : in out Attn_State; X : Tensor)
+      return Tensor
+   is
+      Dim     : constant Integer := L.Dim;
+      NQ      : constant Integer := L.N_Q_Heads;
+      NKV     : constant Integer := L.N_KV_Heads;
+      HD      : constant Integer := L.Head_Dim;
+      Rep     : constant Integer := NQ / NKV;
+      Scale   : constant Float := 1.0 / Sqrt (Float (HD));
+      Att_Dim : constant Integer := NQ * HD;
+      Pos     : constant Integer := St.Len;        -- 0-based abs position for RoPE
+
+      QG    : constant Tensor := MatVec (L.Q_W, X);   -- [1, n_q*2*head_dim]
+      Kt    : constant Tensor := MatVec (L.K_W, X);   -- [1, n_kv*head_dim]
+      Vt    : constant Tensor := MatVec (L.V_W, X);
+      Q_All : Tensor := New_Tensor ([1, NQ * HD]);
+      G_All : Tensor := New_Tensor ([1, NQ * HD]);    -- raw gate
+      Attn  : Tensor := New_Tensor ([1, Att_Dim]);
+      Row   : constant Integer := St.Len + 1;         -- cache row for this token
+   begin
+      --  1. Project q(+gate), QK-norm + partial RoPE; append k, v to the cache.
+      for H in 1 .. NQ loop
+         declare
+            Base : constant Integer := (H - 1) * 2 * HD;
+            Qh   : Tensor := New_Tensor ([1, HD]);
+         begin
+            for D in 1 .. HD loop
+               Set_Flat (Qh, D, Get_Flat (QG, Base + D));
+               Set (G_All, [1, (H - 1) * HD + D], Get_Flat (QG, Base + HD + D));
+            end loop;
+            declare
+               QR : constant Tensor := Norm_Rope (Qh, L.Q_Norm, L.RoPE, Pos);
+            begin
+               for D in 1 .. HD loop
+                  Set (Q_All, [1, (H - 1) * HD + D], Get_Flat (QR, D));
+               end loop;
+            end;
+         end;
+      end loop;
+
+      for J in 1 .. NKV loop
+         declare
+            Kh : Tensor := New_Tensor ([1, HD]);
+         begin
+            for D in 1 .. HD loop
+               Set_Flat (Kh, D, Get_Flat (Kt, (J - 1) * HD + D));
+               Set (St.V_Cache, [Row, (J - 1) * HD + D],
+                    Get_Flat (Vt, (J - 1) * HD + D));
+            end loop;
+            declare
+               KR : constant Tensor := Norm_Rope (Kh, L.K_Norm, L.RoPE, Pos);
+            begin
+               for D in 1 .. HD loop
+                  Set (St.K_Cache, [Row, (J - 1) * HD + D], Get_Flat (KR, D));
+               end loop;
+            end;
+         end;
+      end loop;
+
+      St.Len := Row;
+
+      --  2. Causal GQA softmax over all cached positions, then sigmoid gate.
+      for H in 1 .. NQ loop
+         declare
+            KVH    : constant Integer := (H - 1) / Rep + 1;
+            Q_Off  : constant Integer := (H - 1) * HD;
+            KV_Off : constant Integer := (KVH - 1) * HD;
+            Scores : array (1 .. St.Len) of Float;
+            Max_S  : Float := Float'First;
+            Sum_E  : Float := 0.0;
+         begin
+            for SS in 1 .. St.Len loop
+               declare
+                  Dot : Float := 0.0;
+               begin
+                  for D in 1 .. HD loop
+                     Dot := Dot + Get (Q_All, [1, Q_Off + D])
+                                  * Get (St.K_Cache, [SS, KV_Off + D]);
+                  end loop;
+                  Scores (SS) := Dot * Scale;
+                  if Scores (SS) > Max_S then
+                     Max_S := Scores (SS);
+                  end if;
+               end;
+            end loop;
+            for SS in 1 .. St.Len loop
+               Scores (SS) := Exp (Scores (SS) - Max_S);
+               Sum_E := Sum_E + Scores (SS);
+            end loop;
+
+            for D in 1 .. HD loop
+               declare
+                  Acc : Float := 0.0;
+               begin
+                  for SS in 1 .. St.Len loop
+                     Acc := Acc + (Scores (SS) / Sum_E)
+                                  * Get (St.V_Cache, [SS, KV_Off + D]);
+                  end loop;
+                  Set (Attn, [1, Q_Off + D],
+                       Acc * Sigmoid (Get (G_All, [1, Q_Off + D])));
+               end;
+            end loop;
+         end;
+      end loop;
+
+      --  3. Output projection.
+      declare
+         Ot    : constant Tensor := MatVec (L.O_W, Attn);
+         Out_T : Tensor := New_Tensor ([1, Dim]);
+      begin
+         for D in 1 .. Dim loop
+            Set_Flat (Out_T, D, Get_Flat (Ot, D));
+         end loop;
+         return Out_T;
+      end;
+   end Step;
 
 end LLM_FullAttn;

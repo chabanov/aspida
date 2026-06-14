@@ -118,6 +118,30 @@ begin
               Close (Get (O3, [T, I]), Get (O2, [T, I])));
          end loop;
       end loop;
+
+      --  Incremental decode (KV cache) == batched Forward.
+      declare
+         St : LLM_FullAttn.Attn_State := LLM_FullAttn.Init_State (Layer, 3);
+      begin
+         for T in 1 .. 3 loop
+            declare
+               Xt : Tensor := New_Tensor ([1, Dim]);
+            begin
+               for I in 1 .. Dim loop
+                  Set_Flat (Xt, I, Get (X3, [T, I]));
+               end loop;
+               declare
+                  Ot : constant Tensor := LLM_FullAttn.Step (Layer, St, Xt);
+               begin
+                  for I in 1 .. Dim loop
+                     Assert ("incremental==batched: pos" & Integer'Image (T)
+                       & " dim" & Integer'Image (I),
+                       Close (Get_Flat (Ot, I), Get (O3, [T, I])));
+                  end loop;
+               end;
+            end;
+         end loop;
+      end;
    end;
 
    New_Line;

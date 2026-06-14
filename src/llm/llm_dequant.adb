@@ -4,13 +4,26 @@
 
 with Ada.Text_IO;
 with Interfaces; use Interfaces;
-with LLM_Parallel;
+with LLM_Pool;
 
 package body LLM_Dequant is
+
+   --  This unit is the quantized-matvec hot path: every element is reached by
+   --  index arithmetic that is correct by construction (super-block layout is
+   --  fixed, ranges validated bit-exact against llama + the real-model tests).
+   --  Suppressing the per-element index/range/overflow checks lets the decode
+   --  and dot inner loops run without that tax (and helps the compiler keep
+   --  them in registers / vectorise). Checks stay on everywhere else.
+   pragma Suppress (All_Checks);
 
    use LLM_Tensor;
 
    subtype Byte is Interfaces.Unsigned_8;
+
+   --  One dequantized super-block (256 elements) on the stack — lets the hot
+   --  matvec kernel fuse decode + dot over local arrays (vectorisable, no heap,
+   --  no Tensor access indirection).
+   type Block256 is array (1 .. 256) of Float;
 
    --------------------------------------------------------------------
    -- F16 → F32 conversion
@@ -106,70 +119,69 @@ package body LLM_Dequant is
    --  advance by 64/32/8. Value: y = d * scales[is] * (q6 - 32).
    --------------------------------------------------------------------
 
-   procedure Dequant_Q6_K (X : String; Q : out Tensor; N : Natural) is
-      Blocks : constant Natural := N / 256;
-      Pos    : Natural := X'First;
-      Q_Base : Natural := 1;   -- 1-based flat index of this block's first elem
-
-      function S8 (P : Natural) return Integer is   -- signed int8 at byte P
+   --  Decode ONE Q6_K super-block (210 bytes at Pos) into B (1..256).
+   procedure Decode_Q6K_Block (X : String; Pos : Natural; B : out Block256) is
+      function S8 (P : Natural) return Integer is
          U : constant Integer := Character'Pos (X (P));
       begin
          return (if U >= 128 then U - 256 else U);
       end S8;
+      QL_Base : constant Natural := Pos;
+      QH_Base : constant Natural := Pos + 128;
+      SC_Base : constant Natural := Pos + 192;
+      D       : constant Float := F16_To_F32 (
+        Byte (Character'Pos (X (Pos + 208))),
+        Byte (Character'Pos (X (Pos + 209))));
    begin
-      for B in 1 .. Blocks loop
+      for Half in 0 .. 1 loop
          declare
-            QL_Base : constant Natural := Pos;          -- ql[128]
-            QH_Base : constant Natural := Pos + 128;    -- qh[64]
-            SC_Base : constant Natural := Pos + 192;    -- scales[16]
-            D       : constant Float := F16_To_F32 (
-              Byte (Character'Pos (X (Pos + 208))),
-              Byte (Character'Pos (X (Pos + 209))));
+            QL_H : constant Natural := QL_Base + Half * 64;
+            QH_H : constant Natural := QH_Base + Half * 32;
+            SC_H : constant Natural := SC_Base + Half * 8;
+            Y_H  : constant Natural := Half * 128;   -- block-local base
          begin
-            for Half in 0 .. 1 loop
+            for L in 0 .. 31 loop
                declare
-                  QL_H : constant Natural := QL_Base + Half * 64;
-                  QH_H : constant Natural := QH_Base + Half * 32;
-                  SC_H : constant Natural := SC_Base + Half * 8;
-                  Y_H  : constant Natural := Q_Base + Half * 128;
+                  Is_Idx : constant Natural := L / 16;
+                  QL_L   : constant Unsigned_32 :=
+                    Unsigned_32 (Character'Pos (X (QL_H + L)));
+                  QL_L32 : constant Unsigned_32 :=
+                    Unsigned_32 (Character'Pos (X (QL_H + L + 32)));
+                  QH_L   : constant Unsigned_32 :=
+                    Unsigned_32 (Character'Pos (X (QH_H + L)));
+                  Q1 : constant Integer :=
+                    Integer ((QL_L and 16#0F#) or Shift_Left (QH_L and 3, 4)) - 32;
+                  Q2 : constant Integer :=
+                    Integer ((QL_L32 and 16#0F#)
+                             or Shift_Left (Shift_Right (QH_L, 2) and 3, 4)) - 32;
+                  Q3 : constant Integer :=
+                    Integer (Shift_Right (QL_L, 4)
+                             or Shift_Left (Shift_Right (QH_L, 4) and 3, 4)) - 32;
+                  Q4 : constant Integer :=
+                    Integer (Shift_Right (QL_L32, 4)
+                             or Shift_Left (Shift_Right (QH_L, 6) and 3, 4)) - 32;
                begin
-                  for L in 0 .. 31 loop
-                     declare
-                        Is_Idx : constant Natural := L / 16;  -- 0 or 1
-                        QL_L   : constant Unsigned_32 :=
-                          Unsigned_32 (Character'Pos (X (QL_H + L)));
-                        QL_L32 : constant Unsigned_32 :=
-                          Unsigned_32 (Character'Pos (X (QL_H + L + 32)));
-                        QH_L   : constant Unsigned_32 :=
-                          Unsigned_32 (Character'Pos (X (QH_H + L)));
-                        Q1 : constant Integer :=
-                          Integer ((QL_L and 16#0F#)
-                                   or Shift_Left (QH_L and 3, 4)) - 32;
-                        Q2 : constant Integer :=
-                          Integer ((QL_L32 and 16#0F#)
-                                   or Shift_Left (Shift_Right (QH_L, 2) and 3, 4)) - 32;
-                        Q3 : constant Integer :=
-                          Integer (Shift_Right (QL_L, 4)
-                                   or Shift_Left (Shift_Right (QH_L, 4) and 3, 4)) - 32;
-                        Q4 : constant Integer :=
-                          Integer (Shift_Right (QL_L32, 4)
-                                   or Shift_Left (Shift_Right (QH_L, 6) and 3, 4)) - 32;
-                     begin
-                        Set_Flat (Q, Y_H + L,
-                          D * Float (S8 (SC_H + Is_Idx + 0)) * Float (Q1));
-                        Set_Flat (Q, Y_H + L + 32,
-                          D * Float (S8 (SC_H + Is_Idx + 2)) * Float (Q2));
-                        Set_Flat (Q, Y_H + L + 64,
-                          D * Float (S8 (SC_H + Is_Idx + 4)) * Float (Q3));
-                        Set_Flat (Q, Y_H + L + 96,
-                          D * Float (S8 (SC_H + Is_Idx + 6)) * Float (Q4));
-                     end;
-                  end loop;
+                  B (Y_H + L + 1)  := D * Float (S8 (SC_H + Is_Idx + 0)) * Float (Q1);
+                  B (Y_H + L + 33) := D * Float (S8 (SC_H + Is_Idx + 2)) * Float (Q2);
+                  B (Y_H + L + 65) := D * Float (S8 (SC_H + Is_Idx + 4)) * Float (Q3);
+                  B (Y_H + L + 97) := D * Float (S8 (SC_H + Is_Idx + 6)) * Float (Q4);
                end;
             end loop;
-            Pos := Pos + 210;
-            Q_Base := Q_Base + 256;
          end;
+      end loop;
+   end Decode_Q6K_Block;
+
+   procedure Dequant_Q6_K (X : String; Q : out Tensor; N : Natural) is
+      Blocks : constant Natural := N / 256;
+      Bk     : Block256;
+      QP     : Natural := 1;
+   begin
+      for Blk in 0 .. Blocks - 1 loop
+         Decode_Q6K_Block (X, X'First + Blk * 210, Bk);
+         for I in 1 .. 256 loop
+            Set_Flat (Q, QP, Bk (I));
+            QP := QP + 1;
+         end loop;
       end loop;
    end Dequant_Q6_K;
 
@@ -274,97 +286,92 @@ package body LLM_Dequant is
    --    uint8_t qh[32];     -- 5th (high) bit of each quant
    --    uint8_t qs[128];    -- low 4 bits, 2 quants per byte
    --  Value: y = d*sc*((qs&0xF | qh_bit<<4)) - dmin*m, per 32-element sub-block.
-   procedure Dequant_Q5_K (X : String; Q : out Tensor; N : Natural) is
-      Blocks : constant Natural := N / 256;
-      Pos    : Natural := X'First;
-      Q_Pos  : Natural := 1;
-
+   --  Decode ONE Q5_K super-block (176 bytes at Pos) into B (1..256).
+   procedure Decode_Q5K_Block (X : String; Pos : Natural; B : out Block256) is
       function RF16 (P : Natural) return Float is
         (F16_To_F32 (Byte (Character'Pos (X (P))),
                      Byte (Character'Pos (X (P + 1)))));
+      D    : constant Float := RF16 (Pos);
+      DMin : constant Float := RF16 (Pos + 2);
+      Sc   : array (0 .. 11) of Unsigned_32;
+      QH   : array (0 .. 31) of Unsigned_32;
+      QS   : array (0 .. 127) of Unsigned_32;
+
+      procedure Scale_Min (J : Natural; Scl, Mn : out Unsigned_32) is
+      begin
+         if J < 4 then
+            Scl := Sc (J) and 63;
+            Mn  := Sc (J + 4) and 63;
+         else
+            Scl := (Sc (J + 4) and 16#0F#)
+                   or Shift_Left (Shift_Right (Sc (J - 4), 6), 4);
+            Mn  := Shift_Right (Sc (J + 4), 4)
+                   or Shift_Left (Shift_Right (Sc (J), 6), 4);
+         end if;
+      end Scale_Min;
+
+      P      : Natural := Pos + 4;
    begin
-      for B in 1 .. Blocks loop
+      for I in 0 .. 11 loop
+         Sc (I) := Unsigned_32 (Character'Pos (X (P + I)));
+      end loop;
+      P := P + 12;
+      for I in 0 .. 31 loop
+         QH (I) := Unsigned_32 (Character'Pos (X (P + I)));
+      end loop;
+      P := P + 32;
+      for I in 0 .. 127 loop
+         QS (I) := Unsigned_32 (Character'Pos (X (P + I)));
+      end loop;
+
+      for G in 0 .. 3 loop
          declare
-            D    : constant Float := RF16 (Pos);
-            DMin : constant Float := RF16 (Pos + 2);
-            Sc   : array (0 .. 11) of Unsigned_32;
-            QH   : array (0 .. 31) of Unsigned_32;
-            QS   : array (0 .. 127) of Unsigned_32;
-
-            --  get_scale_min_k4: unpack the j-th 6-bit scale and min.
-            procedure Scale_Min (J : Natural; Scl, Mn : out Unsigned_32) is
-            begin
-               if J < 4 then
-                  Scl := Sc (J) and 63;
-                  Mn  := Sc (J + 4) and 63;
-               else
-                  Scl := (Sc (J + 4) and 16#0F#)
-                         or Shift_Left (Shift_Right (Sc (J - 4), 6), 4);
-                  Mn  := Shift_Right (Sc (J + 4), 4)
-                         or Shift_Left (Shift_Right (Sc (J), 6), 4);
-               end if;
-            end Scale_Min;
-
-            Is_Idx : Natural := 0;
-            U1     : Unsigned_32 := 1;
-            U2     : Unsigned_32 := 2;
-            QS_Off : Natural := 0;
+            Sc1, M1, Sc2, M2 : Unsigned_32;
+            Sh1 : constant Natural := 2 * G;       -- 5th-bit position, low nibble
+            Sh2 : constant Natural := 2 * G + 1;   -- 5th-bit position, high nibble
+            QB  : constant Natural := 32 * G;      -- qs base for this group
+            B1  : constant Natural := 64 * G;      -- 0-based output base, low half
+            B2  : constant Natural := 64 * G + 32; -- 0-based output base, high half
          begin
-            Pos := Pos + 4;
-            for I in 0 .. 11 loop
-               Sc (I) := Unsigned_32 (Character'Pos (X (Pos + I)));
-            end loop;
-            Pos := Pos + 12;
-            for I in 0 .. 31 loop
-               QH (I) := Unsigned_32 (Character'Pos (X (Pos + I)));
-            end loop;
-            Pos := Pos + 32;
-            for I in 0 .. 127 loop
-               QS (I) := Unsigned_32 (Character'Pos (X (Pos + I)));
-            end loop;
-            Pos := Pos + 128;
-
-            --  4 groups of 64 elements (two 32-element sub-blocks each).
-            for G in 0 .. 3 loop
-               declare
-                  Sc1, M1, Sc2, M2 : Unsigned_32;
-               begin
-                  Scale_Min (Is_Idx,     Sc1, M1);
-                  Scale_Min (Is_Idx + 1, Sc2, M2);
+            Scale_Min (2 * G,     Sc1, M1);
+            Scale_Min (2 * G + 1, Sc2, M2);
+            declare
+               D1  : constant Float := D * Float (Sc1);
+               Mn1 : constant Float := DMin * Float (M1);
+               D2  : constant Float := D * Float (Sc2);
+               Mn2 : constant Float := DMin * Float (M2);
+            begin
+               --  Branchless 5th bit (shift, no per-element branch) and fixed
+               --  index bases (no loop-carried counter) so the int->float +
+               --  scale of both nibble halves vectorises to NEON.
+               for L in 0 .. 31 loop
                   declare
-                     D1  : constant Float := D * Float (Sc1);
-                     Mn1 : constant Float := DMin * Float (M1);
-                     D2  : constant Float := D * Float (Sc2);
-                     Mn2 : constant Float := DMin * Float (M2);
+                     Q   : constant Unsigned_32 := QS (QB + L);
+                     Lo  : constant Unsigned_32 := (Q and 16#0F#)
+                       + Shift_Left (Shift_Right (QH (L), Sh1) and 1, 4);
+                     Hi  : constant Unsigned_32 := Shift_Right (Q, 4)
+                       + Shift_Left (Shift_Right (QH (L), Sh2) and 1, 4);
                   begin
-                     for L in 0 .. 31 loop
-                        declare
-                           Hi : constant Unsigned_32 :=
-                             (if (QH (L) and U1) /= 0 then 16 else 0);
-                           Qv : constant Unsigned_32 := (QS (QS_Off + L) and 16#0F#) + Hi;
-                        begin
-                           Set_Flat (Q, Q_Pos, D1 * Float (Qv) - Mn1);
-                           Q_Pos := Q_Pos + 1;
-                        end;
-                     end loop;
-                     for L in 0 .. 31 loop
-                        declare
-                           Hi : constant Unsigned_32 :=
-                             (if (QH (L) and U2) /= 0 then 16 else 0);
-                           Qv : constant Unsigned_32 := Shift_Right (QS (QS_Off + L), 4) + Hi;
-                        begin
-                           Set_Flat (Q, Q_Pos, D2 * Float (Qv) - Mn2);
-                           Q_Pos := Q_Pos + 1;
-                        end;
-                     end loop;
+                     B (B1 + L + 1) := D1 * Float (Lo) - Mn1;
+                     B (B2 + L + 1) := D2 * Float (Hi) - Mn2;
                   end;
-               end;
-               QS_Off := QS_Off + 32;
-               Is_Idx := Is_Idx + 2;
-               U1 := Shift_Left (U1, 2);
-               U2 := Shift_Left (U2, 2);
-            end loop;
+               end loop;
+            end;
          end;
+      end loop;
+   end Decode_Q5K_Block;
+
+   procedure Dequant_Q5_K (X : String; Q : out Tensor; N : Natural) is
+      Blocks : constant Natural := N / 256;
+      Bk     : Block256;
+      QP     : Natural := 1;
+   begin
+      for Blk in 0 .. Blocks - 1 loop
+         Decode_Q5K_Block (X, X'First + Blk * 176, Bk);
+         for I in 1 .. 256 loop
+            Set_Flat (Q, QP, Bk (I));
+            QP := QP + 1;
+         end loop;
       end loop;
    end Dequant_Q5_K;
 
@@ -467,43 +474,86 @@ package body LLM_Dequant is
       X    : Tensor)
       return Tensor
    is
+      use type LLM_GGUF.GGML_Type;
       In_Dim   : constant Integer := Integer (Info.Dims (1));   -- GGUF ne0 = in
       Out_Dim  : constant Integer := Integer (Info.Dims (2));   -- GGUF ne1 = out
+      Kind     : constant LLM_GGUF.GGML_Type := Info.Kind;
+      Is_Q5K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q5_K;
+      Is_Q6K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q6_K;
+      N_Blk    : constant Integer := In_Dim / 256;
+      Blk_Bytes : constant Integer := (if Is_Q5K then 176 elsif Is_Q6K then 210 else 0);
       Row_Info : LLM_GGUF.Tensor_Info := Info;
       BPR      : Natural;
+
+      --  Local FP32 copy of x — the hot dot loop reads it as a plain array
+      --  (no Tensor access indirection), so the compiler can vectorise (FMA).
+      XL : array (1 .. In_Dim) of Float;
    begin
-      --  One-row view [in, 1]; Logical_Shape = [1, in].
       Row_Info.N_Dims := 2;
       Row_Info.Dims   := [Info.Dims (1), 1, 0, 0];
       BPR := Natural (LLM_GGUF.Tensor_Byte_Size (Row_Info));
+      for I in 1 .. In_Dim loop
+         XL (I) := Get_Flat (X, I);
+      end loop;
 
       return Y : Tensor := New_Tensor ([1, Out_Dim]) do
          declare
-            --  Dequantize rows Lo..Hi and write the dot products into Y. A single
-            --  row buffer is reused across the range (no per-row heap allocation,
-            --  so parallel tasks don't contend on the allocator lock).
-            procedure Rows (Lo, Hi : Integer) is
-               Row_T : Tensor := New_Tensor ([1, In_Dim]);
+            type Rows_Op is new LLM_Pool.Parallel_Op with null record;
+            overriding procedure Execute (Op : in out Rows_Op; Lo, Hi : Integer) is
+               Bk    : Block256;          -- one decoded super-block (stack)
+               Row_T : Tensor;            -- fallback buffer (non-K-quant only)
             begin
-               for O in Lo .. Hi loop
-                  declare
-                     Start : constant Natural := Raw'First + (O - 1) * BPR;
-                     Acc   : Float := 0.0;
-                  begin
-                     Fill (Row_Info, Raw (Start .. Start + BPR - 1), Row_T, In_Dim);
-                     for I in 1 .. In_Dim loop
-                        Acc := Acc + Get_Flat (Row_T, I) * Get_Flat (X, I);
-                     end loop;
-                     Set_Flat (Y, O, Acc);
-                  end;
-               end loop;
-            end Rows;
+               if Is_Q5K or else Is_Q6K then
+                  for O in Lo .. Hi loop
+                     declare
+                        RS  : constant Natural := Raw'First + (O - 1) * BPR;
+                        --  Four independent accumulator lanes break the FP
+                        --  reduction dependency chain so the compiler packs the
+                        --  fused decode+dot into NEON vector FMAs. (Sum order
+                        --  differs from a scalar reduction by ~1e-3 rounding.)
+                        A0, A1, A2, A3 : Float := 0.0;
+                     begin
+                        for Blk in 0 .. N_Blk - 1 loop
+                           if Is_Q5K then
+                              Decode_Q5K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
+                           else
+                              Decode_Q6K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
+                           end if;
+                           declare
+                              Base : constant Integer := Blk * 256;
+                           begin
+                              for K in 0 .. 63 loop
+                                 A0 := A0 + Bk (4 * K + 1) * XL (Base + 4 * K + 1);
+                                 A1 := A1 + Bk (4 * K + 2) * XL (Base + 4 * K + 2);
+                                 A2 := A2 + Bk (4 * K + 3) * XL (Base + 4 * K + 3);
+                                 A3 := A3 + Bk (4 * K + 4) * XL (Base + 4 * K + 4);
+                              end loop;
+                           end;
+                        end loop;
+                        Set_Flat (Y, O, (A0 + A1) + (A2 + A3));
+                     end;
+                  end loop;
+               else
+                  --  Generic fallback (F32/F16/…): dequant row, then dot.
+                  Row_T := New_Tensor ([1, In_Dim]);
+                  for O in Lo .. Hi loop
+                     declare
+                        RS  : constant Natural := Raw'First + (O - 1) * BPR;
+                        Acc : Float := 0.0;
+                     begin
+                        Fill (Row_Info, Raw (RS .. RS + BPR - 1), Row_T, In_Dim);
+                        for I in 1 .. In_Dim loop
+                           Acc := Acc + Get_Flat (Row_T, I) * XL (I);
+                        end loop;
+                        Set_Flat (Y, O, Acc);
+                     end;
+                  end loop;
+               end if;
+            end Execute;
 
-            --  Only parallelise large matvecs here; small ones (e.g. MoE
-            --  experts) are parallelised one level up, at the expert loop.
-            procedure Par_Rows is new LLM_Parallel (Rows);
+            Op : Rows_Op;
          begin
-            Par_Rows (1, Out_Dim, Min_Grain => 2048);
+            LLM_Pool.Run (Op, 1, Out_Dim, Min_Grain => 2048);
          end;
       end return;
    end QMatVec;

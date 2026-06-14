@@ -111,6 +111,31 @@ begin
               Close (Get (O3, [T, I]), Get (O2, [T, I])));
          end loop;
       end loop;
+
+      --  Incremental decode == batched Forward: feed X3 one token at a time
+      --  through Step (carrying state) and compare to the batched output.
+      declare
+         St : LLM_DeltaNet_Blk.DNet_State := LLM_DeltaNet_Blk.Init_State (Layer);
+      begin
+         for T in 1 .. 3 loop
+            declare
+               Xt : Tensor := New_Tensor ([1, Dim]);
+            begin
+               for I in 1 .. Dim loop
+                  Set_Flat (Xt, I, Get (X3, [T, I]));
+               end loop;
+               declare
+                  Ot : constant Tensor := LLM_DeltaNet_Blk.Step (Layer, St, Xt);
+               begin
+                  for I in 1 .. Dim loop
+                     Assert ("incremental==batched: pos" & Integer'Image (T)
+                       & " dim" & Integer'Image (I),
+                       Close (Get_Flat (Ot, I), Get (O3, [T, I])));
+                  end loop;
+               end;
+            end;
+         end loop;
+      end;
    end;
 
    New_Line;

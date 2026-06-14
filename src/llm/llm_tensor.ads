@@ -48,6 +48,13 @@ package LLM_Tensor is
    function Dot (A, B : Tensor) return Float;      -- dot product (1D only)
    function Transpose (T : Tensor) return Tensor;  -- 2D transpose
 
+   --  Dense matrix-vector product W*x for a row-major weight W [Rows, Cols]
+   --  and vector X [Cols] (any rank, read flat), returning Y [1, Rows].
+   --  The hot dot loop runs directly over the raw FP32 storage (no Get
+   --  indirection, so it vectorises) and is split across the worker pool.
+   --  Used for the LM head (vocab x dim) and other large dense matvecs.
+   function MatVec_Rows (W : Tensor; X : Tensor) return Tensor;
+
    -- Activations
    function Relu (T : Tensor) return Tensor;
    function Gelu (T : Tensor) return Tensor;

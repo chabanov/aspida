@@ -33,4 +33,22 @@ package LLM_FullAttn is
    function Forward (L : Full_Attn_Layer; X : LLM_Tensor.Tensor)
       return LLM_Tensor.Tensor;
 
+   --------------------------------------------------------------------
+   -- Incremental decode (KV cache, one token at a time).
+   --
+   -- Attn_State holds the K/V cache for all positions seen so far. Step
+   -- projects the single new token, appends its K/V, attends the new
+   -- query against the whole cache and returns [1, Dim].
+   --------------------------------------------------------------------
+   type Attn_State is record
+      K_Cache : LLM_Tensor.Tensor;  -- [Max_Len, N_KV_Heads*Head_Dim]
+      V_Cache : LLM_Tensor.Tensor;  -- [Max_Len, N_KV_Heads*Head_Dim]
+      Len     : Natural := 0;       -- positions filled so far
+   end record;
+
+   function Init_State (L : Full_Attn_Layer; Max_Len : Integer) return Attn_State;
+
+   function Step (L : Full_Attn_Layer; St : in out Attn_State; X : LLM_Tensor.Tensor)
+      return LLM_Tensor.Tensor;
+
 end LLM_FullAttn;
