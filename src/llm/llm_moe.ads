@@ -23,23 +23,20 @@
 ---------------------------------------------------------------------
 
 with LLM_Tensor;
+with LLM_Weight;
 
 package LLM_MoE is
 
    type MoE_Layer is record
-      -- Router: input projection + gating
-      Gate_Inp_W : LLM_Tensor.Tensor;  -- [dim, 256]
-      Gate_Exp_W : LLM_Tensor.Tensor;  -- [dim, intermed, 256]
-
-      -- Routed experts
-      Up_W   : LLM_Tensor.Tensor;  -- [dim, intermed, 256]
-      Down_W : LLM_Tensor.Tensor;  -- [intermed, dim, 256]
-
-      -- Shared expert
-      Shexp_Gate_W     : LLM_Tensor.Tensor;  -- [dim, intermed]
-      Shexp_Up_W       : LLM_Tensor.Tensor;  -- [dim, intermed]
-      Shexp_Down_W     : LLM_Tensor.Tensor;  -- [intermed, dim]
-      Shexp_Gate_Inp_W : LLM_Tensor.Tensor;  -- [dim]
+      --  Projection weights (dense for tests / quantized for the real model).
+      Gate_Inp_W   : LLM_Weight.Weight;   -- router  [n_exp, dim]
+      Gate_Exp_W   : LLM_Weight.Weight;   -- 3D [n_exp, intermed, dim]
+      Up_W         : LLM_Weight.Weight;   -- 3D [n_exp, intermed, dim]
+      Down_W       : LLM_Weight.Weight;   -- 3D [n_exp, dim, intermed]
+      Shexp_Gate_W : LLM_Weight.Weight;   -- [intermed, dim]
+      Shexp_Up_W   : LLM_Weight.Weight;   -- [intermed, dim]
+      Shexp_Down_W : LLM_Weight.Weight;   -- [dim, intermed]
+      Shexp_Gate_Inp_W : LLM_Tensor.Tensor;  -- [dim] (dense, element-wise)
 
       N_Experts : Integer := 256;
       Top_K     : Integer := 8;   -- Qwen uses top-8
@@ -47,10 +44,11 @@ package LLM_MoE is
       Intermed  : Integer;
    end record;
 
-   -- Create MoE layer from tensors
+   -- Create MoE layer from weights
    function Create_MoE
      (Gate_Inp_W, Gate_Exp_W, Up_W, Down_W,
-      Shexp_Gate_W, Shexp_Up_W, Shexp_Down_W, Shexp_Gate_Inp_W : LLM_Tensor.Tensor;
+      Shexp_Gate_W, Shexp_Up_W, Shexp_Down_W : LLM_Weight.Weight;
+      Shexp_Gate_Inp_W : LLM_Tensor.Tensor;
       N_Experts : Integer)
       return MoE_Layer;
 

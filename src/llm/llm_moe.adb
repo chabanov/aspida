@@ -1,117 +1,43 @@
 ---------------------------------------------------------------------
--- LLM_MoE body — Router + SwiGLU expert FFN (top-k mixture of experts)
+-- LLM_MoE body — router top-k + SwiGLU experts (via LLM_Weight matvec)
 --
--- Implemented weight layout (row-major logical shapes, i.e. GGUF dims
--- reversed — see llm_dequant Logical_Shape):
---   Gate_Inp_W : [n_experts, dim]              router logits
---   Gate_Exp_W : [n_experts, intermed, dim]    per-expert gate proj  (3D)
---   Up_W       : [n_experts, intermed, dim]    per-expert up proj    (3D)
---   Down_W     : [n_experts, dim, intermed]    per-expert down proj  (3D)
---   Shexp_Gate_W / Shexp_Up_W : [intermed, dim]
---   Shexp_Down_W              : [dim, intermed]
---   Shexp_Gate_Inp_W          : [1, dim]  (optional sigmoid gate)
---
--- One expert FFN is SwiGLU:  y = Down · ( silu(Gate · x) * (Up · x) ).
+-- One expert FFN is SwiGLU:  y = Down . ( silu(Gate . x) * (Up . x) ).
+-- Routed experts are 3D weights (per-expert matvec); the shared expert
+-- and router are 2D matvecs. Weights are dense (tests) or quantized.
 ---------------------------------------------------------------------
 
 with Ada.Numerics.Generic_Elementary_Functions;
 with LLM_Tensor; use LLM_Tensor;
+with LLM_Weight; use LLM_Weight;
+with LLM_Parallel;
 
 package body LLM_MoE is
 
    package Float_Math is new Ada.Numerics.Generic_Elementary_Functions (Float);
    use Float_Math;
 
-   --------------------------------------------------------------------
-   -- Silu activation: x * sigmoid(x)
-   --------------------------------------------------------------------
-
-   function Silu (X : Float) return Float is
-   begin
-      return X / (1.0 + Exp (-X));
-   end Silu;
-
-   --------------------------------------------------------------------
-   -- Create
-   --------------------------------------------------------------------
+   function Silu (X : Float) return Float is (X / (1.0 + Exp (-X)));
 
    function Create_MoE
      (Gate_Inp_W, Gate_Exp_W, Up_W, Down_W,
-      Shexp_Gate_W, Shexp_Up_W, Shexp_Down_W, Shexp_Gate_Inp_W : Tensor;
+      Shexp_Gate_W, Shexp_Up_W, Shexp_Down_W : Weight;
+      Shexp_Gate_Inp_W : Tensor;
       N_Experts : Integer)
       return MoE_Layer
    is
       M : MoE_Layer;
    begin
-      M.Gate_Inp_W       := Gate_Inp_W;
-      M.Gate_Exp_W       := Gate_Exp_W;
-      M.Up_W             := Up_W;
-      M.Down_W           := Down_W;
-      M.Shexp_Gate_W     := Shexp_Gate_W;
-      M.Shexp_Up_W       := Shexp_Up_W;
-      M.Shexp_Down_W     := Shexp_Down_W;
-      M.Shexp_Gate_Inp_W := Shexp_Gate_Inp_W;
+      M.Gate_Inp_W := Gate_Inp_W;  M.Gate_Exp_W := Gate_Exp_W;
+      M.Up_W := Up_W;  M.Down_W := Down_W;
+      M.Shexp_Gate_W := Shexp_Gate_W;  M.Shexp_Up_W := Shexp_Up_W;
+      M.Shexp_Down_W := Shexp_Down_W;  M.Shexp_Gate_Inp_W := Shexp_Gate_Inp_W;
 
       M.N_Experts := N_Experts;
-      --  Router is [n_experts, dim]; the model dim is the second axis.
-      M.Dim := Shape (Gate_Inp_W) (2);
-      --  Never select more experts than exist.
-      M.Top_K := Integer'Min (8, N_Experts);
-      --  Gate_Exp is [n_experts, intermed, dim]; intermed is the 2nd axis.
-      if Rank (Gate_Exp_W) >= 3 then
-         M.Intermed := Shape (Gate_Exp_W) (2);
-      elsif Numel (Shexp_Gate_W) > 1 then
-         M.Intermed := Shape (Shexp_Gate_W) (1);
-      else
-         M.Intermed := 512;
-      end if;
-
+      M.Dim       := Cols (Gate_Inp_W);
+      M.Top_K     := Integer'Min (8, N_Experts);
+      M.Intermed  := Expert_Out (Gate_Exp_W);
       return M;
    end Create_MoE;
-
-   --------------------------------------------------------------------
-   -- One SwiGLU expert E:  y = Down_E · ( silu(Gate_E · x) * (Up_E · x) )
-   -- Gate/Up are [n_experts, intermed, dim]; Down is [n_experts, dim, intermed].
-   --------------------------------------------------------------------
-
-   procedure SwiGLU
-     (Gate_W, Up_W, Down_W : Tensor;
-      E      : Integer;
-      X      : Tensor;
-      Dim    : Integer;
-      Intermed : Integer;
-      Y      : out Tensor)
-   is
-      H : array (1 .. Intermed) of Float;
-   begin
-      for J in 1 .. Intermed loop
-         declare
-            G : Float := 0.0;
-            U : Float := 0.0;
-         begin
-            for D in 1 .. Dim loop
-               G := G + Get (Gate_W, [E, J, D]) * Get_Flat (X, D);
-               U := U + Get (Up_W,   [E, J, D]) * Get_Flat (X, D);
-            end loop;
-            H (J) := Silu (G) * U;
-         end;
-      end loop;
-
-      for I in 1 .. Dim loop
-         declare
-            Acc : Float := 0.0;
-         begin
-            for J in 1 .. Intermed loop
-               Acc := Acc + Get (Down_W, [E, I, J]) * H (J);
-            end loop;
-            Set_Flat (Y, I, Acc);
-         end;
-      end loop;
-   end SwiGLU;
-
-   --------------------------------------------------------------------
-   -- Forward — top-k gated mixture of experts + shared expert
-   --------------------------------------------------------------------
 
    function Forward (M : MoE_Layer; X : Tensor) return Tensor is
       Dim      : constant Integer := M.Dim;
@@ -119,30 +45,32 @@ package body LLM_MoE is
       N_Exp    : constant Integer := M.N_Experts;
       Top_K    : constant Integer := M.Top_K;
 
-      Router  : array (1 .. N_Exp) of Float := [others => 0.0];
+      Router  : array (1 .. N_Exp) of Float;
       Top_Idx : array (1 .. Top_K) of Integer := [others => 1];
       Top_W   : array (1 .. Top_K) of Float := [others => 0.0];
 
-      Result  : Tensor := New_Tensor ([1, Dim]);
-      Exp_Out : Tensor := New_Tensor ([1, Dim]);
-   begin
-      ----------------------------------------------------------------
-      -- 1. Router logits: gate_inp [n_experts, dim] · x
-      ----------------------------------------------------------------
-      for E in 1 .. N_Exp loop
-         declare
-            S : Float := 0.0;
-         begin
-            for D in 1 .. Dim loop
-               S := S + Get (M.Gate_Inp_W, [E, D]) * Get_Flat (X, D);
-            end loop;
-            Router (E) := S;
-         end;
-      end loop;
+      Result : Tensor := New_Tensor ([1, Dim]);
 
-      ----------------------------------------------------------------
-      -- 2. Softmax over experts (numerically stable)
-      ----------------------------------------------------------------
+      --  SwiGLU hidden = silu(gate) * up, given the two [1,intermed] projections.
+      function Hidden (Gate_P, Up_P : Tensor) return Tensor is
+      begin
+         return H : Tensor := New_Tensor ([1, Intermed]) do
+            for J in 1 .. Intermed loop
+               Set_Flat (H, J, Silu (Get_Flat (Gate_P, J)) * Get_Flat (Up_P, J));
+            end loop;
+         end return;
+      end Hidden;
+   begin
+      --  1. Router logits.
+      declare
+         RL : constant Tensor := MatVec (M.Gate_Inp_W, X);
+      begin
+         for E in 1 .. N_Exp loop
+            Router (E) := Get_Flat (RL, E);
+         end loop;
+      end;
+
+      --  2. Softmax (numerically stable).
       declare
          Max_L : Float := Router (1);
          Sum_E : Float := 0.0;
@@ -161,9 +89,7 @@ package body LLM_MoE is
          end loop;
       end;
 
-      ----------------------------------------------------------------
-      -- 3. Greedy top-k selection, then renormalise the chosen weights
-      ----------------------------------------------------------------
+      --  3. Greedy top-k + renormalise.
       declare
          Used  : array (1 .. N_Exp) of Boolean := [others => False];
          Sum_W : Float := 0.0;
@@ -190,28 +116,43 @@ package body LLM_MoE is
          end loop;
       end;
 
-      ----------------------------------------------------------------
-      -- 4. Run each selected expert and accumulate the weighted output
-      ----------------------------------------------------------------
-      for K in 1 .. Top_K loop
-         declare
-            E : constant Integer := Top_Idx (K);
-         begin
-            SwiGLU (M.Gate_Exp_W, M.Up_W, M.Down_W, E,
-                    X, Dim, Intermed, Exp_Out);
-            for I in 1 .. Dim loop
-               Set_Flat (Result, I,
-                 Get_Flat (Result, I) + Top_W (K) * Get_Flat (Exp_Out, I));
-            end loop;
-         end;
-      end loop;
-
-      ----------------------------------------------------------------
-      -- 5. Shared expert (always active), with optional sigmoid gate
-      ----------------------------------------------------------------
+      --  4. Selected experts — run the (independent) experts across CPUs,
+      --     each into its own row of Exp_Y, then reduce.
       declare
+         Exp_Y : Tensor := New_Tensor ([Top_K, Dim]);
+
+         procedure Do_Experts (Lo, Hi : Integer) is
+         begin
+            for K in Lo .. Hi loop
+               declare
+                  E : constant Integer := Top_Idx (K);
+                  H : constant Tensor := Hidden (MatVec_Expert (M.Gate_Exp_W, E, X),
+                                                 MatVec_Expert (M.Up_W, E, X));
+                  Y : constant Tensor := MatVec_Expert (M.Down_W, E, H);
+               begin
+                  for I in 1 .. Dim loop
+                     Set (Exp_Y, [K, I], Top_W (K) * Get_Flat (Y, I));
+                  end loop;
+               end;
+            end loop;
+         end Do_Experts;
+
+         procedure Par_Experts is new LLM_Parallel (Do_Experts);
+      begin
+         Par_Experts (1, Top_K, Min_Grain => 2);
+         for K in 1 .. Top_K loop
+            for I in 1 .. Dim loop
+               Set_Flat (Result, I, Get_Flat (Result, I) + Get (Exp_Y, [K, I]));
+            end loop;
+         end loop;
+      end;
+
+      --  5. Shared expert (optional sigmoid gate).
+      declare
+         H : constant Tensor := Hidden (MatVec (M.Shexp_Gate_W, X),
+                                        MatVec (M.Shexp_Up_W, X));
+         Y : constant Tensor := MatVec (M.Shexp_Down_W, H);
          Shared_Gate : Float := 1.0;
-         H : array (1 .. Intermed) of Float;
       begin
          if Numel (M.Shexp_Gate_Inp_W) > 1 then
             declare
@@ -223,29 +164,8 @@ package body LLM_MoE is
                Shared_Gate := 1.0 / (1.0 + Exp (-GS));
             end;
          end if;
-
-         for J in 1 .. Intermed loop
-            declare
-               G : Float := 0.0;
-               U : Float := 0.0;
-            begin
-               for D in 1 .. Dim loop
-                  G := G + Get (M.Shexp_Gate_W, [J, D]) * Get_Flat (X, D);
-                  U := U + Get (M.Shexp_Up_W,   [J, D]) * Get_Flat (X, D);
-               end loop;
-               H (J) := Silu (G) * U;
-            end;
-         end loop;
-
          for I in 1 .. Dim loop
-            declare
-               Acc : Float := 0.0;
-            begin
-               for J in 1 .. Intermed loop
-                  Acc := Acc + Get (M.Shexp_Down_W, [I, J]) * H (J);
-               end loop;
-               Set_Flat (Result, I, Get_Flat (Result, I) + Shared_Gate * Acc);
-            end;
+            Set_Flat (Result, I, Get_Flat (Result, I) + Shared_Gate * Get_Flat (Y, I));
          end loop;
       end;
 

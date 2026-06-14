@@ -1,84 +1,31 @@
 ---------------------------------------------------------------------
--- LLM_Qwen_Blk — Qwen 3.5 Hybrid Transformer Block
+-- LLM_Qwen_Blk — one Qwen3-Next hybrid block
 --
--- Architecture (Qwen3.5-35B-A3B, qwen35moe):
---
---   Full-Attention layers (every 4th block, L mod 4 = 0):
---     x_norm = RMSNorm(x)
---     q, k, v = split(QKV_Project(x_norm))
---     attn_out = GQA_Attention(q, k, v)
---     x = x + attn_out
---     x_norm2 = RMSNorm(x)
---     x = x + MoE(x_norm2)
---
---   SSM layers (all other blocks):
---     x_norm = RMSNorm(x)
---     q, k, v = split(QKV_Project(x_norm))  [sliding attn]
---     attn_out = GQA_Attention(q, k, v)
---     gate = sigmoid(attn_gate @ x_norm)
---     ssm_out = SSM(x_norm)
---     combined = gate * attn_out + (1 - gate) * ssm_out
---     x = x + combined
---     x_norm2 = RMSNorm(x)
---     x = x + MoE(x_norm2)
+-- Each block is RMSNorm -> (full attention | gated delta-net) -> residual
+-- -> RMSNorm -> MoE -> residual, over a whole sequence [seq, dim].
+-- The layer type is fixed at load time: full attention when L mod 4 == 3,
+-- gated delta-net otherwise. The unused layer field is left default.
 ---------------------------------------------------------------------
 
 with LLM_Tensor;
 with LLM_MoE;
-with LLM_SSM;
+with LLM_FullAttn;
+with LLM_DeltaNet_Blk;
 
 package LLM_Qwen_Blk is
 
-   type Qwen_Block is tagged record
-      -- Is this a full-attention layer? (L mod 4 = 0)
-      Is_Full_Attn : Boolean;
-
-      -- Unified QKV projection [dim, heads * head_dim * 3] (includes KV for GQA)
-      QKV_W : LLM_Tensor.Tensor;
-
-      -- Attention output gate (sigmoid) [dim, dim] — SSM layers only
-      Attn_Gate_W : LLM_Tensor.Tensor;
-
-      -- Output projection [dim, dim]
-      O_W : LLM_Tensor.Tensor;
-
-      -- RMSNorm weights (input + post-attn)
-      Attn_Norm_W     : LLM_Tensor.Tensor;  -- [dim]
-      Post_Attn_Norm_W : LLM_Tensor.Tensor;  -- [dim]
-
-      -- SSM layer (Mamba hybrid block — non full-attn layers)
-      SSM : LLM_SSM.SSM_Params;
-
-      -- MoE layer (present on all blocks)
-      MoE : LLM_MoE.MoE_Layer;
-
-      -- Hyperparameters
-      N_Heads    : Integer;
-      N_KV_Heads : Integer;  -- GQA: 2 KV heads vs 16 Q heads
-      Dim        : Integer;
+   type Qwen_Block is record
+      Is_Full_Attn     : Boolean := False;
+      Full             : LLM_FullAttn.Full_Attn_Layer;       -- if Is_Full_Attn
+      DNet             : LLM_DeltaNet_Blk.DeltaNet_Layer;    -- otherwise
+      MoE              : LLM_MoE.MoE_Layer;
+      Attn_Norm_W      : LLM_Tensor.Tensor;
+      Post_Attn_Norm_W : LLM_Tensor.Tensor;
+      Dim              : Integer := 0;
    end record;
 
-   -- Create a Qwen hybrid block
-   function Create_Qwen_Block
-     (QKV_W         : LLM_Tensor.Tensor;
-      Attn_Gate_W   : LLM_Tensor.Tensor;
-      O_W           : LLM_Tensor.Tensor;
-      Attn_Norm_W   : LLM_Tensor.Tensor;
-      Post_Attn_Norm_W : LLM_Tensor.Tensor;
-      Ssm_Params    : LLM_SSM.SSM_Params;
-      Moe_Layer     : LLM_MoE.MoE_Layer;
-      Is_Full_Attn  : Boolean;
-      Dim           : Integer;
-      N_Heads       : Integer;
-      N_KV_Heads    : Integer)
-      return Qwen_Block;
-
-   -- Forward pass through one block over a whole sequence.
-   -- X: input [Seq_Len, dim]
-   -- Returns: output [Seq_Len, dim]
-   function Forward (B : Qwen_Block; X : LLM_Tensor.Tensor) return LLM_Tensor.Tensor;
-
-   -- Equality (required for Ada.Containers.Vectors)
-   function "=" (Left, Right : Qwen_Block) return Boolean;
+   -- Forward over a whole sequence: X [seq, dim] -> [seq, dim].
+   function Forward (B : Qwen_Block; X : LLM_Tensor.Tensor)
+      return LLM_Tensor.Tensor;
 
 end LLM_Qwen_Blk;

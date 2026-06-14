@@ -95,6 +95,10 @@ test-llm: ## Build + run all LLM unit tests (rmsnorm, attention, moe, tokenizer,
 	./obj/test_tokenizer
 	./obj/test_ssm
 	./obj/test_tensor
+	./obj/test_deltanet
+	./obj/test_deltanet_blk
+	./obj/test_fullattn
+	./obj/test_block
 
 .PHONY: test-tokenizer-real
 test-tokenizer-real: ## Validate the tokenizer against the real GGUF vocab (needs model)
@@ -163,3 +167,8 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| sort \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-18s\033[0m %s\n", $$1, $$2}'
+
+.PHONY: test-qmatvec-real
+test-qmatvec-real: ## Validate streaming quantized matvec on real tensors (needs model)
+	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
+	./obj/test_qmatvec_real
