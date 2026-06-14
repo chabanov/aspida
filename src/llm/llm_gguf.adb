@@ -142,12 +142,28 @@ package body LLM_GGUF is
    -- GGML type mapping
    --------------------------------------------------------------------
 
+   --  Map the on-disk GGML type code (which has gaps) to our enum. A naive
+   --  'Val is wrong because the enum positions are contiguous (0..13) while
+   --  the real codes skip values (Q5_0=6, …, Q5_K=13, Q6_K=14, Q8_K=15).
    function To_GGML_Type (V : U32) return GGML_Type is
    begin
-      return GGML_Type'Val (Integer (V));
-   exception
-      when others =>
-         return GGML_TYPE_F32;
+      case V is
+         when 0      => return GGML_TYPE_F32;
+         when 1      => return GGML_TYPE_F16;
+         when 2      => return GGML_TYPE_Q4_0;
+         when 3      => return GGML_TYPE_Q4_1;
+         when 6      => return GGML_TYPE_Q5_0;
+         when 7      => return GGML_TYPE_Q5_1;
+         when 8      => return GGML_TYPE_Q8_0;
+         when 9      => return GGML_TYPE_Q8_1;
+         when 10     => return GGML_TYPE_Q2_K;
+         when 11     => return GGML_TYPE_Q3_K;
+         when 12     => return GGML_TYPE_Q4_K;
+         when 13     => return GGML_TYPE_Q5_K;
+         when 14     => return GGML_TYPE_Q6_K;
+         when 15     => return GGML_TYPE_Q8_K;
+         when others => return GGML_TYPE_F32;  -- legacy/IQ types: unsupported
+      end case;
    end To_GGML_Type;
 
    --------------------------------------------------------------------
@@ -277,8 +293,14 @@ package body LLM_GGUF is
          end;
       end loop;
 
-      -- Remember current position as data start (though we use absolute offsets)
-      File.Data_Start := U64 (C_LSeek (FD, 0, SEEK_CUR));
+      -- Tensor data begins at the next alignment boundary after the tensor
+      -- info section. Per-tensor Info.Offset values are relative to this point.
+      declare
+         Pos : constant U64 := U64 (C_LSeek (FD, 0, SEEK_CUR));
+         A   : constant U64 := File.Alignment_Val;
+      begin
+         File.Data_Start := ((Pos + A - 1) / A) * A;
+      end;
 
       Ada.Text_IO.Put_Line ("GGUF: parsed" & Integer'Image (Natural (N_Tensors)) &
         " tensors, alignment=" & U64'Image (File.Alignment_Val));
@@ -365,7 +387,8 @@ package body LLM_GGUF is
       Buf_Size : Natural)
    is
       FD : constant C_Int := C_Int (File.FD);
-      Off : constant C_Off := C_Off (Info.Offset);
+      --  Info.Offset is relative to the aligned data-section start.
+      Off : constant C_Off := C_Off (File.Data_Start + Info.Offset);
    begin
       Ignore (C_LSeek (FD, Off, SEEK_SET));
       Read_Exact (FD, Buffer, Buf_Size);
@@ -379,7 +402,11 @@ package body LLM_GGUF is
          when GGML_TYPE_F16 => return N_Elements * 2;
          when GGML_TYPE_Q5_0 => return ((N_Elements + 31) / 32) * 64;
          when GGML_TYPE_Q5_1 => return ((N_Elements + 31) / 32) * 64;
-         when GGML_TYPE_Q5_K => return (N_Elements / 256) * 304 + (N_Elements / 16) * 2;
+         --  K-quant super-block sizes (bytes per 256 elements), per llama.cpp:
+         when GGML_TYPE_Q4_K => return (N_Elements / 256) * 144;
+         when GGML_TYPE_Q5_K => return (N_Elements / 256) * 176;
+         when GGML_TYPE_Q6_K => return (N_Elements / 256) * 210;
+         when GGML_TYPE_Q8_K => return (N_Elements / 256) * 292;
          when GGML_TYPE_Q8_0 => return N_Elements;
          when others => return N_Elements * 4;
       end case;

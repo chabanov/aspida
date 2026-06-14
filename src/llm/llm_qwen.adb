@@ -267,9 +267,20 @@ package body LLM_Qwen is
          end loop;
          declare
             Normed : constant Tensor := LLM_RMSNorm.Forward (Last, M.Final_Norm);
+            Logits : Tensor := New_Tensor ([1, M.Vocab_Sz]);
          begin
-            -- Normed [1, dim] @ LM_Head [dim, vocab] → [1, vocab]
-            return Matmul (Normed, M.LM_Head);
+            -- output.weight is [vocab, dim] (row-major); logits[v] = Normed . row v
+            for V in 1 .. M.Vocab_Sz loop
+               declare
+                  Acc : Float := 0.0;
+               begin
+                  for D in 1 .. Dim loop
+                     Acc := Acc + Get_Flat (Normed, D) * Get (M.LM_Head, [V, D]);
+                  end loop;
+                  Set_Flat (Logits, V, Acc);
+               end;
+            end loop;
+            return Logits;
          end;
       end;
    end Forward;
