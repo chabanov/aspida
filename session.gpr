@@ -1,0 +1,17 @@
+-- session.gpr — secure session layer (handshake + framed AEAD transport)
+-- on top of the crypto primitives. Networking-agnostic: works over any
+-- Byte_Transport (loopback for tests, GNAT.Sockets in the server).
+
+with "crypto.gpr";
+
+project Session is
+
+   for Source_Dirs use ("src/session");
+   for Object_Dir use "obj/session";
+
+   package Compiler is
+      for Default_Switches ("Ada") use
+        ("-gnatwa", "-gnatwe", "-gnatX", "-O2");
+   end Compiler;
+
+end Session;

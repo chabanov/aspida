@@ -8,6 +8,7 @@
 with LLM_Tensor;
 with LLM_Qwen_Blk;
 with LLM_Tokenizer;
+with Ada.Strings.Unbounded;
 
 package LLM_Qwen is
 
@@ -38,6 +39,21 @@ package LLM_Qwen is
    -- <think>...</think> reasoning. Returns just the assistant's answer.
    function Chat
      (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256;
+      Sink : access Token_Sink'Class := null) return String;
+
+   --  Multi-turn chat. Conversation is the full message history with the
+   --  current user message LAST (roles alternate user/assistant). Builds the
+   --  ChatML transcript so the model has the prior turns as context.
+   type Role_Kind is (Role_User, Role_Assistant);
+   type Message is record
+      Role : Role_Kind;
+      Text : Ada.Strings.Unbounded.Unbounded_String;
+   end record;
+   type Message_Array is array (Positive range <>) of Message;
+
+   function Chat
+     (M : Qwen_Model; Conversation : Message_Array;
+      Max_New_Tokens : Integer := 256;
       Sink : access Token_Sink'Class := null) return String;
 
    -- Model params count (total, not activated)

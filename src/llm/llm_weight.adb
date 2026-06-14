@@ -59,7 +59,6 @@ package body LLM_Weight is
          return null;
       end if;
       declare
-         use type LLM_GGUF.GGML_Type;
          T : constant Tensor_Access :=
            new LLM_Tensor.Tensor'(LLM_Dequant.Dequantize (W.Info, W.Bytes.all));
       begin
