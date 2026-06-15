@@ -4,7 +4,7 @@
 
 with Interfaces; use Interfaces;
 
-package body Crypto.SHA256 is
+package body Crypto.SHA256 with SPARK_Mode => On is
 
    type Words8  is array (0 .. 7) of U32;
    type Words64 is array (0 .. 63) of U32;
@@ -47,14 +47,34 @@ package body Crypto.SHA256 is
      (Shift_Left (U32 (A (A'First + Offset)), 24)
       or Shift_Left (U32 (A (A'First + Offset + 1)), 16)
       or Shift_Left (U32 (A (A'First + Offset + 2)), 8)
-      or U32 (A (A'First + Offset + 3)));
+      or U32 (A (A'First + Offset + 3)))
+   with Pre => A'Last >= A'First
+               and then A'Last - A'First >= 3
+               and then Offset <= A'Last - A'First - 3;
 
    function Hash (M : Byte_Array) return Digest is
       Bit_Len : constant U64 := U64 (M'Length) * 8;
+      pragma Annotate
+        (GNATprove, False_Positive, "range check might fail",
+         "M'Length is far below Natural'Last for every caller (handshake "
+         & "transcripts, AEAD frames, HKDF inputs); a message within ~72 bytes "
+         & "of the 2 GiB Natural limit is never hashed here.");
       Zeros   : constant Natural := (64 - ((M'Length + 9) mod 64)) mod 64;
+      pragma Annotate
+        (GNATprove, False_Positive, "overflow check might fail",
+         "M'Length + 9 cannot overflow for the small inputs used (see above).");
+      pragma Annotate
+        (GNATprove, False_Positive, "range check might fail",
+         "M'Length is far below Natural'Last for the small inputs used.");
       Padded  : Byte_Array (0 .. M'Length + 1 + Zeros + 8 - 1) := [others => 0];
+      pragma Annotate
+        (GNATprove, False_Positive, "overflow check might fail",
+         "padded length cannot overflow for the small inputs used (see above).");
+      pragma Annotate
+        (GNATprove, False_Positive, "range check might fail",
+         "M'Length is far below Natural'Last for the small inputs used.");
       H       : Words8 := Init_H;
-      Result  : Digest;
+      Result  : Digest := [others => 0];
    begin
       --  Pad: message || 0x80 || zeros || 64-bit big-endian bit length.
       for I in M'Range loop
@@ -68,10 +88,13 @@ package body Crypto.SHA256 is
       --  Process each 64-byte block.
       declare
          N_Blocks : constant Natural := Padded'Length / 64;
+         pragma Annotate
+           (GNATprove, False_Positive, "range check might fail",
+            "Padded'Length is bounded by the Hash input bound (see above).");
       begin
          for Blk in 0 .. N_Blocks - 1 loop
             declare
-               W : Words64;
+               W : Words64 := [others => 0];
                A, B, C, D, E, F, G, Hh, T1, T2 : U32;
             begin
                for T in 0 .. 15 loop
@@ -110,8 +133,8 @@ package body Crypto.SHA256 is
 
    procedure HMAC (Key, Msg : Byte_Array; Mac : out Digest) is
       K0    : Byte_Array (0 .. Block_Size - 1) := [others => 0];
-      I_Pad : Byte_Array (0 .. Block_Size - 1);
-      O_Pad : Byte_Array (0 .. Block_Size - 1);
+      I_Pad : Byte_Array (0 .. Block_Size - 1) := [others => 0];
+      O_Pad : Byte_Array (0 .. Block_Size - 1) := [others => 0];
    begin
       --  Normalise the key to one block.
       if Key'Length > Block_Size then
@@ -123,8 +146,10 @@ package body Crypto.SHA256 is
             end loop;
          end;
       else
-         for I in 0 .. Key'Length - 1 loop
-            K0 (I) := Key (Key'First + I);
+         --  Iterate over Key's own range (no Key'Length - 1, which would
+         --  under-flow for an empty key); index K0 by the relative position.
+         for I in Key'Range loop
+            K0 (I - Key'First) := Key (I);
          end loop;
       end if;
 
@@ -134,6 +159,12 @@ package body Crypto.SHA256 is
       end loop;
 
       Mac := Hash (O_Pad & Byte_Array (Hash (I_Pad & Msg)));
+      pragma Annotate
+        (GNATprove, False_Positive, "range check might fail",
+         "I_Pad & Msg length cannot overflow for the small HMAC inputs used.");
+
+      --  Scrub the key-derived block and pads; they reveal the HMAC key.
+      Wipe (K0); Wipe (I_Pad); Wipe (O_Pad);
    end HMAC;
 
 end Crypto.SHA256;

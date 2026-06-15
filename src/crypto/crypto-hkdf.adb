@@ -2,7 +2,7 @@
 -- Crypto.HKDF body — RFC 5869 (HMAC-SHA256)
 ---------------------------------------------------------------------
 
-package body Crypto.HKDF is
+package body Crypto.HKDF with SPARK_Mode => On is
 
    use Crypto.SHA256;
 
@@ -23,12 +23,16 @@ package body Crypto.HKDF is
       Prev_Len : Natural := 0;                                 -- T(0) is empty
       Pos   : Natural := 0;
    begin
+      Output := [others => 0];   -- fully initialised for flow; filled below
       for I in 1 .. N loop
          declare
-            --  Input = T(i-1) | Info | byte(i)
-            In_Buf : Byte_Array (0 .. Prev_Len + Info'Length + 1 - 1);
+            --  Input = T(i-1) | Info | byte(i). Sized for the maximum
+            --  (Prev is at most 32 bytes) so the bound is constant, not a
+            --  variable subtype constraint (which SPARK forbids); only the
+            --  filled prefix In_Buf (0 .. P - 1) is fed to HMAC.
+            In_Buf : Byte_Array (0 .. 32 + Info'Length) := [others => 0];
             P      : Natural := 0;
-            T      : Digest;
+            T      : Digest := [others => 0];
          begin
             for J in 0 .. Prev_Len - 1 loop
                In_Buf (P) := Prev (J); P := P + 1;
@@ -36,9 +40,9 @@ package body Crypto.HKDF is
             for J in Info'Range loop
                In_Buf (P) := Info (J); P := P + 1;
             end loop;
-            In_Buf (P) := U8 (I);
+            In_Buf (P) := U8 (I); P := P + 1;
 
-            HMAC (PRK, In_Buf, T);
+            HMAC (PRK, In_Buf (0 .. P - 1), T);
 
             declare
                Take : constant Natural := Natural'Min (32, Output'Length - Pos);
@@ -51,8 +55,11 @@ package body Crypto.HKDF is
 
             Prev (0 .. 31) := T;
             Prev_Len := 32;
+            Wipe (In_Buf);   -- holds T(i-1), a secret
+            Wipe (T);
          end;
       end loop;
+      Wipe (Prev);           -- last secret block
    end Expand;
 
 end Crypto.HKDF;

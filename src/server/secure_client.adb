@@ -148,9 +148,10 @@ begin
                         Put (Clear_Ln & "ai  ▸ "); Answered := True;
                      end if;
                      for I in Rec'First + 1 .. Rec'Last loop
-                        if P_Len <= Pending'Last then
-                           Pending (P_Len) := Rec (I); P_Len := P_Len + 1;
+                        if P_Len > Pending'Last then
+                           Flush_Complete;   -- drain; keeps only a partial tail
                         end if;
+                        Pending (P_Len) := Rec (I); P_Len := P_Len + 1;
                      end loop;
                      Flush_Complete; Flush;
                   when others => null;

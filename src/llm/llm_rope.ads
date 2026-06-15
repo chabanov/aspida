@@ -23,8 +23,12 @@ package LLM_RoPE is
       Sections   : Tensor;  -- [1, 4] = [11, 11, 10, 0] (set 0 for unused)
    end record;
 
-   -- Create RoPE params for Qwen 3.5
-   function Create_Qwen_RoPE return RoPE_Params;
+   -- Create RoPE params. Defaults are the Qwen 3.5 values; the loader passes
+   -- the GGUF metadata values when present so other configs work unchanged.
+   function Create_Qwen_RoPE
+     (Dim       : Integer := 64;
+      Freq_Base : Float   := 10_000_000.0;
+      Max_Pos   : Integer := 262_144) return RoPE_Params;
 
    -- Apply rotary embedding to input tensor
    -- X: query or key tensor [1, head_dim] (single head, single token)

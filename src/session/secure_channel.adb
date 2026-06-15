@@ -19,6 +19,14 @@ package body Secure_Channel is
 
    Max_Frame : constant := 1_048_576;   -- 1 MiB cap (anti-DoS)
 
+   Zero32 : constant Key32 := [others => 0];
+
+   --  An all-zero X25519 result means the peer sent a low-order point: the
+   --  shared secret is non-contributory and must be rejected (RFC 7748 §6.1).
+   --  Compared in constant time (the secret-dependent value is the input).
+   function Degenerate (K : Key32) return Boolean is
+     (Const_Time_Equal (K, Zero32));
+
    ------------------------------------------------------------------
    -- Wire framing: 4-byte big-endian length prefix + payload.
    ------------------------------------------------------------------
@@ -146,6 +154,10 @@ package body Secure_Channel is
             for I in 0 .. 31 loop E (I) := E_Pub (E_Pub'First + I); end loop;
             ES := Crypto.X25519.Scalar_Mult (Static_Secret, E);
             EE := Crypto.X25519.Scalar_Mult (F_Priv, E);
+            if Degenerate (ES) or else Degenerate (EE) then
+               Wipe (ES); Wipe (EE);
+               raise Handshake_Error with "degenerate (low-order) DH result";
+            end if;
             Derive (S_Pub, E, F_Pub, ES, EE, K_C2S, K_S2C, Transcript);
             Wipe (ES); Wipe (EE);
 
@@ -162,6 +174,13 @@ package body Secure_Channel is
             Wipe (F_Priv); Wipe (K_C2S); Wipe (K_S2C);
          end;
       end;
+   exception
+      when others =>
+         --  Never leave session/ephemeral keys on the stack on a failed
+         --  handshake. Ch.Ready stays False (record default), so the caller
+         --  must not use Ch.
+         Wipe (F_Priv); Wipe (K_C2S); Wipe (K_S2C);
+         raise;
    end Server_Handshake;
 
    procedure Client_Handshake
@@ -188,6 +207,10 @@ package body Secure_Channel is
                ES : Key32 := Crypto.X25519.Scalar_Mult (E_Priv, Server_Public);
                EE : Key32 := Crypto.X25519.Scalar_Mult (E_Priv, F_Pub);
             begin
+               if Degenerate (ES) or else Degenerate (EE) then
+                  Wipe (ES); Wipe (EE);
+                  raise Handshake_Error with "degenerate (low-order) DH result";
+               end if;
                Derive (Server_Public, E_Pub, F_Pub, ES, EE,
                        K_C2S, K_S2C, Transcript);
                Wipe (ES); Wipe (EE);
@@ -220,6 +243,10 @@ package body Secure_Channel is
             end;
          end;
       end;
+   exception
+      when others =>
+         Wipe (E_Priv); Wipe (K_C2S); Wipe (K_S2C);
+         raise;
    end Client_Handshake;
 
    ------------------------------------------------------------------
@@ -234,6 +261,12 @@ package body Secure_Channel is
       CT    : Byte_Array (0 .. Plaintext'Length - 1);
       Tag   : Crypto.AEAD.Tag_128;
    begin
+      --  Refuse to wrap the 64-bit nonce counter: reusing a (key, nonce) pair
+      --  is catastrophic for ChaCha20-Poly1305. 2^64 records is unreachable in
+      --  practice, so this only ever fires on a bug, not in normal operation.
+      if Ch.N_Send = Crypto.U64'Last then
+         raise Auth_Error with "send nonce space exhausted";
+      end if;
       Crypto.AEAD.Seal (Ch.K_Send, Nonce (Ch.N_Send), Empty, Plaintext, CT, Tag);
       for I in CT'Range loop Frame (I) := CT (I); end loop;
       for I in 0 .. 15 loop Frame (Plaintext'Length + I) := Tag (I); end loop;
@@ -248,6 +281,9 @@ package body Secure_Channel is
    begin
       if Frame'Length < 16 then
          raise Auth_Error with "short frame";
+      end if;
+      if Ch.N_Recv = Crypto.U64'Last then
+         raise Auth_Error with "recv nonce space exhausted";
       end if;
       declare
          PT_Len : constant Natural := Frame'Length - 16;

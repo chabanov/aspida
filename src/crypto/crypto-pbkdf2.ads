@@ -4,12 +4,14 @@
 -- configurable iteration count (work factor) to slow brute force.
 ---------------------------------------------------------------------
 
-package Crypto.PBKDF2 is
+--  SPARK_Mode: flow-analysed (initialisation, data dependencies, non-aliasing).
+package Crypto.PBKDF2 with SPARK_Mode => On is
 
    procedure Derive
      (Password   : Byte_Array;
       Salt       : Byte_Array;
       Iterations : Positive;
-      DK         : out Byte_Array);
+      DK         : out Byte_Array)
+     with Global => null;
 
 end Crypto.PBKDF2;

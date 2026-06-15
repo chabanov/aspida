@@ -9,17 +9,20 @@
 
 with Crypto.SHA256;
 
-package Crypto.HKDF is
+--  SPARK_Mode: flow-analysed (initialisation, data dependencies, non-aliasing).
+package Crypto.HKDF with SPARK_Mode => On is
 
    --  PRK = HMAC-SHA256(salt, IKM). Empty salt is treated as 32 zero bytes
    --  (equivalent under HMAC), per RFC 5869 §2.2.
    procedure Extract
-     (Salt : Byte_Array; IKM : Byte_Array; PRK : out Crypto.SHA256.Digest);
+     (Salt : Byte_Array; IKM : Byte_Array; PRK : out Crypto.SHA256.Digest)
+     with Global => null;
 
    --  Fill Output with OKM = T(1) | T(2) | ... (RFC 5869 §2.3). Output'Length
    --  must be <= 255 * 32.
    procedure Expand
      (PRK : Crypto.SHA256.Digest; Info : Byte_Array; Output : out Byte_Array)
-     with Pre => Output'Length <= 255 * 32;
+     with Global => null,
+          Pre    => Output'Length <= 255 * 32;
 
 end Crypto.HKDF;

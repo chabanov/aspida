@@ -20,6 +20,7 @@ package body At_Rest is
 
    use Crypto;
    package SIO renames Ada.Streams.Stream_IO;
+   use type SIO.Count;
 
    Magic    : constant Byte_Array (0 .. 3) :=
      [Character'Pos ('A'), Character'Pos ('S'),
@@ -27,6 +28,7 @@ package body At_Rest is
    Hdr_Len  : constant := 36;
    Salt_Off : constant := 8;
    Non_Off  : constant := 24;
+   Max_File : constant := 64 * 1024 * 1024;   -- 64 MiB sane cap on a store file
 
    procedure Put_BE32 (A : in out Byte_Array; Off : Natural; V : U32) is
    begin
@@ -83,6 +85,12 @@ package body At_Rest is
       F : SIO.File_Type;
    begin
       SIO.Open (F, SIO.In_File, Path);
+      --  Bound the allocation by the on-disk size before reading: a corrupt or
+      --  hostile file must not be able to force a multi-gigabyte read (OOM DoS).
+      if SIO.Size (F) > SIO.Count (Max_File) then
+         SIO.Close (F);
+         raise Format_Error with "encrypted store too large";
+      end if;
       declare
          Size : constant Natural := Natural (SIO.Size (F));
          Buf  : Byte_Array (0 .. Size - 1);

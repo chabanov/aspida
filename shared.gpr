@@ -1,0 +1,37 @@
+-- shared.gpr — common compiler/linker switches for every Aspida project.
+--
+-- Centralises the flag lists that were copy-pasted across the per-component
+-- project files (and had drifted), and gates the non-portable -march=native:
+--
+--   gprbuild -P <prj> ...                 # ARCH=native (default): tune for host
+--   gprbuild -P <prj> -XARCH=portable ... # drop -march=native: run anywhere
+--
+-- Abstract: it carries no sources, only the shared switch variables that the
+-- other projects reference (e.g. `for Default_Switches ("Ada") use Shared.Ada_O3`).
+
+abstract project Shared is
+
+   for Source_Dirs use ();
+
+   type Arch_Kind is ("native", "portable");
+   Arch : Arch_Kind := external ("ARCH", "native");
+
+   March := ();
+   case Arch is
+      when "native"   => March := ("-march=native");
+      when "portable" => March := ();
+   end case;
+
+   --  Strict warnings-as-errors + the GNAT extension subset, shared by every
+   --  component so the strictness can never drift between them again.
+   Warn := ("-gnatwa", "-gnatwe", "-gnatX");
+
+   Ada_O3 := Warn & ("-O3") & March;
+   Ada_O2 := Warn & ("-O2") & March;
+
+   --  macOS SDK root for the linker (passed as -XSDKROOT on the command line).
+   Linker_Switches :=
+     ("-L" & external ("SDKROOT", "") & "/usr/lib",
+      "-Wl,-syslibroot," & external ("SDKROOT", ""));
+
+end Shared;

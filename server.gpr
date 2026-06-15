@@ -8,6 +8,7 @@
 -- Run:   QWEN_MODEL_PATH=... ./obj/secure_server [port]
 --        ./obj/secure_client <host> <port> <server_pub_hex> <prompt...>
 
+with "shared.gpr";
 with "session.gpr";
 
 project Server is
@@ -18,14 +19,11 @@ project Server is
    for Main use ("secure_server.adb", "secure_client.adb");
 
    package Compiler is
-      for Default_Switches ("Ada") use
-        ("-gnatwa", "-gnatwe", "-gnatX", "-O3", "-march=native");
+      for Default_Switches ("Ada") use Shared.Ada_O3;
    end Compiler;
 
    package Linker is
-      for Default_Switches ("Ada") use
-        ("-L" & external ("SDKROOT", "") & "/usr/lib",
-         "-Wl,-syslibroot," & external ("SDKROOT", ""));
+      for Default_Switches ("Ada") use Shared.Linker_Switches;
    end Linker;
 
    package Binder is

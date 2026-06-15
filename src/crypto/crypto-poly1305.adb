@@ -4,7 +4,7 @@
 
 with Interfaces; use Interfaces;
 
-package body Crypto.Poly1305 is
+package body Crypto.Poly1305 with SPARK_Mode => On is
 
    Mask26 : constant U32 := 16#3FFFFFF#;
 
@@ -26,6 +26,7 @@ package body Crypto.Poly1305 is
       N   : constant Natural := Msg'Length;
       Pos : Natural := 0;
    begin
+      Tag := [others => 0];   -- fully initialised for flow; overwritten below
       while Pos < N loop
          declare
             Remain : constant Natural := N - Pos;

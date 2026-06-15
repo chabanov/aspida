@@ -1,14 +1,16 @@
 ---------------------------------------------------------------------
 -- LLM_Dequant — Q5_K_M and other GGML quantization → FP32
 --
--- Q5_K_M is the format used by the Qwen 3.5 model.
--- Layout per superblock of 256 elements:
---   - scales: 12 × FP16  (for 8 sub-blocks of 32 el, plus 4 extra for interleaving)
---   - qs:     N/16 × 2 bytes = compressed 5-bit values with packing
---   - qh:     N/16 × 1 byte  = high bits for 5-bit values
+-- Q5_K_M is the format used by parts of the Qwen 3.5 model.
+-- Layout per Q5_K super-block of 256 elements (block_q5_K in llama.cpp):
+--   - d:      FP16 (2 bytes)   super-block scale
+--   - dmin:   FP16 (2 bytes)   super-block min
+--   - scales: 12 bytes         8 × 6-bit (scale, min) packed
+--   - qh:     32 bytes         1 high bit per element (256 / 8)
+--   - qs:     128 bytes        4 low bits per element (256 / 2)
 --
--- Total per 256-element superblock: 2×12 + N/8 + N/16 bytes
--- For N=256: 24 + 32 + 16 = 72 bytes → 18% of FP32 (72/1024)
+-- Total per 256-element super-block: 2 + 2 + 12 + 32 + 128 = 176 bytes
+--   → 5.5 bits/weight, 176/1024 ≈ 17.2% of FP32.
 --
 -- Reference: ggml-quants.c from llama.cpp
 ---------------------------------------------------------------------

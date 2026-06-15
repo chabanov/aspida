@@ -49,6 +49,10 @@ package body LLM_Qwen is
       M    : Qwen_Model;
       Dim  : Integer := 2048;
       N_Layers : Integer := 36;
+      N_Experts     : Integer := 256;   -- GGUF override below; Qwen-3.5 default
+      Full_Interval : Integer := 4;     -- full-attn every Nth layer (L mod N = N-1)
+      RoPE_Dim      : Integer := 64;            -- rope dimension count
+      RoPE_Base     : Float   := 10_000_000.0;  -- rope frequency base
 
       function L (Name : String) return Tensor is
          Info : constant Tensor_Info := Find_Tensor (G, Name);
@@ -63,12 +67,10 @@ package body LLM_Qwen is
          end return;
       exception
          when Constraint_Error =>
-            Ada.Text_IO.Put_Line ("  WARNING: tensor not found: " & Name);
-            return New_Tensor ([1, 1]);
+            raise Model_Load_Error with "tensor not found: " & Name;
          when E : others =>
-            Ada.Text_IO.Put_Line ("  ERROR loading tensor " & Name & ": "
-              & Ada.Exceptions.Exception_Message (E));
-            return New_Tensor ([1, 1]);
+            raise Model_Load_Error with "error loading tensor " & Name & ": "
+              & Ada.Exceptions.Exception_Message (E);
       end L;
 
       --  Load a weight WITHOUT dequantizing — keeps raw quantized bytes so the
@@ -81,9 +83,9 @@ package body LLM_Qwen is
          Read_Tensor_Raw (G, Info, B.all'Address, Size);
          return LLM_Weight.From_Quant (Info, B);
       exception
-         when others =>
-            Ada.Text_IO.Put_Line ("  WARNING: tensor not found: " & Name);
-            return LLM_Weight.From_Dense (New_Tensor ([1, 1]));
+         when E : others =>
+            raise Model_Load_Error with "error loading weight " & Name & ": "
+              & Ada.Exceptions.Exception_Message (E);
       end LQ;
 
    begin
@@ -91,8 +93,7 @@ package body LLM_Qwen is
       Open (G, Path);
 
       if not Is_Open (G) then
-         Ada.Text_IO.Put_Line ("ERROR: cannot open GGUF file");
-         return M;
+         raise Model_Load_Error with "cannot open GGUF file: " & Path;
       end if;
 
       -- Read config from metadata (try qwen35moe.* first, fallback to qwen2.*)
@@ -138,6 +139,42 @@ package body LLM_Qwen is
          end;
       end;
 
+      --  Architecture parameters that were previously hard-coded: read them
+      --  from GGUF metadata when present, else keep the known Qwen-3.5 default,
+      --  so the bundled model is byte-identical while other configs work.
+      declare
+         function Meta_Int (Key : String; Default : Integer) return Integer is
+            V : constant String := Metadata (G, "qwen35moe." & Key);
+         begin
+            return (if V = "" then Default else Integer'Value (V));
+         exception
+            when others => return Default;
+         end;
+         function Meta_Float (Key : String; Default : Float) return Float is
+            V : constant String := Metadata (G, "qwen35moe." & Key);
+         begin
+            return (if V = "" then Default else Float'Value (V));
+         exception
+            when others => return Default;
+         end;
+      begin
+         N_Experts := Meta_Int ("expert_count", N_Experts);
+         Full_Interval :=
+           Meta_Int ("attention.full_attention_interval", Full_Interval);
+         if Full_Interval < 1 then
+            Full_Interval := 4;   -- guard against a bogus/zero value
+         end if;
+         RoPE_Dim  := Meta_Int ("rope.dimension_count", RoPE_Dim);
+         RoPE_Base := Meta_Float ("rope.freq_base", RoPE_Base);
+         if RoPE_Dim < 2 then
+            RoPE_Dim := 64;       -- guard against a bogus/zero value
+         end if;
+      end;
+      Ada.Text_IO.Put_Line ("  rope: dim=" & Img (RoPE_Dim)
+        & " base=" & Float'Image (RoPE_Base)
+        & " experts=" & Img (N_Experts)
+        & " full_attn_every=" & Img (Full_Interval));
+
       -- Allocate block array
       M.Blocks := new Block_Array (1 .. N_Layers);
 
@@ -172,7 +209,7 @@ package body LLM_Qwen is
       for I in 0 .. N_Layers - 1 loop
          declare
             Pre     : constant String := "blk." & Img (I) & ".";
-            Is_Full : constant Boolean := (I mod 4) = 3;
+            Is_Full : constant Boolean := (I mod Full_Interval) = Full_Interval - 1;
             Blk     : LLM_Qwen_Blk.Qwen_Block;
          begin
             Ada.Text_IO.Put_Line ("  loading block" & Img (I) &
@@ -192,7 +229,7 @@ package body LLM_Qwen is
                   L  (Pre & "attn_q_norm.weight"),
                   L  (Pre & "attn_k_norm.weight"),
                   LQ (Pre & "attn_output.weight"),
-                  LLM_RoPE.Create_Qwen_RoPE);
+                  LLM_RoPE.Create_Qwen_RoPE (RoPE_Dim, RoPE_Base, M.Ctx_Len));
             else
                Blk.DNet := LLM_DeltaNet_Blk.Create
                  (LQ (Pre & "attn_qkv.weight"),
@@ -216,7 +253,7 @@ package body LLM_Qwen is
                LQ (Pre & "ffn_up_shexp.weight"),
                LQ (Pre & "ffn_down_shexp.weight"),
                L  (Pre & "ffn_gate_inp_shexp.weight"),
-               256);
+               N_Experts);
 
             M.Blocks (I + 1) := new LLM_Qwen_Blk.Qwen_Block'(Blk);
          end;
@@ -238,7 +275,8 @@ package body LLM_Qwen is
          when others => M.Eos_Id := M.Im_End_Id;
       end;
       Ada.Text_IO.Put_Line ("  chat tokens: im_start=" & Img (M.Im_Start_Id)
-        & " im_end=" & Img (M.Im_End_Id) & " eos=" & Img (M.Eos_Id));
+        & " im_end=" & Img (M.Im_End_Id) & " eos=" & Img (M.Eos_Id)
+        & " unk=" & Img (LLM_Tokenizer.Unk_Id (M.Tok)));
 
       Close (G);
       Ada.Text_IO.Put_Line ("  Qwen model loaded: " & Img (M.N_Blocks) & " blocks.");

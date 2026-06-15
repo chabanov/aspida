@@ -36,8 +36,28 @@ procedure Secure_Server is
    package SIO renames Ada.Streams.Stream_IO;
 
    Key_File     : constant String := "server_key.bin";
+   Pub_File     : constant String := "server_pub.hex";
+   Default_Port : constant := 8765;
    Max_Clients  : constant := 8;     -- concurrent handler tasks
    Max_Queue    : constant := 64;    -- pending-connection backlog
+   Max_Reply_Tokens : constant := 256;   -- generation cap per turn
+
+   --  How long a connection may stay silent before its handler reclaims the
+   --  slot (anti-DoS: a client that handshakes then never sends must not pin a
+   --  handler task forever). Generous so a user thinking between turns is fine;
+   --  override with ASPIDA_IDLE_TIMEOUT (seconds).
+   function Idle_Timeout return Duration is
+   begin
+      if Ada.Environment_Variables.Exists ("ASPIDA_IDLE_TIMEOUT") then
+         begin
+            return Duration'Value
+              (Ada.Environment_Variables.Value ("ASPIDA_IDLE_TIMEOUT"));
+         exception
+            when others => null;   -- malformed -> fall through to default
+         end;
+      end if;
+      return 600.0;
+   end Idle_Timeout;
 
    function Hex (B : Byte_Array) return String is
       Digs : constant String := "0123456789abcdef";
@@ -189,6 +209,23 @@ procedure Secure_Server is
          if Length (Want) = 0 then
             Crypto.Random.Fill (Id_B);
             Want := To_Unbounded_String (Hex (Id_B));
+         elsif not Session_Store.Valid_Id (To_String (Want)) then
+            --  Client-supplied id reaches the filesystem path; reject anything
+            --  that isn't a safe [A-Za-z0-9_-]{1,64} token (path-traversal).
+            declare
+               Msg : constant String := "invalid session id";
+               Err : Byte_Array (0 .. Msg'Length);
+            begin
+               Err (0) := Protocol.Tag_Error;
+               for I in Msg'Range loop
+                  Err (I - Msg'First + 1) := U8 (Character'Pos (Msg (I)));
+               end loop;
+               Secure_Channel.Send_Message (Ch, ST'Access, Err);
+            end;
+            Put_Line ("  [rejected] invalid session id");
+            Secure_Channel.Close (Ch);
+            Close_Socket (Conn);
+            return;
          end if;
 
          --  Refuse a second live connection to the same session.
@@ -254,7 +291,7 @@ procedure Secure_Server is
                --  Only one generation runs at a time across all clients.
                Infer_Lock.Acquire; Locked := True;
                R_Val := To_Unbounded_String
-                 (LLM_Qwen.Chat (Model, Conv, 256, Sink'Access));
+                 (LLM_Qwen.Chat (Model, Conv, Max_Reply_Tokens, Sink'Access));
                Infer_Lock.Release; Locked := False;
 
                Secure_Channel.Send_Message (Ch, ST'Access, [0 => Protocol.Tag_Done]);
@@ -269,16 +306,18 @@ procedure Secure_Server is
    exception
       when E : others =>
          Put_Line ("  connection closed: " & Exception_Message (E));
+         --  Each cleanup step is isolated: a failure in one must not skip the
+         --  others (a leaked socket or unreleased session would compound).
          if Length (Sid) > 0 then
-            Active_Sessions.Release (To_String (Sid));
+            begin Active_Sessions.Release (To_String (Sid));
+            exception when others => null; end;
          end if;
-         Session_Store.Close (Store);
-         Secure_Channel.Close (Ch);
-         begin
-            Close_Socket (Conn);
-         exception
-            when others => null;
-         end;
+         begin Session_Store.Close (Store);
+         exception when others => null; end;
+         begin Secure_Channel.Close (Ch);
+         exception when others => null; end;
+         begin Close_Socket (Conn);
+         exception when others => null; end;
    end Handle_Connection;
 
    task type Handler;
@@ -287,14 +326,21 @@ procedure Secure_Server is
    begin
       loop
          Conn_Queue.Get (Conn);
-         Handle_Connection (Conn);     -- has its own exception handling
+         --  A handler task must never die: even though Handle_Connection has its
+         --  own handler, an exception escaping it (e.g. from cleanup) would kill
+         --  this task and permanently shrink the pool. Swallow as a last resort.
+         begin
+            Handle_Connection (Conn);
+         exception
+            when others => null;
+         end;
       end loop;
    end Handler;
 
    Handlers : array (1 .. Max_Clients) of Handler;
    pragma Unreferenced (Handlers);
 
-   Port : Port_Type := 8765;
+   Port : Port_Type := Default_Port;
 begin
    if Ada.Command_Line.Argument_Count >= 1 then
       Port := Port_Type'Value (Ada.Command_Line.Argument (1));
@@ -309,7 +355,7 @@ begin
    declare
       F : Ada.Text_IO.File_Type;
    begin
-      Ada.Text_IO.Create (F, Ada.Text_IO.Out_File, "server_pub.hex");
+      Ada.Text_IO.Create (F, Ada.Text_IO.Out_File, Pub_File);
       Ada.Text_IO.Put_Line (F, Hex (Crypto.X25519.Public_Key (Secret)));
       Ada.Text_IO.Close (F);
    exception
@@ -329,6 +375,10 @@ begin
          From : Sock_Addr_Type;
       begin
          Accept_Socket (Listener, Conn, From);
+         --  Reclaim the slot from a silent peer: a read that stalls past the
+         --  idle timeout raises in the handler, which then cleans up.
+         Set_Socket_Option
+           (Conn, Socket_Level, (Receive_Timeout, Idle_Timeout));
          Conn_Queue.Put (Conn);        -- a free handler will pick it up
       end;
    end loop;

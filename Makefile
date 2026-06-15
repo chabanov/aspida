@@ -32,11 +32,15 @@ TEST_BIN    := $(OBJ_DIR)/test_runner
 # ── Toolchain ────────────────────────────────────────────────────────
 GPRBUILD    := $(GPRBUILD_BIN)/gprbuild
 GPRCLEAN    := $(GPRBUILD_BIN)/gprclean
-GNATPROVE   := $(GNAT_BIN)/gnatprove
+# gnatprove is installed via `alr install gnatprove` (lands in ~/.alire/bin);
+# fall back to the GNAT toolchain dir if a future toolchain bundles it.
+GNATPROVE   := $(firstword $(wildcard $(HOME)/.alire/bin/gnatprove) $(GNAT_BIN)/gnatprove)
 FORMATTER   := $(GNAT_BIN)/gnatpp
 
 # ── Flags ────────────────────────────────────────────────────────────
-GPR_FLAGS   := -XSDKROOT=$(SDKROOT)
+# ARCH=portable drops -march=native (binaries run on any CPU); see shared.gpr.
+ARCH        ?= native
+GPR_FLAGS   := -XSDKROOT=$(SDKROOT) -XARCH=$(ARCH)
 SPARK_FLAGS := -P $(MAIN_GPR) $(GPR_FLAGS) --mode=flow
 
 # ── Default ──────────────────────────────────────────────────────────
@@ -133,12 +137,14 @@ test-weights-real: ## Validate GGUF load + dequant on real tensors (needs model)
 	./obj/test_weights_real
 
 .PHONY: prove
-prove: ## Run SPARK flow analysis
-	$(GNATPROVE) $(SPARK_FLAGS)
+prove: ## SPARK: full AoRTE+functional proof of crypto root, ChaCha20 & SHA-256; flow for the rest
+	$(GNATPROVE) -P crypto.gpr $(GPR_FLAGS) \
+	  -u crypto.adb -u crypto-chacha20.adb -u crypto-sha256.adb \
+	  --mode=all --level=2 -j0 --report=all
 
-.PHONY: prove-report
-prove-report: ## Run SPARK + generate HTML report
-	$(GNATPROVE) $(SPARK_FLAGS) --report=all
+.PHONY: prove-flow
+prove-flow: ## SPARK flow analysis (init/deps/aliasing) over the whole crypto library
+	$(GNATPROVE) -P crypto.gpr $(GPR_FLAGS) --mode=flow -j0
 
 # ══════════════════════════════════════════════════════════════════════
 #  CLEAN
