@@ -14,11 +14,13 @@ with Ada.Strings.Fixed;
 with Ada.Strings;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Exceptions;
+with Interfaces.C;
 with LLM_GGUF;    use LLM_GGUF;
 with LLM_Tensor;  use LLM_Tensor;
 with LLM_RMSNorm;
 with LLM_RoPE;
 with LLM_Weight;
+with LLM_GPU;
 
 package body LLM_Llama is
 
@@ -193,6 +195,36 @@ package body LLM_Llama is
       return M;
    end Load;
 
+   --  Matvec, on the GPU when the LLM_GPU shim is loaded (Q4_K/Q6_K weights),
+   --  else the pure-Ada CPU path. Bit-identical kernels, so output is unchanged.
+   function GMV (W : LLM_Weight.Weight; X : Tensor) return Tensor is
+      KC : constant Integer := LLM_Weight.Kind_Code (W);
+   begin
+      if KC >= 0 and then LLM_GPU.Available then
+         declare
+            Ind  : constant Integer := LLM_Weight.Cols (W);
+            Outd : constant Integer := LLM_Weight.Rows (W);
+            XL   : array (1 .. Ind)  of aliased Interfaces.C.C_float;
+            YL   : array (1 .. Outd) of aliased Interfaces.C.C_float :=
+              [others => 0.0];   -- written by the C call via 'Address
+            Y    : Tensor := New_Tensor ([1, Outd]);
+         begin
+            for I in 1 .. Ind loop
+               XL (I) := Interfaces.C.C_float (Get_Flat (X, I));
+            end loop;
+            LLM_GPU.MatVec
+              (LLM_Weight.Raw_Address (W), LLM_Weight.Raw_Bytes (W),
+               KC, Ind, Outd, XL'Address, YL'Address);
+            for I in 1 .. Outd loop
+               Set_Flat (Y, I, Float (YL (I)));
+            end loop;
+            return Y;
+         end;
+      else
+         return LLM_Weight.MatVec (W, X);
+      end if;
+   end GMV;
+
    --------------------------------------------------------------------
    -- One incremental decode step at 0-based position Pos.
    --------------------------------------------------------------------
@@ -218,9 +250,9 @@ package body LLM_Llama is
          declare
             B : L_Block renames M.Blocks (Lr);
             X : constant Tensor := GN (H, B.Attn_Norm);
-            Q : Tensor := LLM_Weight.MatVec (B.W_Q, X);
-            K : Tensor := LLM_Weight.MatVec (B.W_K, X);
-            V : constant Tensor := LLM_Weight.MatVec (B.W_V, X);
+            Q : Tensor := GMV (B.W_Q, X);
+            K : Tensor := GMV (B.W_K, X);
+            V : constant Tensor := GMV (B.W_V, X);
          begin
             --  RoPE on Q (per head) and K (per kv head); no QK-norm, no bias.
             for Hh in 0 .. NH - 1 loop
@@ -280,21 +312,21 @@ package body LLM_Llama is
                      end loop;
                   end;
                end loop;
-               Add_To (H, LLM_Weight.MatVec (B.W_O, Ctx_O));   -- attn residual
+               Add_To (H, GMV (B.W_O, Ctx_O));   -- attn residual
             end;
 
             --  SwiGLU FFN with residual.
             declare
                Xf   : constant Tensor := GN (H, B.Ffn_Norm);
-               Gate : constant Tensor := Silu (LLM_Weight.MatVec (B.W_Gate, Xf));
-               Up   : constant Tensor := LLM_Weight.MatVec (B.W_Up, Xf);
+               Gate : constant Tensor := Silu (GMV (B.W_Gate, Xf));
+               Up   : constant Tensor := GMV (B.W_Up, Xf);
             begin
-               Add_To (H, LLM_Weight.MatVec (B.W_Down, Gate * Up));
+               Add_To (H, GMV (B.W_Down, Gate * Up));
             end;
          end;
       end loop;
 
-      return LLM_Weight.MatVec (M.Output, GN (H, M.Out_Norm));
+      return GMV (M.Output, GN (H, M.Out_Norm));
    end Forward_Step;
 
    --------------------------------------------------------------------

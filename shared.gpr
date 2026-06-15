@@ -6,6 +6,11 @@
 --   gprbuild -P <prj> ...                 # ARCH=native (default): tune for host
 --   gprbuild -P <prj> -XARCH=portable ... # drop -march=native: run anywhere
 --
+-- Target OS selects the linker flags (the Makefile passes -XOS=$(uname)):
+--
+--   -XOS=darwin  (default)  # macOS: link against the SDK (needs -XSDKROOT)
+--   -XOS=linux              # Linux: no SDK flags; GNAT links libc directly
+--
 -- Abstract: it carries no sources, only the shared switch variables that the
 -- other projects reference (e.g. `for Default_Switches ("Ada") use Shared.Ada_O3`).
 
@@ -15,6 +20,9 @@ abstract project Shared is
 
    type Arch_Kind is ("native", "portable");
    Arch : Arch_Kind := external ("ARCH", "native");
+
+   type OS_Kind is ("darwin", "linux");
+   OS : OS_Kind := external ("OS", "darwin");
 
    March := ();
    case Arch is
@@ -29,9 +37,17 @@ abstract project Shared is
    Ada_O3 := Warn & ("-O3") & March;
    Ada_O2 := Warn & ("-O2") & March;
 
-   --  macOS SDK root for the linker (passed as -XSDKROOT on the command line).
-   Linker_Switches :=
-     ("-L" & external ("SDKROOT", "") & "/usr/lib",
-      "-Wl,-syslibroot," & external ("SDKROOT", ""));
+   --  Linker flags are OS-specific. macOS needs the SDK root (passed as
+   --  -XSDKROOT); Linux needs nothing extra (GNAT links libc/libm and the
+   --  tasking runtime automatically).
+   Linker_Switches := ();
+   case OS is
+      when "darwin" =>
+         Linker_Switches :=
+           ("-L" & external ("SDKROOT", "") & "/usr/lib",
+            "-Wl,-syslibroot," & external ("SDKROOT", ""));
+      when "linux" =>
+         Linker_Switches := ();
+   end case;
 
 end Shared;

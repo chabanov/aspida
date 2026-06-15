@@ -2,6 +2,8 @@
 --
 -- Build: gprbuild -P tests/aspida_tests.gpr -XSDKROOT=$(xcrun --show-sdk-path)
 
+with "../shared.gpr";
+
 project Aspida_Tests is
 
    for Source_Dirs use ("../src", "../src/llm", ".");
@@ -14,9 +16,7 @@ project Aspida_Tests is
    end Compiler;
 
    package Linker is
-      for Default_Switches ("Ada") use
-        ("-L" & external ("SDKROOT", "") & "/usr/lib",
-         "-Wl,-syslibroot," & external ("SDKROOT", ""));
+      for Default_Switches ("Ada") use Shared.Linker_Switches;
    end Linker;
 
    package Binder is
