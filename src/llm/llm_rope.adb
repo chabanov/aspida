@@ -7,13 +7,17 @@ use Ada.Numerics.Elementary_Functions;
 
 package body LLM_RoPE is
 
-   function Create_Qwen_RoPE return RoPE_Params is
+   function Create_Qwen_RoPE
+     (Dim       : Integer := 64;
+      Freq_Base : Float   := 10_000_000.0;
+      Max_Pos   : Integer := 262_144) return RoPE_Params
+   is
       P : RoPE_Params;
       S : Tensor := New_Tensor ([1, 4]);
    begin
-      P.Dim       := 64;
-      P.Freq_Base := 10_000_000.0;
-      P.Max_Pos   := 262_144;
+      P.Dim       := Dim;
+      P.Freq_Base := Freq_Base;
+      P.Max_Pos   := Max_Pos;
       Set_Flat (S, 1, 11.0);  -- section 0: dims 0-10
       Set_Flat (S, 2, 11.0);  -- section 1: dims 11-21
       Set_Flat (S, 3, 10.0);  -- section 2: dims 22-31

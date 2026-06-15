@@ -6,7 +6,10 @@
 -- constant-time (no secret-dependent branches or memory indexing).
 ---------------------------------------------------------------------
 
-package Crypto.ChaCha20 is
+--  SPARK_Mode: formally analysed for absence of run-time errors (no overflow,
+--  no out-of-range indexing) and flow. The cipher is branch-/index-constant
+--  in its secret inputs by construction.
+package Crypto.ChaCha20 with SPARK_Mode => On is
 
    subtype Key_256  is Byte_Array (0 .. 31);   -- 32-byte key
    subtype Nonce_96 is Byte_Array (0 .. 11);   -- 12-byte nonce
@@ -14,7 +17,8 @@ package Crypto.ChaCha20 is
 
    --  One 64-byte keystream block for the given counter (RFC 8439 §2.3).
    procedure Keystream_Block
-     (Key : Key_256; Nonce : Nonce_96; Counter : U32; B : out Block_64);
+     (Key : Key_256; Nonce : Nonce_96; Counter : U32; B : out Block_64)
+     with Global => null;
 
    --  XOR the keystream into Input, producing Output (same length), starting
    --  at the given block counter (RFC 8439 §2.4). Encrypt and decrypt are the
@@ -25,6 +29,7 @@ package Crypto.ChaCha20 is
       Counter : U32;
       Input   : Byte_Array;
       Output  : out Byte_Array)
-     with Pre => Output'Length = Input'Length;
+     with Global => null,
+          Pre    => Output'Length = Input'Length;
 
 end Crypto.ChaCha20;

@@ -5,7 +5,7 @@
 with Interfaces; use Interfaces;
 with Crypto.SHA256;
 
-package body Crypto.PBKDF2 is
+package body Crypto.PBKDF2 with SPARK_Mode => On is
 
    procedure Derive
      (Password   : Byte_Array;
@@ -18,12 +18,13 @@ package body Crypto.PBKDF2 is
       N_Blocks : constant Natural := (DK'Length + H_Len - 1) / H_Len;
       Pos      : Natural := 0;
    begin
+      DK := [others => 0];   -- fully initialised for flow; filled below
       for I in 1 .. N_Blocks loop
          declare
             --  U_1 = HMAC(P, Salt || INT_BE32(i))
-            Msg  : Byte_Array (0 .. Salt'Length + 4 - 1);
+            Msg  : Byte_Array (0 .. Salt'Length + 4 - 1) := [others => 0];
             U    : Digest;
-            U_Nx : Digest;
+            U_Nx : Digest := [others => 0];   -- may stay unset if Iterations = 1
             T    : Digest;
          begin
             for J in Salt'Range loop
@@ -52,6 +53,7 @@ package body Crypto.PBKDF2 is
                end loop;
                Pos := Pos + Take;
             end;
+            Wipe (U); Wipe (U_Nx); Wipe (T);   -- password-derived secrets
          end;
       end loop;
    end Derive;

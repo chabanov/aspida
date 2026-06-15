@@ -5,7 +5,7 @@
 with Crypto.ChaCha20;
 with Crypto.Poly1305;
 
-package body Crypto.AEAD is
+package body Crypto.AEAD with SPARK_Mode => On is
 
    --  Poly1305 key generation (RFC 8439 §2.6): first 32 bytes of the
    --  ChaCha20 keystream block at counter 0.
@@ -72,6 +72,7 @@ package body Crypto.AEAD is
       Ciphertext : Byte_Array;
       Tag        : Tag_128;
       Plaintext  : out Byte_Array) return Boolean
+     with SPARK_Mode => Off
    is
       Expected : Tag_128;
    begin

@@ -6,9 +6,9 @@
 -- byte-pair encoding by merge rank; with no vocabulary it falls back to
 -- a 1-id-per-byte encoding so callers always get a usable result.
 --
--- NOTE: real GGUF vocabularies use the GPT-2 byte->unicode remapping;
--- mapping raw input bytes through that bijection is a remaining
--- refinement (pieces not found in the vocab fall back to per-byte ids).
+-- Real GGUF vocabularies use the GPT-2 byte->unicode remapping; that
+-- bijection is implemented (see Byte_To_Piece / Unmap_Bytes in the body),
+-- so raw input bytes map onto the UTF-8 vocab pieces and back on decode.
 ---------------------------------------------------------------------
 
 with LLM_GGUF;
@@ -34,6 +34,8 @@ package LLM_Tokenizer is
    -- True once a vocabulary has been loaded (otherwise byte-level mode).
    function Is_Loaded (T : Tokenizer) return Boolean;
    function Vocab_Size (T : Tokenizer) return Integer;
+   --  The model's unknown-token id, or -1 if the vocab defines none.
+   function Unk_Id (T : Tokenizer) return Integer;
 
    -- Text -> token ids.
    function Encode (T : Tokenizer; Text : String) return Token_Array;

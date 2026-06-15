@@ -1,0 +1,52 @@
+name: CI
+
+# Builds the engine + crypto/E2EE stack and runs every test that does NOT need
+# the (multi-gigabyte, non-distributable) GGUF model. The model-dependent
+# checks (test_*_real) are intentionally excluded — run them locally via
+# `make test-tokenizer-real` / `test-weights-real` / `test-qmatvec-real`.
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Alire + GNAT toolchain
+        uses: alire-project/setup-alire@v4
+        with:
+          toolchain: gnat_native^15 gprbuild
+
+      - name: Resolve macOS SDK
+        run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+
+      - name: Build crypto + session test suites
+        run: |
+          alr exec -- gprbuild -P crypto_tests.gpr -XSDKROOT="$SDKROOT"
+          alr exec -- gprbuild -P secure_tests.gpr -XSDKROOT="$SDKROOT"
+
+      - name: Run crypto / E2EE test vectors (RFC KATs, channel, at-rest)
+        run: |
+          set -e
+          for t in test_crypto test_hash test_random test_x25519 \
+                   test_channel test_pbkdf2 test_atrest test_socket test_session; do
+            echo "── $t"; ./obj/$t
+          done
+
+      - name: Build LLM unit tests
+        run: alr exec -- gprbuild -P tests/llm_tests.gpr -XSDKROOT="$SDKROOT"
+
+      - name: Run model-free LLM unit tests
+        run: |
+          set -e
+          for t in test_rmsnorm test_moe test_tokenizer test_tensor \
+                   test_deltanet test_deltanet_blk test_fullattn test_block test_pool; do
+            echo "── $t"; ./obj/$t
+          done
+
+      - name: Build the encrypted server + client
+        run: alr exec -- gprbuild -P server.gpr -XSDKROOT="$SDKROOT"

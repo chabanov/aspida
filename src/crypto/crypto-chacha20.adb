@@ -4,7 +4,7 @@
 
 with Interfaces; use Interfaces;
 
-package body Crypto.ChaCha20 is
+package body Crypto.ChaCha20 with SPARK_Mode => On is
 
    type State is array (0 .. 15) of U32;
 
@@ -14,6 +14,8 @@ package body Crypto.ChaCha20 is
    C2 : constant U32 := 16#79622D32#;
    C3 : constant U32 := 16#6B206574#;
 
+   procedure Quarter_Round (S : in out State; A, B, C, D : Natural)
+     with Pre => A <= 15 and then B <= 15 and then C <= 15 and then D <= 15;
    procedure Quarter_Round (S : in out State; A, B, C, D : Natural) is
    begin
       S (A) := S (A) + S (B); S (D) := Rotate_Left (S (D) xor S (A), 16);
@@ -25,8 +27,10 @@ package body Crypto.ChaCha20 is
    procedure Keystream_Block
      (Key : Key_256; Nonce : Nonce_96; Counter : U32; B : out Block_64)
    is
-      Init, S : State;
+      Init : State := [others => 0];   -- fully initialised for flow analysis
+      S    : State;
    begin
+      B := [others => 0];
       Init (0) := C0;  Init (1) := C1;  Init (2) := C2;  Init (3) := C3;
       for I in 0 .. 7 loop
          Init (4 + I) := Load_LE32 (Key, 4 * I);
@@ -62,23 +66,47 @@ package body Crypto.ChaCha20 is
       Input   : Byte_Array;
       Output  : out Byte_Array)
    is
-      KS     : Block_64;
-      N      : constant Natural := Input'Length;
-      Blocks : constant Natural := (N + 63) / 64;
-      Pos    : Natural := 0;
+      KS : Block_64;
+      N  : constant Natural := Input'Length;
+      pragma Annotate
+        (GNATprove, False_Positive, "range check might fail",
+         "Input'Length cannot overflow Natural: a Byte_Array spanning 0 .. "
+         & "Natural'Last (>2 GiB from index 0) is not constructible; all "
+         & "callers pass small buffers.");
    begin
-      for Blk in 0 .. Blocks - 1 loop
-         Keystream_Block (Key, Nonce, Counter + U32 (Blk), KS);
-         declare
-            This : constant Natural := Natural'Min (64, N - Pos);
-         begin
-            for I in 0 .. This - 1 loop
-               Output (Output'First + Pos + I) :=
-                 Input (Input'First + Pos + I) xor KS (I);
-            end loop;
-            Pos := Pos + This;
-         end;
-      end loop;
+      Output := [others => 0];   -- fully initialised (flow); overwritten below
+      if N = 0 then
+         return;
+      end if;
+      declare
+         --  Ceil(N/64) without an N+63 intermediate that could overflow.
+         Blocks : constant Natural := N / 64 + (if N mod 64 = 0 then 0 else 1);
+         Pos    : Natural := 0;
+      begin
+         --  The 32-bit block counter must not wrap: a wrapped counter reuses
+         --  keystream. (Unreachable below 256 GiB, but enforce it explicitly.)
+         if U64 (Counter) + U64 (Blocks - 1) > U64 (U32'Last) then
+            raise Constraint_Error with "ChaCha20 block counter overflow";
+            pragma Annotate
+              (GNATprove, Intentional, "exception might be raised",
+               "intentional defensive guard: a wrapped 32-bit block counter "
+               & "would reuse keystream. AEAD callers bound messages far below "
+               & "the 2**32-block (256 GiB) limit, so this is unreachable.");
+         end if;
+         for Blk in 0 .. Blocks - 1 loop
+            pragma Loop_Invariant (Pos <= N);
+            Keystream_Block (Key, Nonce, Counter + U32 (Blk), KS);
+            declare
+               This : constant Natural := Natural'Min (64, N - Pos);
+            begin
+               for I in 0 .. This - 1 loop
+                  Output (Output'First + Pos + I) :=
+                    Input (Input'First + Pos + I) xor KS (I);
+               end loop;
+               Pos := Pos + This;
+            end;
+         end loop;
+      end;
    end XOR_Stream;
 
 end Crypto.ChaCha20;

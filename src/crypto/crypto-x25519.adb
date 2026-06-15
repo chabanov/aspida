@@ -12,7 +12,7 @@
 with Interfaces;             use Interfaces;
 with Ada.Unchecked_Conversion;
 
-package body Crypto.X25519 is
+package body Crypto.X25519 with SPARK_Mode => On is
 
    subtype I64 is Interfaces.Integer_64;
    type GF is array (0 .. 15) of I64;
@@ -61,14 +61,14 @@ package body Crypto.X25519 is
    end Sel;
 
    function Add (A, B : GF) return GF is
-      O : GF;
+      O : GF := [others => 0];
    begin
       for I in 0 .. 15 loop O (I) := A (I) + B (I); end loop;
       return O;
    end Add;
 
    function Sub (A, B : GF) return GF is
-      O : GF;
+      O : GF := [others => 0];
    begin
       for I in 0 .. 15 loop O (I) := A (I) - B (I); end loop;
       return O;
@@ -76,7 +76,7 @@ package body Crypto.X25519 is
 
    function Mul (A, B : GF) return GF is
       T : array (0 .. 30) of I64 := [others => 0];
-      O : GF;
+      O : GF := [others => 0];
    begin
       for I in 0 .. 15 loop
          for J in 0 .. 15 loop
@@ -107,7 +107,7 @@ package body Crypto.X25519 is
    end Inv;
 
    function Unpack (N : Key_256) return GF is
-      O : GF;
+      O : GF := [others => 0];
    begin
       for I in 0 .. 15 loop
          O (I) := I64 (N (N'First + 2 * I))
@@ -118,9 +118,11 @@ package body Crypto.X25519 is
    end Unpack;
 
    procedure Pack (O : out Key_256; N : GF) is
-      M, T : GF;
-      B    : I64;
+      M : GF := [others => 0];
+      T : GF := [others => 0];
+      B : I64;
    begin
+      O := [others => 0];
       T := N;
       Car (T); Car (T); Car (T);
       for J in 0 .. 1 loop
@@ -141,16 +143,16 @@ package body Crypto.X25519 is
    end Pack;
 
    function Scalar_Mult (Scalar, Point : Key_256) return Key_256 is
-      Z : Byte_Array (0 .. 31);
-      X : GF;
+      Z : Byte_Array (0 .. 31) := [others => 0];
+      X : GF := [others => 0];
       A : GF := [0 => 1, others => 0];
-      B : GF;
+      B : GF := [others => 0];
       C : GF := [others => 0];
       D : GF := [0 => 1, others => 0];
-      E : GF;
-      F : GF;
+      E : GF := [others => 0];
+      F : GF := [others => 0];
       R : I64;
-      Result : Key_256;
+      Result : Key_256 := [others => 0];
    begin
       --  Clamp the scalar (RFC 7748 §5).
       for I in 0 .. 30 loop
@@ -191,6 +193,7 @@ package body Crypto.X25519 is
       C := Inv (C);
       A := Mul (A, C);
       Pack (Result, A);
+      Wipe (Z);   -- scrub the clamped private scalar before returning
       return Result;
    end Scalar_Mult;
 

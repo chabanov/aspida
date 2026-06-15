@@ -27,6 +27,7 @@ package body LLM_Tokenizer is
       Merges     : Str_Int_Maps.Map;   -- "left<NUL>right" -> rank
       Loaded     : Boolean := False;
       Byte_Level : Boolean := False;   -- GPT-2 byte->unicode remap
+      Unk_Id     : Integer := -1;      -- tokenizer.ggml.unknown_token_id (-1 = none)
    end record;
 
    --------------------------------------------------------------------
@@ -154,6 +155,19 @@ package body LLM_Tokenizer is
          Add_Merge (T, LLM_GGUF.Merge_At (G, I), I);      -- rank = file order
       end loop;
       T.Byte_Level := LLM_GGUF.Metadata (G, "tokenizer.ggml.model") = "gpt2";
+      --  The model's unknown-token id, used as the fallback for a piece that
+      --  is absent from the vocab (instead of the magic 0, a valid token).
+      --  Absent for an exhaustive byte-level vocab -> stays -1.
+      declare
+         U : constant String :=
+           LLM_GGUF.Metadata (G, "tokenizer.ggml.unknown_token_id");
+      begin
+         if U /= "" then
+            T.Unk_Id := Integer'Value (U);
+         end if;
+      exception
+         when others => T.Unk_Id := -1;
+      end;
       T.Loaded := NT > 0;
    end Load_From_GGUF;
 
@@ -173,6 +187,9 @@ package body LLM_Tokenizer is
       end if;
       return Integer (T.Vocab.Length);
    end Vocab_Size;
+
+   function Unk_Id (T : Tokenizer) return Integer is
+     (if T = null then -1 else T.Unk_Id);
 
    --------------------------------------------------------------------
    -- Decode
@@ -290,8 +307,10 @@ package body LLM_Tokenizer is
                begin
                   if T.Vocab.Contains (P) then
                      R (I) := T.Vocab.Element (P);
+                  elsif T.Unk_Id >= 0 then
+                     R (I) := T.Unk_Id;        -- the model's real UNK token
                   else
-                     R (I) := 0;  -- unknown piece
+                     R (I) := 0;               -- last resort (no UNK defined)
                   end if;
                end;
             end loop;

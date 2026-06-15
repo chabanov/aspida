@@ -1,5 +1,6 @@
 -- secure_tests.gpr — TCP transport + channel integration test (no model).
 
+with "shared.gpr";
 with "session.gpr";
 
 project Secure_Tests is
@@ -10,13 +11,11 @@ project Secure_Tests is
    for Main use ("test_socket.adb", "test_session.adb");
 
    package Compiler is
-      for Default_Switches ("Ada") use ("-gnatwa", "-gnatwe", "-gnatX", "-O2");
+      for Default_Switches ("Ada") use Shared.Ada_O2;
    end Compiler;
 
    package Linker is
-      for Default_Switches ("Ada") use
-        ("-L" & external ("SDKROOT", "") & "/usr/lib",
-         "-Wl,-syslibroot," & external ("SDKROOT", ""));
+      for Default_Switches ("Ada") use Shared.Linker_Switches;
    end Linker;
 
 end Secure_Tests;

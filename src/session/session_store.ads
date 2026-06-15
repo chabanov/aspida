@@ -15,6 +15,11 @@ package Session_Store is
    --  True when ASPIDA_STORE_PASSWORD is set (history is persisted).
    function Enabled return Boolean;
 
+   --  True if Id is safe to use as the on-disk session filename: 1..64 chars
+   --  from [A-Za-z0-9_-] only. Rejects anything that could escape the sessions
+   --  directory (path separators, '.', NUL), i.e. guards against traversal.
+   function Valid_Id (Id : String) return Boolean;
+
    --  Begin or resume the session with the given id: if an encrypted
    --  transcript already exists it is decrypted and loaded.
    procedure Open (S : out Store; Id : String);

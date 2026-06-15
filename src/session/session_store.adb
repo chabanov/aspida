@@ -40,6 +40,20 @@ package body Session_Store is
      (Ada.Environment_Variables.Exists (Var)
       and then Ada.Environment_Variables.Value (Var) /= "");
 
+   function Valid_Id (Id : String) return Boolean is
+   begin
+      if Id'Length = 0 or else Id'Length > 64 then
+         return False;
+      end if;
+      for C of Id loop
+         case C is
+            when '0' .. '9' | 'a' .. 'z' | 'A' .. 'Z' | '_' | '-' => null;
+            when others => return False;
+         end case;
+      end loop;
+      return True;
+   end Valid_Id;
+
    function Password_Bytes return Byte_Array is
       V : constant String := Ada.Environment_Variables.Value (Var, "");
       R : Byte_Array (0 .. Integer'Max (0, V'Length) - 1);
@@ -86,29 +100,43 @@ package body Session_Store is
       end return;
    end Serialize;
 
+   Corrupt_Store : exception;   -- length prefixes inconsistent with the blob
+
    procedure Deserialize (Data : Byte_Array; V : in out Turn_Vectors.Vector) is
       P : Natural := 0;   -- offset from Data'First
       function Rd_Len return Natural is
-         L : constant U32 :=
-           Shift_Left (U32 (Data (Data'First + P)), 24)
-           or Shift_Left (U32 (Data (Data'First + P + 1)), 16)
-           or Shift_Left (U32 (Data (Data'First + P + 2)), 8)
-           or U32 (Data (Data'First + P + 3));
       begin
-         P := P + 4;
-         return Natural (L);
+         if P + 4 > Data'Length then
+            raise Corrupt_Store with "truncated length prefix";
+         end if;
+         declare
+            L : constant U32 :=
+              Shift_Left (U32 (Data (Data'First + P)), 24)
+              or Shift_Left (U32 (Data (Data'First + P + 1)), 16)
+              or Shift_Left (U32 (Data (Data'First + P + 2)), 8)
+              or U32 (Data (Data'First + P + 3));
+         begin
+            P := P + 4;
+            return Natural (L);
+         end;
       end Rd_Len;
       function Rd_Str (N : Natural) return String is
-         R : String (1 .. N);
       begin
-         for I in 1 .. N loop
-            R (I) := Character'Val (Integer (Data (Data'First + P + I - 1)));
-         end loop;
-         P := P + N;
-         return R;
+         if P + N > Data'Length then
+            raise Corrupt_Store with "length prefix exceeds remaining data";
+         end if;
+         return R : String (1 .. N) do
+            for I in 1 .. N loop
+               R (I) := Character'Val (Integer (Data (Data'First + P + I - 1)));
+            end loop;
+            P := P + N;
+         end return;
       end Rd_Str;
    begin
       V.Clear;
+      --  Every read is bounds-checked against Data'Length, so a corrupt (but
+      --  authenticated) blob raises Corrupt_Store rather than reading past the
+      --  buffer or allocating a multi-gigabyte String from a bogus prefix.
       while P < Data'Length loop
          declare
             U_Len : constant Natural := Rd_Len;
@@ -139,6 +167,11 @@ package body Session_Store is
 
    procedure Open (S : out Store; Id : String) is
    begin
+      --  Defence in depth: never let an unvalidated id reach the filesystem
+      --  path (callers should pre-validate, but this is the last line).
+      if not Valid_Id (Id) then
+         raise Program_Error with "invalid session id";
+      end if;
       S := new Store_Rec;
       S.Id := To_Unbounded_String (Id);
       S.Turns.Clear;

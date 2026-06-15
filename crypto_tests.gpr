@@ -4,6 +4,7 @@
 --   gprbuild -P crypto_tests.gpr -XSDKROOT=$(xcrun --show-sdk-path)
 --   ./obj/test_crypto
 
+with "shared.gpr";
 with "crypto.gpr";
 with "session.gpr";
 
@@ -17,14 +18,11 @@ project Crypto_Tests is
                  "test_pbkdf2.adb", "test_atrest.adb");
 
    package Compiler is
-      for Default_Switches ("Ada") use
-        ("-gnatwa", "-gnatwe", "-gnatX", "-O2");
+      for Default_Switches ("Ada") use Shared.Ada_O2;
    end Compiler;
 
    package Linker is
-      for Default_Switches ("Ada") use
-        ("-L" & external ("SDKROOT", "") & "/usr/lib",
-         "-Wl,-syslibroot," & external ("SDKROOT", ""));
+      for Default_Switches ("Ada") use Shared.Linker_Switches;
    end Linker;
 
 end Crypto_Tests;

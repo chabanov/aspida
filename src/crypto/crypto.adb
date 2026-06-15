@@ -4,7 +4,7 @@
 
 with Interfaces; use Interfaces;
 
-package body Crypto is
+package body Crypto with SPARK_Mode => On is
 
    function Const_Time_Equal (A, B : Byte_Array) return Boolean is
       Diff : U8 := 0;
@@ -12,13 +12,23 @@ package body Crypto is
       if A'Length /= B'Length then
          return False;                       -- length is not a secret
       end if;
-      for I in 0 .. A'Length - 1 loop
-         Diff := Diff or (A (A'First + I) xor B (B'First + I));
+      for I in A'Range loop
+         Diff := Diff or (A (I) xor B (B'First + (I - A'First)));
+         --  Diff has folded exactly the bytes A'First..I; it is zero iff every
+         --  one of those byte pairs is equal. This ties the accumulator to the
+         --  functional postcondition.
+         pragma Loop_Invariant
+           ((Diff = 0)
+            = (for all J in A'First .. I =>
+                 A (J) = B (B'First + (J - A'First))));
       end loop;
       return Diff = 0;
    end Const_Time_Equal;
 
-   procedure Wipe (A : in out Byte_Array) is
+   --  The body uses an anti-dead-store-elimination trick (a branch the
+   --  optimiser cannot prove unreachable) that is outside the SPARK model,
+   --  so it is exempted; the spec's postcondition is the callable guarantee.
+   procedure Wipe (A : in out Byte_Array) with SPARK_Mode => Off is
    begin
       for I in A'Range loop
          A (I) := 0;

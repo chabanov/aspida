@@ -14,6 +14,11 @@ package LLM_Qwen is
 
    type Qwen_Model is private;
 
+   --  Raised by Load when the GGUF cannot be opened or a critical tensor is
+   --  missing/unreadable. Loading must fail loudly rather than return a model
+   --  that silently emits garbage.
+   Model_Load_Error : exception;
+
    -- Load model from GGUF file
    function Load (Path : String) return Qwen_Model;
 

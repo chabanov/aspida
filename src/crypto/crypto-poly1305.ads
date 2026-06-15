@@ -7,11 +7,17 @@
 -- branches; the final reduction selects via masks, not branches).
 ---------------------------------------------------------------------
 
-package Crypto.Poly1305 is
+--  SPARK_Mode: flow-analysed (initialisation, data dependencies, non-aliasing).
+--  Full absence-of-run-time-errors proof of the 26-bit limb carry arithmetic
+--  needs the "accumulator < 2**130" invariant (research-grade, see SPARKNaCl)
+--  and is tracked as future work; the cipher's tag-comparison path is already
+--  fully proved in the Crypto root (Const_Time_Equal).
+package Crypto.Poly1305 with SPARK_Mode => On is
 
    subtype Key_256 is Byte_Array (0 .. 31);   -- one-time key r||s
    subtype Tag_128 is Byte_Array (0 .. 15);
 
-   procedure MAC (Key : Key_256; Msg : Byte_Array; Tag : out Tag_128);
+   procedure MAC (Key : Key_256; Msg : Byte_Array; Tag : out Tag_128)
+     with Global => null;
 
 end Crypto.Poly1305;

@@ -3,6 +3,7 @@
 ---------------------------------------------------------------------
 
 with Ada.Text_IO;
+with System.Storage_Elements;
 
 package body LLM_GGUF is
 
@@ -37,14 +38,40 @@ package body LLM_GGUF is
    -- Binary reader helpers
    --------------------------------------------------------------------
 
+   --  Read exactly Count bytes, looping over short reads (read() may legally
+   --  return fewer bytes than requested — at EOF, on a signal, or on a pipe).
+   --  Advances the destination address by the bytes already read.
    procedure Read_Exact (FD : C_Int; Addr : System.Address; Count : Natural) is
-      N : C_Int;
+      use System.Storage_Elements;
+      Remaining : Natural := Count;
+      Cur       : System.Address := Addr;
+      N         : C_Int;
    begin
-      N := C_Read (FD, Addr, C_Size (Count));
-      if N /= C_Int (Count) then
-         raise Constraint_Error with "Short read from GGUF file";
-      end if;
+      while Remaining > 0 loop
+         N := C_Read (FD, Cur, C_Size (Remaining));
+         if N <= 0 then
+            raise Constraint_Error with "Short read from GGUF file";
+         end if;
+         Remaining := Remaining - Natural (N);
+         Cur := Cur + Storage_Offset (N);
+      end loop;
    end Read_Exact;
+
+   type U8_T  is mod 2 ** 8;
+   function Read_U8 (FD : C_Int) return U8_T is
+      V : U8_T := 0;
+   begin
+      Read_Exact (FD, V'Address, 1);
+      return V;
+   end Read_U8;
+
+   type U16_T is mod 2 ** 16;
+   function Read_U16 (FD : C_Int) return U16_T is
+      V : U16_T := 0;
+   begin
+      Read_Exact (FD, V'Address, 2);
+      return V;
+   end Read_U16;
 
    function Read_U32 (FD : C_Int) return U32 is
       V : U32 := 0;
@@ -106,10 +133,24 @@ package body LLM_GGUF is
       V_Str : Unbounded_String;
    begin
       case VT is
-         when GGUF_TYPE_U8   => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U32 (FD))));
-         when GGUF_TYPE_I8   => V_Str := To_Unbounded_String (Integer'Image (Integer (Read_U32 (FD))));
-         when GGUF_TYPE_U16  => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U32 (FD))));
-         when GGUF_TYPE_I16  => V_Str := To_Unbounded_String (Integer'Image (Integer (Read_U32 (FD))));
+         --  Small scalars are 1 or 2 bytes on disk; reading 4 would desync the
+         --  file cursor and corrupt every subsequent metadata entry.
+         when GGUF_TYPE_U8   => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U8 (FD))));
+         when GGUF_TYPE_I8   =>
+            declare
+               B : constant U8_T := Read_U8 (FD);
+            begin
+               V_Str := To_Unbounded_String (Integer'Image
+                 (if B >= 128 then Integer (B) - 256 else Integer (B)));
+            end;
+         when GGUF_TYPE_U16  => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U16 (FD))));
+         when GGUF_TYPE_I16  =>
+            declare
+               H : constant U16_T := Read_U16 (FD);
+            begin
+               V_Str := To_Unbounded_String (Integer'Image
+                 (if H >= 32768 then Integer (H) - 65536 else Integer (H)));
+            end;
          when GGUF_TYPE_U32  => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U32 (FD))));
          when GGUF_TYPE_I32  => V_Str := To_Unbounded_String (Integer'Image (Integer (Read_U32 (FD))));
          when GGUF_TYPE_F32  => V_Str := To_Unbounded_String (Float'Image (Read_F32 (FD)));
