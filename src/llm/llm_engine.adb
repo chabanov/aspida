@@ -1,10 +1,35 @@
 ---------------------------------------------------------------------
--- LLM_Engine body — detect architecture, dispatch to the backend.
+-- LLM_Engine body — detect architecture, construct the matching backend
+-- (registry-driven), then dispatch over the unified Model_Backend protocol.
 ---------------------------------------------------------------------
 
 with LLM_GGUF;
+with LLM_Qwen.Backend;
+with LLM_Gemma.Backend;
+with LLM_Llama.Backend;
 
 package body LLM_Engine is
+
+   --  Architecture registry: a GGUF general.architecture string -> the backend
+   --  constructor. Adding a model = add one row here; nothing else changes.
+   type Constructor is access
+     function (Path : String) return LLM_Backend.Backend_Access;
+
+   type Registration is record
+      Arch : access constant String;
+      Make : Constructor;
+   end record;
+
+   A_Gemma : aliased constant String := "gemma4";
+   A_QMoe  : aliased constant String := "qwen35moe";
+   A_Qwen2 : aliased constant String := "qwen2";
+   A_Llama : aliased constant String := "llama";
+
+   Registry : constant array (Positive range <>) of Registration :=
+     [1 => (A_Gemma'Access, LLM_Gemma.Backend.Create'Access),
+      2 => (A_QMoe'Access,  LLM_Qwen.Backend.Create'Access),
+      3 => (A_Qwen2'Access, LLM_Qwen.Backend.Create'Access),
+      4 => (A_Llama'Access, LLM_Llama.Backend.Create'Access)];
 
    --  Peek general.architecture: open, read metadata, close. (One-time on
    --  load; the chosen backend reopens the file to stream tensor data.)
@@ -25,38 +50,27 @@ package body LLM_Engine is
    function Load (Path : String) return Engine is
       Arch : constant String := Detect (Path);
    begin
-      if Arch = "gemma4" then
-         return (Kind => B_Gemma, Gm => LLM_Gemma.Load (Path), others => <>);
-      elsif Arch = "qwen35moe" or else Arch = "qwen2" then
-         return (Kind => B_Qwen, Q => LLM_Qwen.Load (Path), others => <>);
-      elsif Arch = "" then
+      if Arch = "" then
          raise Model_Load_Error with "cannot open GGUF file: " & Path;
-      else
-         raise Model_Load_Error with
-           "unsupported architecture '" & Arch
-           & "' (supported: qwen35moe, gemma4)";
       end if;
+      for R of Registry loop
+         if R.Arch.all = Arch then
+            return (Impl => R.Make (Path));
+         end if;
+      end loop;
+      raise Model_Load_Error with
+        "unsupported architecture '" & Arch
+        & "' (supported: qwen35moe, qwen2, gemma4, llama)";
    end Load;
 
    function Chat
      (E : Engine; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
-      Sink : access LLM_Qwen.Token_Sink'Class := null) return String is
-   begin
-      case E.Kind is
-         when B_Qwen  =>
-            return LLM_Qwen.Chat (E.Q, Conversation, Max_New_Tokens, Sink);
-         when B_Gemma =>
-            return LLM_Gemma.Chat (E.Gm, Conversation, Max_New_Tokens, Sink);
-      end case;
-   end Chat;
+      Sink : access LLM_Qwen.Token_Sink'Class := null;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
+   is (E.Impl.Chat (Conversation, Max_New_Tokens, Sink, Params));
 
-   function Vocab_Size (E : Engine) return Integer is
-     (case E.Kind is
-         when B_Qwen  => LLM_Qwen.Vocab_Size (E.Q),
-         when B_Gemma => LLM_Gemma.Vocab_Size (E.Gm));
-
-   function Arch_Name (E : Engine) return String is
-     (case E.Kind is when B_Qwen => "qwen35moe", when B_Gemma => "gemma4");
+   function Vocab_Size (E : Engine) return Integer is (E.Impl.Vocab_Size);
+   function Arch_Name  (E : Engine) return String  is (E.Impl.Arch_Name);
 
 end LLM_Engine;

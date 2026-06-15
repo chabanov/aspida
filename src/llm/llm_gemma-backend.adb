@@ -1,0 +1,25 @@
+package body LLM_Gemma.Backend is
+
+   function Create (Path : String) return LLM_Backend.Backend_Access is
+   begin
+      return new Gemma_Backend'(Model => LLM_Gemma.Load (Path));
+   end Create;
+
+   overriding function Chat
+     (M              : Gemma_Backend;
+      Conversation   : LLM_Qwen.Message_Array;
+      Max_New_Tokens : Integer := 256;
+      Sink           : access LLM_Qwen.Token_Sink'Class := null;
+      Params         : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
+   is (LLM_Gemma.Chat (M.Model, Conversation, Max_New_Tokens, Sink, Params));
+
+   overriding function Vocab_Size  (M : Gemma_Backend) return Integer
+     is (LLM_Gemma.Vocab_Size (M.Model));
+   overriding function Arch_Name   (M : Gemma_Backend) return String
+     is ("gemma4");
+   overriding function Dim         (M : Gemma_Backend) return Integer
+     is (LLM_Gemma.Dim (M.Model));
+   overriding function Block_Count (M : Gemma_Backend) return Integer
+     is (LLM_Gemma.Block_Count (M.Model));
+
+end LLM_Gemma.Backend;

@@ -1,13 +1,17 @@
 ---------------------------------------------------------------------
--- LLM_Gemma body — gemma4 (Gemma 3n E4B) loader + forward.
+-- LLM_Gemma body — gemma4 (Gemma-4-E4B) loader + forward.
 --
--- The forward graph (incl. the per-layer-embedding / PLE mechanism and the
--- exact scale constants) was reconstructed from llama.cpp's eval-callback
--- trace and validated against it; see the inline references.
+-- The forward graph follows llama.cpp's models/gemma4.cpp exactly: scaled
+-- token + per-layer (PLE) embeddings, QK-norm attention with V-norm and a
+-- 1.0 scale, dual RoPE (full-attn layers add proportional rope_freqs),
+-- per-layer head_dim (256 SWA / 512 full), shared-KV reuse for the trailing
+-- layers, GeGLU FFN with sandwich norms, tied output + final logit soft-cap.
+-- Decoding keeps an incremental K/V cache, so each step forwards only the new
+-- token (O(n) per token rather than recomputing the whole prefix).
 ---------------------------------------------------------------------
 
 with Ada.Text_IO;
-with Ada.Environment_Variables;
+with Ada.Unchecked_Deallocation;
 with Ada.Numerics.Elementary_Functions; use Ada.Numerics.Elementary_Functions;
 with Ada.Strings.Fixed;
 with Ada.Strings;
@@ -29,15 +33,14 @@ package body LLM_Gemma is
    function Img (N : Integer) return String is
      (Trim (Integer'Image (N), Ada.Strings.Both));
 
-   Dbg : constant Boolean := Ada.Environment_Variables.Exists ("LLM_GDBG");
-   procedure D3 (Name : String; T : Tensor) is
-   begin
-      if Dbg then
-         Ada.Text_IO.Put_Line ("  [" & Name & "]"
-           & Float'Image (Get_Flat (T, 1)) & Float'Image (Get_Flat (T, 2))
-           & Float'Image (Get_Flat (T, 3)));
-      end if;
-   end D3;
+   --  K/V cache: one growing column of per-head K/V vectors per attention
+   --  layer (only own-KV layers are populated; shared layers point at one).
+   type Tensor_Array is array (Positive range <>) of Tensor;
+   type Tensor_Array_Ptr is access Tensor_Array;
+   type KV_Layer is record
+      K, V : Tensor_Array_Ptr;   -- each entry [1, N_KV*Head_Dim]
+   end record;
+   type KV_Cache is array (Positive range <>) of KV_Layer;
 
    type G_Block is record
       Attn_Norm, Post_Attn_Norm     : Tensor;   -- raw weights (no +1)
@@ -49,6 +52,8 @@ package body LLM_Gemma is
       Inp_Gate, Proj                : LLM_Weight.Weight;
       Layer_Out_Scale               : Float := 1.0;
       Is_SWA                        : Boolean := True;
+      Head_Dim                      : Integer := 0;     -- 256 (SWA) / 512 (full)
+      Has_KV                        : Boolean := True;  -- false => reuse cache
    end record;
 
    type Block_Arr is array (Positive range <>) of G_Block;
@@ -64,8 +69,12 @@ package body LLM_Gemma is
       PLE_Proj      : LLM_Weight.Weight;   -- per_layer_model_proj
       PLE_Proj_Norm : Tensor;              -- per_layer_proj_norm
       Out_Norm      : Tensor;
+      Rope_Freqs    : Tensor;              -- proportional-RoPE divisors (full)
       Blocks        : Block_Arr_Ptr;
       Dim, N_Blocks, N_Heads, N_KV, Head_Dim, FFN, Vocab, Ctx : Integer := 0;
+      HD_SWA, HD_Full : Integer := 0;      -- per-type head dims (256 / 512)
+      N_KV_From_Start : Integer := 0;      -- layers [0..N-1] own their KV
+      Logit_Softcap   : Float := 30.0;
       PL_Dim         : Integer := 256;     -- per-layer input dim
       Sliding_Window : Integer := 512;
       RoPE_Glob, RoPE_SWA : LLM_RoPE.RoPE_Params;
@@ -149,6 +158,11 @@ package body LLM_Gemma is
       M.Ctx      := MI ("context_length", 131072);
       M.PL_Dim   := MI ("embedding_length_per_layer_input", 256);
       M.Sliding_Window := MI ("attention.sliding_window", 512);
+      M.HD_Full  := MI ("attention.key_length", 512);
+      M.HD_SWA   := MI ("attention.key_length_swa", 256);
+      M.Logit_Softcap := MF ("final_logit_softcapping", 30.0);
+      --  Last `shared_kv_layers` blocks reuse an earlier block's K/V cache.
+      M.N_KV_From_Start := M.N_Blocks - MI ("attention.shared_kv_layers", 0);
       Glob_Base := MF ("rope.freq_base", 1_000_000.0);
       SWA_Base  := MF ("rope.freq_base_swa", 10_000.0);
 
@@ -164,6 +178,7 @@ package body LLM_Gemma is
       M.PLE_Proj      := LQ ("per_layer_model_proj.weight");
       M.PLE_Proj_Norm := LT ("per_layer_proj_norm.weight");
       M.Out_Norm      := LT ("output_norm.weight");
+      M.Rope_Freqs    := LT ("rope_freqs.weight");
       M.Vocab         := LLM_Weight.Rows (M.Tok_Emb);
       M.Blocks        := new Block_Arr (1 .. M.N_Blocks);
 
@@ -172,17 +187,23 @@ package body LLM_Gemma is
             P  : constant String := "blk." & Img (I - 1) & ".";
             Bk : G_Block;
          begin
+            Bk.Is_SWA  := (I - 1) mod 6 /= 5;            -- 5 local : 1 global
+            Bk.Has_KV  := (I - 1) < M.N_KV_From_Start;   -- else reuse cache
             Bk.Attn_Norm      := LT (P & "attn_norm.weight");
             Bk.Post_Attn_Norm := LT (P & "post_attention_norm.weight");
             Bk.Ffn_Norm       := LT (P & "ffn_norm.weight");
             Bk.Post_Ffw_Norm  := LT (P & "post_ffw_norm.weight");
             Bk.Post_Norm      := LT (P & "post_norm.weight");
             Bk.Q_Norm         := LT (P & "attn_q_norm.weight");
-            Bk.K_Norm         := LT (P & "attn_k_norm.weight");
             Bk.W_Q := LQ (P & "attn_q.weight");
-            Bk.W_K := LQ (P & "attn_k.weight");
-            Bk.W_V := LQ (P & "attn_v.weight");
             Bk.W_O := LQ (P & "attn_output.weight");
+            --  Shared-KV layers (the last `shared_kv_layers`) do not own K/V;
+            --  they reuse an earlier block's cache, so skip those tensors.
+            if Bk.Has_KV then
+               Bk.K_Norm := LT (P & "attn_k_norm.weight");
+               Bk.W_K := LQ (P & "attn_k.weight");
+               Bk.W_V := LQ (P & "attn_v.weight");
+            end if;
             Bk.W_Gate := LQ (P & "ffn_gate.weight");
             Bk.W_Up   := LQ (P & "ffn_up.weight");
             Bk.W_Down := LQ (P & "ffn_down.weight");
@@ -190,14 +211,17 @@ package body LLM_Gemma is
             Bk.Proj     := LQ (P & "proj.weight");
             Bk.Layer_Out_Scale :=
               Get_Flat (LLM_Weight.Get_Row (LQ (P & "layer_output_scale.weight"), 0), 1);
-            Bk.Is_SWA := (I - 1) mod 6 /= 5;     -- 5 local : 1 global
+            Bk.Head_Dim := LLM_Weight.Rows (Bk.W_Q) / M.N_Heads;
             M.Blocks (I) := Bk;
          end;
       end loop;
 
-      M.Head_Dim := LLM_Weight.Rows (M.Blocks (1).W_Q) / M.N_Heads;
-      M.RoPE_Glob := LLM_RoPE.Create_Qwen_RoPE (M.Head_Dim, Glob_Base, M.Ctx);
-      M.RoPE_SWA  := LLM_RoPE.Create_Qwen_RoPE (M.Head_Dim, SWA_Base, M.Ctx);
+      M.Head_Dim := M.Blocks (1).Head_Dim;
+      --  Full-attention layers: head_dim 512, base 1e6, proportional RoPE.
+      M.RoPE_Glob := LLM_RoPE.Create_Qwen_RoPE (M.HD_Full, Glob_Base, M.Ctx);
+      LLM_RoPE.Set_Freq_Factors (M.RoPE_Glob, M.Rope_Freqs);
+      --  Sliding-window layers: head_dim 256, base 1e4, plain RoPE.
+      M.RoPE_SWA  := LLM_RoPE.Create_Qwen_RoPE (M.HD_SWA, SWA_Base, M.Ctx);
 
       M.Tok := LLM_Tokenizer.Create;
       LLM_Tokenizer.Load_From_GGUF (M.Tok, G);
@@ -211,166 +235,180 @@ package body LLM_Gemma is
 
       Ada.Text_IO.Put_Line ("  gemma4: dim=" & Img (M.Dim)
         & " layers=" & Img (M.N_Blocks) & " heads=" & Img (M.N_Heads)
-        & "/" & Img (M.N_KV) & " head_dim=" & Img (M.Head_Dim)
-        & " pl=" & Img (M.PL_Dim) & " vocab=" & Img (M.Vocab));
-      Ada.Text_IO.Put_Line ("  NOTE: forward validated bit-exact through the V "
-        & "projection; attention-output scaling is still being matched to the "
-        & "reference, so generated text is not yet correct.");
+        & "/" & Img (M.N_KV) & " head_dim=" & Img (M.HD_SWA) & "/" & Img (M.HD_Full)
+        & " pl=" & Img (M.PL_Dim) & " kv_from_start=" & Img (M.N_KV_From_Start)
+        & " vocab=" & Img (M.Vocab));
       return M;   -- G (= M.Gf) stays open for on-demand PLE row reads
    end Load;
 
    --------------------------------------------------------------------
-   -- Forward over a token sequence -> logits for the LAST position.
+   -- One incremental decode step: forward the single token Tok at 0-based
+   -- position Pos, append its K/V to the cache, and return the logits.
+   -- The K/V of every prior position are read from Cache, so a step is O(seq)
+   -- rather than recomputing the whole prefix.  (Cache is `in`: the access
+   -- columns are fixed, but their designated elements are written here.)
    --------------------------------------------------------------------
 
-   function Forward_Logits
-     (M : Gemma_Model; Ids : LLM_Tokenizer.Token_Array) return Tensor
+   function Forward_Step
+     (M : Gemma_Model; Cache : KV_Cache; Tok : Integer; Pos : Integer)
+      return Tensor
    is
       D    : constant Integer := M.Dim;
-      HD   : constant Integer := M.Head_Dim;
       NH   : constant Integer := M.N_Heads;
       NKV  : constant Integer := M.N_KV;
       PL   : constant Integer := M.PL_Dim;
-      Seq  : constant Integer := Ids'Length;
-      AScale  : constant Float := 1.0 / Sqrt (Float (HD));
+      --  Gemma 4 uses self.scaling = 1.0 (NO 1/sqrt(head_dim) pre-attn scale).
+      AScale  : constant Float := 1.0;
       E_Scale : constant Float := Sqrt (Float (D));
       P_Scale : constant Float := Sqrt (Float (PL));
       Inv_D   : constant Float := 1.0 / Sqrt (Float (D));
       Inv_2   : constant Float := 1.0 / Sqrt (2.0);
 
-      type TArr is array (Positive range <>) of Tensor;
-      H   : TArr (1 .. Seq);    -- residual stream, each [1, D]
-      IPL : TArr (1 .. Seq);    -- per-layer inputs, each [1, N_Blocks*PL]
-
       procedure Add_To (A : in out Tensor; B : Tensor) is
       begin
          for I in 1 .. D loop Set_Flat (A, I, Get_Flat (A, I) + Get_Flat (B, I)); end loop;
       end Add_To;
-   begin
-      --  Token + per-layer embeddings and the PLE setup (per position).
-      for T in 1 .. Seq loop
+
+      --  RMS-normalize a single head's vector WITHOUT a weight (Gemma's V-norm).
+      function VNorm (X : Tensor) return Tensor is
+         N  : constant Integer := Numel (X);
+         SS : Float := 0.0;
+         R  : Tensor := New_Tensor ([1, N]);
+      begin
+         for I in 1 .. N loop SS := SS + Get_Flat (X, I) ** 2; end loop;
          declare
-            Tok    : constant Integer := Ids (Ids'First + T - 1);
-            Scaled : Tensor := LLM_Weight.Get_Row (M.Tok_Emb, Tok);
-            PTok   : constant Tensor := PLE_Row (M, Tok);
+            Inv : constant Float := 1.0 / Sqrt (SS / Float (N) + 1.0e-6);
          begin
-            for I in 1 .. D loop Set_Flat (Scaled, I, Get_Flat (Scaled, I) * E_Scale); end loop;
-            H (T) := Scaled;
-            IPL (T) := New_Tensor ([1, M.N_Blocks * PL]);
+            for I in 1 .. N loop Set_Flat (R, I, Get_Flat (X, I) * Inv); end loop;
+         end;
+         return R;
+      end VNorm;
+
+      H   : Tensor := LLM_Weight.Get_Row (M.Tok_Emb, Tok);   -- residual [1, D]
+      IPL : Tensor := New_Tensor ([1, M.N_Blocks * PL]);      -- per-layer inputs
+   begin
+      --  Scaled token embedding + per-layer (PLE) inputs for this token.
+      for I in 1 .. D loop Set_Flat (H, I, Get_Flat (H, I) * E_Scale); end loop;
+      declare
+         PTok  : constant Tensor := PLE_Row (M, Tok);
+         --  per_layer_model_proj is applied to the SCALED embedding.
+         PProj : Tensor := LLM_Weight.MatVec (M.PLE_Proj, H);
+      begin
+         for I in 1 .. M.N_Blocks * PL loop
+            Set_Flat (PProj, I, Get_Flat (PProj, I) * Inv_D);
+         end loop;
+         for Lr in 0 .. M.N_Blocks - 1 loop
             declare
-               --  per_layer_model_proj is applied to the SCALED embedding.
-               PProj : Tensor := LLM_Weight.MatVec (M.PLE_Proj, Scaled);
+               Sel : constant Tensor := Slice (PTok, Lr * PL + 1, PL);
+               Prj : constant Tensor :=
+                 GN (Slice (PProj, Lr * PL + 1, PL), M.PLE_Proj_Norm);
             begin
-               for I in 1 .. M.N_Blocks * PL loop
-                  Set_Flat (PProj, I, Get_Flat (PProj, I) * Inv_D);
-               end loop;
-               for Lr in 0 .. M.N_Blocks - 1 loop
-                  declare
-                     Sel : constant Tensor := Slice (PTok, Lr * PL + 1, PL);
-                     Prj : constant Tensor :=
-                       GN (Slice (PProj, Lr * PL + 1, PL), M.PLE_Proj_Norm);
-                  begin
-                     for I in 1 .. PL loop
-                        Set_Flat (IPL (T), Lr * PL + I,
-                          (Get_Flat (Prj, I) + Get_Flat (Sel, I) * P_Scale) * Inv_2);
-                     end loop;
-                  end;
+               for I in 1 .. PL loop
+                  Set_Flat (IPL, Lr * PL + I,
+                    (Get_Flat (Prj, I) + Get_Flat (Sel, I) * P_Scale) * Inv_2);
                end loop;
             end;
-         end;
-      end loop;
-      D3 ("inp_scaled", H (1));
+         end loop;
+      end;
 
       for Lr in 1 .. M.N_Blocks loop
          declare
             B    : G_Block renames M.Blocks (Lr);
+            HD   : constant Integer := B.Head_Dim;   -- 256 (SWA) / 512 (full)
             RoPE : LLM_RoPE.RoPE_Params :=
               (if B.Is_SWA then M.RoPE_SWA else M.RoPE_Glob);
-            Win  : constant Integer := (if B.Is_SWA then M.Sliding_Window else Seq);
-            Qs, Ks, Vs : TArr (1 .. Seq);
-            Attn : TArr (1 .. Seq);
+            Win  : constant Integer :=
+              (if B.Is_SWA then M.Sliding_Window else Pos + 1);
+            --  Shared-KV layers attend the last own-KV layer of their type:
+            --  SWA -> N_KV_From_Start-1, full -> N_KV_From_Start (1-based).
+            Src  : constant Integer :=
+              (if B.Has_KV then Lr
+               elsif B.Is_SWA then M.N_KV_From_Start - 1
+               else M.N_KV_From_Start);
+            X    : constant Tensor := GN (H, B.Attn_Norm);
+            Q    : Tensor := LLM_Weight.MatVec (B.W_Q, X);
          begin
-            --  Q/K/V + QK-norm + RoPE.
-            for T in 1 .. Seq loop
+            --  Q: per-head RMS-norm + RoPE at this position.
+            for Hh in 0 .. NH - 1 loop
                declare
-                  X : constant Tensor := GN (H (T), B.Attn_Norm);
-                  Q : Tensor := LLM_Weight.MatVec (B.W_Q, X);
-                  K : Tensor := LLM_Weight.MatVec (B.W_K, X);
+                  S : constant Tensor := LLM_RoPE.Apply
+                    (RoPE, GN (Slice (Q, Hh * HD + 1, HD), B.Q_Norm), Pos);
                begin
-                  if Lr = 1 and then T = Seq then
-                     D3 ("attn_norm-0", X);
-                     D3 ("Vcur-0", LLM_Weight.MatVec (B.W_V, X));
-                  end if;
-                  for Hh in 0 .. NH - 1 loop
-                     declare
-                        S : constant Tensor := LLM_RoPE.Apply
-                          (RoPE, GN (Slice (Q, Hh * HD + 1, HD), B.Q_Norm), T - 1);
-                     begin
-                        for J in 1 .. HD loop Set_Flat (Q, Hh * HD + J, Get_Flat (S, J)); end loop;
-                     end;
-                  end loop;
+                  for J in 1 .. HD loop Set_Flat (Q, Hh * HD + J, Get_Flat (S, J)); end loop;
+               end;
+            end loop;
+
+            --  Own-KV layers compute K (norm+RoPE) and V (norm) for this token
+            --  and append them to the cache column at this position.
+            if B.Has_KV then
+               declare
+                  K : Tensor := LLM_Weight.MatVec (B.W_K, X);
+                  V : Tensor := LLM_Weight.MatVec (B.W_V, X);
+               begin
                   for Hh in 0 .. NKV - 1 loop
                      declare
-                        S : constant Tensor := LLM_RoPE.Apply
-                          (RoPE, GN (Slice (K, Hh * HD + 1, HD), B.K_Norm), T - 1);
+                        Kn : constant Tensor := LLM_RoPE.Apply
+                          (RoPE, GN (Slice (K, Hh * HD + 1, HD), B.K_Norm), Pos);
+                        Vn : constant Tensor := VNorm (Slice (V, Hh * HD + 1, HD));
                      begin
-                        for J in 1 .. HD loop Set_Flat (K, Hh * HD + J, Get_Flat (S, J)); end loop;
-                     end;
-                  end loop;
-                  Qs (T) := Q; Ks (T) := K; Vs (T) := LLM_Weight.MatVec (B.W_V, X);
-               end;
-            end loop;
-
-            --  Causal (+ sliding-window) attention.
-            for T in 1 .. Seq loop
-               declare
-                  Ctx_O : Tensor := New_Tensor ([1, NH * HD]);
-                  Lo : constant Integer := Integer'Max (1, T - Win + 1);
-               begin
-                  for Hh in 0 .. NH - 1 loop
-                     declare
-                        KV  : constant Integer := Hh / (NH / NKV);
-                        Scr : Tensor := New_Tensor ([1, Seq]);
-                        Mx  : Float := Float'First;
-                        Den : Float := 0.0;
-                     begin
-                        for S in Lo .. T loop
-                           declare Dp : Float := 0.0; begin
-                              for J in 1 .. HD loop
-                                 Dp := Dp + Get_Flat (Qs (T), Hh * HD + J)
-                                          * Get_Flat (Ks (S), KV * HD + J);
-                              end loop;
-                              Set_Flat (Scr, S, Dp * AScale);
-                              Mx := Float'Max (Mx, Dp * AScale);
-                           end;
-                        end loop;
-                        for S in Lo .. T loop
-                           Set_Flat (Scr, S, Exp (Get_Flat (Scr, S) - Mx));
-                           Den := Den + Get_Flat (Scr, S);
-                        end loop;
                         for J in 1 .. HD loop
-                           declare Acc : Float := 0.0; begin
-                              for S in Lo .. T loop
-                                 Acc := Acc + (Get_Flat (Scr, S) / Den)
-                                          * Get_Flat (Vs (S), KV * HD + J);
-                              end loop;
-                              Set_Flat (Ctx_O, Hh * HD + J, Acc);
-                           end;
+                           Set_Flat (K, Hh * HD + J, Get_Flat (Kn, J));
+                           Set_Flat (V, Hh * HD + J, Get_Flat (Vn, J));
                         end loop;
                      end;
                   end loop;
-                  Attn (T) := LLM_Weight.MatVec (B.W_O, Ctx_O);
-                  if Lr = 1 and then T = Seq then D3 ("rawattn-0", Attn (T)); end if;
+                  Cache (Lr).K (Pos + 1) := K;
+                  Cache (Lr).V (Pos + 1) := V;
                end;
-            end loop;
+            end if;
 
-            --  Sandwich norms, FFN, and the per-layer-embedding injection.
-            for T in 1 .. Seq loop
+            --  Causal (+ sliding-window) attention over cached positions; 1.0.
+            declare
+               KC    : Tensor_Array_Ptr renames Cache (Src).K;
+               VC    : Tensor_Array_Ptr renames Cache (Src).V;
+               Lo    : constant Integer := Integer'Max (0, Pos - Win + 1);
+               Ctx_O : Tensor := New_Tensor ([1, NH * HD]);
+            begin
+               for Hh in 0 .. NH - 1 loop
+                  declare
+                     KV  : constant Integer := Hh / (NH / NKV);
+                     Scr : Tensor := New_Tensor ([1, Pos + 1]);
+                     Mx  : Float := Float'First;
+                     Den : Float := 0.0;
+                  begin
+                     for S in Lo .. Pos loop
+                        declare Dp : Float := 0.0; begin
+                           for J in 1 .. HD loop
+                              Dp := Dp + Get_Flat (Q, Hh * HD + J)
+                                       * Get_Flat (KC (S + 1), KV * HD + J);
+                           end loop;
+                           Set_Flat (Scr, S + 1, Dp * AScale);
+                           Mx := Float'Max (Mx, Dp * AScale);
+                        end;
+                     end loop;
+                     for S in Lo .. Pos loop
+                        Set_Flat (Scr, S + 1, Exp (Get_Flat (Scr, S + 1) - Mx));
+                        Den := Den + Get_Flat (Scr, S + 1);
+                     end loop;
+                     for J in 1 .. HD loop
+                        declare Acc : Float := 0.0; begin
+                           for S in Lo .. Pos loop
+                              Acc := Acc + (Get_Flat (Scr, S + 1) / Den)
+                                       * Get_Flat (VC (S + 1), KV * HD + J);
+                           end loop;
+                           Set_Flat (Ctx_O, Hh * HD + J, Acc);
+                        end;
+                     end loop;
+                  end;
+               end loop;
+
+               --  Post-attn norm + residual, GeGLU FFN with sandwich norms,
+               --  per-layer-embedding injection, and the layer output scale.
                declare
-                  Attn_Out : Tensor := GN (Attn (T), B.Post_Attn_Norm);
+                  Attn_Out : Tensor :=
+                    GN (LLM_Weight.MatVec (B.W_O, Ctx_O), B.Post_Attn_Norm);
                begin
-                  Add_To (Attn_Out, H (T));                      -- attn residual
-                  if Lr = 1 and then T = Seq then D3 ("attn_out-0", Attn_Out); end if;
+                  Add_To (Attn_Out, H);                          -- attn residual
                   declare
                      Xf   : constant Tensor := GN (Attn_Out, B.Ffn_Norm);
                      Gate : constant Tensor := Gelu (LLM_Weight.MatVec (B.W_Gate, Xf));
@@ -379,74 +417,105 @@ package body LLM_Gemma is
                                           B.Post_Ffw_Norm);
                   begin
                      Add_To (Ff, Attn_Out);                      -- pe_in
-                     if Lr = 1 and then T = Seq then D3 ("pe_in-0", Ff); end if;
                      declare
-                        Gp   : constant Tensor :=
-                          Gelu (LLM_Weight.MatVec (B.Inp_Gate, Ff));     -- [PL]
-                        Pg   : Tensor := New_Tensor ([1, PL]);
+                        Gp : constant Tensor :=
+                          Gelu (LLM_Weight.MatVec (B.Inp_Gate, Ff));   -- [PL]
+                        Pg : Tensor := New_Tensor ([1, PL]);
                      begin
                         for I in 1 .. PL loop
                            Set_Flat (Pg, I, Get_Flat (Gp, I)
-                             * Get_Flat (IPL (T), (Lr - 1) * PL + I));
+                             * Get_Flat (IPL, (Lr - 1) * PL + I));
                         end loop;
                         declare
                            Pe : Tensor :=
                              GN (LLM_Weight.MatVec (B.Proj, Pg), B.Post_Norm);
                         begin
-                           if Lr = 1 and then T = Seq then D3 ("ple_out-0", Pe); end if;
-                           Add_To (Pe, Ff);                      -- node_61
+                           Add_To (Pe, Ff);                      -- per-layer resid
                            for I in 1 .. D loop
                               Set_Flat (Pe, I, Get_Flat (Pe, I) * B.Layer_Out_Scale);
                            end loop;
-                           if Lr = 1 and then T = Seq then D3 ("l_out-0", Pe); end if;
-                           H (T) := Pe;
+                           H := Pe;
                         end;
                      end;
                   end;
                end;
-            end loop;
+            end;
          end;
       end loop;
 
-      --  Final norm on the last position, tied output projection.
-      return LLM_Weight.MatVec (M.Tok_Emb, GN (H (Seq), M.Out_Norm));
-   end Forward_Logits;
+      --  Final norm, tied output projection, then the Gemma final logit
+      --  soft-cap:  logits := cap * tanh (logits / cap).
+      declare
+         Logits : Tensor := LLM_Weight.MatVec (M.Tok_Emb, GN (H, M.Out_Norm));
+         Cap    : constant Float := M.Logit_Softcap;
+      begin
+         if Cap > 0.0 then
+            for I in 1 .. Numel (Logits) loop
+               Set_Flat (Logits, I, Cap * Tanh (Get_Flat (Logits, I) / Cap));
+            end loop;
+         end if;
+         return Logits;
+      end;
+   end Forward_Step;
 
    --------------------------------------------------------------------
-   -- Greedy decode (full-sequence recompute — no KV cache yet).
+   -- Decode (sampler-driven) with an incremental K/V cache.
    --------------------------------------------------------------------
 
    function Decode
      (M : Gemma_Model; Prompt : LLM_Tokenizer.Token_Array;
-      Max_New : Integer; Sink : access LLM_Qwen.Token_Sink'Class) return String
+      Max_New : Integer; Sink : access LLM_Qwen.Token_Sink'Class;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
    is
-      Cap   : constant Integer := Integer'Max (1, Prompt'Length + Max_New);
-      Seq   : LLM_Tokenizer.Token_Array (1 .. Cap);
-      Len   : Integer := Prompt'Length;
-      Out_S : Unbounded_String;
+      Cap    : constant Integer := Integer'Max (1, Prompt'Length + Max_New);
+      Cache  : KV_Cache (1 .. M.N_Blocks);
+      Len    : Integer := 0;        -- positions consumed so far (= next Pos)
+      Out_S  : Unbounded_String;
+      Logits : Tensor;
+      Smp    : LLM_Sampler.Sampler := LLM_Sampler.Create (Params);
+      Hist   : LLM_Sampler.History (1 .. Integer'Max (1, Max_New)) :=
+        (others => 0);
+      N_Hist : Natural := 0;
+
+      procedure Free is
+        new Ada.Unchecked_Deallocation (Tensor_Array, Tensor_Array_Ptr);
    begin
-      Seq (1 .. Prompt'Length) := Prompt;
+      --  Allocate cache columns only for layers that own a K/V.
+      for L in 1 .. M.N_Blocks loop
+         if M.Blocks (L).Has_KV then
+            Cache (L).K := new Tensor_Array (1 .. Cap);
+            Cache (L).V := new Tensor_Array (1 .. Cap);
+         end if;
+      end loop;
+
+      --  Prefill the prompt; Logits ends as the distribution for the last token.
+      for I in Prompt'Range loop
+         Logits := Forward_Step (M, Cache, Prompt (I), Len);
+         Len := Len + 1;
+      end loop;
+
       for Step in 1 .. Max_New loop
          declare
-            Logits : constant Tensor := Forward_Logits (M, Seq (1 .. Len));
-            Best   : Integer := 1;
-            Bs     : Float := Float'First;
+            Win : constant Natural :=
+              Integer'Min (N_Hist, Integer'Max (0, Params.Repeat_Last_N));
+            Tid : constant Integer := LLM_Sampler.Next
+              (Smp, Logits, Hist (N_Hist - Win + 1 .. N_Hist));
          begin
-            for I in 1 .. Numel (Logits) loop
-               if Get_Flat (Logits, I) > Bs then Bs := Get_Flat (Logits, I); Best := I; end if;
-            end loop;
-            declare
-               Tid : constant Integer := Best - 1;
-            begin
-               exit when Tid = M.Eos or else Tid = M.EOT;
-               declare Piece : constant String := LLM_Tokenizer.Decode_One (M.Tok, Tid); begin
-                  Append (Out_S, Piece);
-                  if Sink /= null then LLM_Qwen.Emit (Sink.all, Piece); end if;
-               end;
-               exit when Len >= Cap;
-               Len := Len + 1; Seq (Len) := Tid;
+            exit when Tid = M.Eos or else Tid = M.EOT;
+            declare Piece : constant String := LLM_Tokenizer.Decode_One (M.Tok, Tid); begin
+               Append (Out_S, Piece);
+               if Sink /= null then LLM_Qwen.Emit (Sink.all, Piece); end if;
             end;
+            N_Hist := N_Hist + 1; Hist (N_Hist) := Tid;
+            exit when Len >= Cap;
+            Logits := Forward_Step (M, Cache, Tid, Len);
+            Len := Len + 1;
          end;
+      end loop;
+
+      for L in 1 .. M.N_Blocks loop
+         Free (Cache (L).K);
+         Free (Cache (L).V);
       end loop;
       return To_String (Out_S);
    end Decode;
@@ -454,7 +523,8 @@ package body LLM_Gemma is
    function Chat
      (M : Gemma_Model; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
-      Sink : access LLM_Qwen.Token_Sink'Class := null) return String
+      Sink : access LLM_Qwen.Token_Sink'Class := null;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
    is
       use type LLM_Tokenizer.Token_Array;
       LF : constant Character := Character'Val (10);
@@ -464,8 +534,9 @@ package body LLM_Gemma is
          else LLM_Tokenizer.Token_Array'(2 .. 1 => 0));
 
       function Msg_Ids (Msg : LLM_Qwen.Message) return LLM_Tokenizer.Token_Array is
+         --  Gemma's turn template has no system role; fold system into "user".
          Role : constant String :=
-           (if Msg.Role = LLM_Qwen.Role_User then "user" else "model");
+           (if Msg.Role = LLM_Qwen.Role_Assistant then "model" else "user");
       begin
          return One (M.SOT)
            & LLM_Tokenizer.Encode (M.Tok, Role & LF & To_String (Msg.Text))
@@ -481,7 +552,7 @@ package body LLM_Gemma is
       return Decode
         (M, One (M.Bos) & Conv_Ids (Conversation'First)
             & One (M.SOT) & LLM_Tokenizer.Encode (M.Tok, "model" & LF),
-         Max_New_Tokens, Sink);
+         Max_New_Tokens, Sink, Params);
    end Chat;
 
    function Complete

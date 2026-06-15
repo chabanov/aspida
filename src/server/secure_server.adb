@@ -31,6 +31,7 @@ with Encrypting_Sink;
 with Protocol;
 with LLM_Qwen;
 with LLM_Engine;
+with LLM_Sampler;
 
 procedure Secure_Server is
 
@@ -59,6 +60,38 @@ procedure Secure_Server is
       end if;
       return 600.0;
    end Idle_Timeout;
+
+   --  Generation sampling, configured via environment (default = greedy, so
+   --  behaviour is unchanged unless explicitly opted in):
+   --    ASPIDA_TEMP, ASPIDA_TOP_P, ASPIDA_TOP_K,
+   --    ASPIDA_REPEAT_PENALTY, ASPIDA_REPEAT_LAST_N, ASPIDA_SEED.
+   function Sampling_Cfg return LLM_Sampler.Params is
+      P : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      function FEnv (Name : String; D : Float) return Float is
+      begin
+         if Ada.Environment_Variables.Exists (Name) then
+            return Float'Value (Ada.Environment_Variables.Value (Name));
+         end if;
+         return D;
+      exception when others => return D; end FEnv;
+      function IEnv (Name : String; D : Integer) return Integer is
+      begin
+         if Ada.Environment_Variables.Exists (Name) then
+            return Integer'Value (Ada.Environment_Variables.Value (Name));
+         end if;
+         return D;
+      exception when others => return D; end IEnv;
+   begin
+      P.Temperature    := FEnv ("ASPIDA_TEMP", 0.0);
+      P.Top_P          := FEnv ("ASPIDA_TOP_P", 1.0);
+      P.Top_K          := IEnv ("ASPIDA_TOP_K", 0);
+      P.Repeat_Penalty := FEnv ("ASPIDA_REPEAT_PENALTY", 1.0);
+      P.Repeat_Last_N  := IEnv ("ASPIDA_REPEAT_LAST_N", 64);
+      P.Seed           := Long_Long_Integer (IEnv ("ASPIDA_SEED", 0));
+      return P;
+   end Sampling_Cfg;
+
+   Sampler_Cfg : constant LLM_Sampler.Params := Sampling_Cfg;
 
    function Hex (B : Byte_Array) return String is
       Digs : constant String := "0123456789abcdef";
@@ -292,7 +325,8 @@ procedure Secure_Server is
                --  Only one generation runs at a time across all clients.
                Infer_Lock.Acquire; Locked := True;
                R_Val := To_Unbounded_String
-                 (LLM_Engine.Chat (Model, Conv, Max_Reply_Tokens, Sink'Access));
+                 (LLM_Engine.Chat
+                    (Model, Conv, Max_Reply_Tokens, Sink'Access, Sampler_Cfg));
                Infer_Lock.Release; Locked := False;
 
                Secure_Channel.Send_Message (Ch, ST'Access, [0 => Protocol.Tag_Done]);

@@ -21,6 +21,8 @@ package LLM_RoPE is
       Freq_Base  : Float;   -- 1e7 for Qwen 3.5
       Max_Pos    : Integer; -- max context (262144)
       Sections   : Tensor;  -- [1, 4] = [11, 11, 10, 0] (set 0 for unused)
+      Use_FF     : Boolean := False;  -- divide theta by per-freq factors?
+      Freq_Factors : Tensor;          -- [1, Dim/2] proportional-RoPE divisors
    end record;
 
    -- Create RoPE params. Defaults are the Qwen 3.5 values; the loader passes
@@ -29,6 +31,10 @@ package LLM_RoPE is
      (Dim       : Integer := 64;
       Freq_Base : Float   := 10_000_000.0;
       Max_Pos   : Integer := 262_144) return RoPE_Params;
+
+   -- Enable proportional RoPE: theta_i := theta_i / FF(i)  (Gemma full-attn
+   -- layers use this with rope_freqs.weight). FF must hold Dim/2 values.
+   procedure Set_Freq_Factors (P : in out RoPE_Params; FF : Tensor);
 
    -- Apply rotary embedding to input tensor
    -- X: query or key tensor [1, head_dim] (single head, single token)

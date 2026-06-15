@@ -16,6 +16,7 @@
 ---------------------------------------------------------------------
 
 with LLM_Qwen;
+with LLM_Sampler;
 
 package LLM_Gemma is
 
@@ -30,7 +31,8 @@ package LLM_Gemma is
    function Chat
      (M : Gemma_Model; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
-      Sink : access LLM_Qwen.Token_Sink'Class := null) return String;
+      Sink : access LLM_Qwen.Token_Sink'Class := null;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String;
 
    --  Raw greedy completion (BOS + prompt, no turn template) — for validation.
    function Complete
