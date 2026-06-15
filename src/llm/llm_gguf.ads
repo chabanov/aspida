@@ -46,7 +46,8 @@ package LLM_GGUF is
       GGML_TYPE_Q4_K,     -- 12
       GGML_TYPE_Q5_K,     -- 13  ← Qwen 3.5 uses this
       GGML_TYPE_Q6_K,     -- 14
-      GGML_TYPE_Q8_K);    -- 15
+      GGML_TYPE_Q8_K,     -- 15
+      GGML_TYPE_BF16);    -- 30 (brain float; Gemma per-layer projection)
 
    type Dim_Array is array (1 .. 4) of U64;
 

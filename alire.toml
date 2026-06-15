@@ -6,8 +6,8 @@ description = "ADA/SPARK monorepo: HTTP client generator (WIP) + native Qwen GGU
 version = "0.1.0-dev"
 authors = ["Aspida contributors"]
 licenses = "MIT"
-maintainers = ["aspida@example.com"]
-website = "https://github.com/aspida/aspida"
+maintainers = ["aspida@snaga.ai"]
+website = "https://github.com/snaga.ai/aspida"
 
 [[depends-on]]
 gnat = ">=12"

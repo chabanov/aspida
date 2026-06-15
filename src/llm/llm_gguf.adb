@@ -203,6 +203,7 @@ package body LLM_GGUF is
          when 13     => return GGML_TYPE_Q5_K;
          when 14     => return GGML_TYPE_Q6_K;
          when 15     => return GGML_TYPE_Q8_K;
+         when 30     => return GGML_TYPE_BF16;
          when others => return GGML_TYPE_F32;  -- legacy/IQ types: unsupported
       end case;
    end To_GGML_Type;
@@ -459,6 +460,7 @@ package body LLM_GGUF is
       case Info.Kind is
          when GGML_TYPE_F32 => return N_Elements * 4;
          when GGML_TYPE_F16 => return N_Elements * 2;
+         when GGML_TYPE_BF16 => return N_Elements * 2;
          when GGML_TYPE_Q5_0 => return ((N_Elements + 31) / 32) * 64;
          when GGML_TYPE_Q5_1 => return ((N_Elements + 31) / 32) * 64;
          --  K-quant super-block sizes (bytes per 256 elements), per llama.cpp:

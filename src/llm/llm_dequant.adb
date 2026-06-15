@@ -201,85 +201,79 @@ package body LLM_Dequant is
    --------------------------------------------------------------------
    -- Q4_K dequantization
    --
-   -- Super-block of 256 elements (Q4_K_M variant):
-   --   - 2 bytes: FP16 d (global scale)
-   --   - 2 bytes: FP16 dmin (global min scale)
-   --   - 24 bytes: 12 × FP16 scales (6 sub-blocks of 32 el, each has scale + min)
-   --   - 128 bytes: qs (packed 4-bit, 2 values per byte)
-   --   - 16 bytes: qh (high 2 bits, 1 byte per 32 el)
-   -- Total: 2+2+24+128+16 = 172 bytes / 256 el
+   -- Super-block of 256 elements (llama.cpp block_q4_K, 144 bytes):
+   --   - 2 bytes:  FP16 d    (super-block scale for the 6-bit scales)
+   --   - 2 bytes:  FP16 dmin (super-block scale for the 6-bit mins)
+   --   - 12 bytes: scales[12] — eight 6-bit scales + eight 6-bit mins, packed
+   --   - 128 bytes: qs (256 × 4-bit quants, low then high nibble of each byte)
    --
-   -- Sub-blocks of 32: 8 groups within super-block
-   -- scales[2*i]=sub_scale, scales[2*i-1]=sub_min for i=1..6
+   -- 256 elements are emitted in 4 groups of 64: within each group the low
+   -- nibbles of qs[0..31] use (d1,m1), the high nibbles use (d2,m2), where
+   -- (sc,m) come from get_scale_min_k4.  Value = d*sc*q - dmin*m  (min subtracted).
    --
-   -- Reference: llama.cpp, dequantize_row_q4_K
+   -- Reference: llama.cpp, dequantize_row_q4_K / get_scale_min_k4.
    --------------------------------------------------------------------
 
    procedure Dequant_Q4_K (X : String; Q : out Tensor; N : Natural) is
       Blocks : constant Natural := N / 256;
       Pos    : Natural := X'First;
       Q_Pos  : Natural := 1;
+
+      function U8 (P : Natural) return Byte is (Byte (Character'Pos (X (P))));
    begin
       for B in 1 .. Blocks loop
          declare
-            D     : constant Float := F16_To_F32 (
-              Byte (Character'Pos (X (Pos))),
-              Byte (Character'Pos (X (Pos + 1))));
-            DMin  : constant Float := F16_To_F32 (
-              Byte (Character'Pos (X (Pos + 2))),
-              Byte (Character'Pos (X (Pos + 3))));
-            Scales : array (1 .. 12) of Float;
-            QS     : array (1 .. 128) of Byte;
-            QH     : array (1 .. 16) of Byte;
+            D    : constant Float := F16_To_F32 (U8 (Pos),     U8 (Pos + 1));
+            DMin : constant Float := F16_To_F32 (U8 (Pos + 2), U8 (Pos + 3));
+            Sc   : array (0 .. 11) of Byte;          -- the 12 packed scale bytes
+            QS_Base : constant Natural := Pos + 16;  -- start of qs (128 bytes)
+
+            --  Extract the J-th (0..7) 6-bit scale (Dd) and min (Mm).
+            procedure Get_SM (J : Natural; Dd, Mm : out Byte) is
+            begin
+               if J < 4 then
+                  Dd := Sc (J)     and 63;
+                  Mm := Sc (J + 4) and 63;
+               else
+                  Dd := (Sc (J + 4) and 16#0F#)
+                          or Shift_Left (Shift_Right (Sc (J - 4), 6), 4);
+                  Mm := Shift_Right (Sc (J + 4), 4)
+                          or Shift_Left (Shift_Right (Sc (J), 6), 4);
+               end if;
+            end Get_SM;
+
+            Is_Idx : Natural := 0;
          begin
-            Pos := Pos + 4;
+            for I in 0 .. 11 loop Sc (I) := U8 (Pos + 4 + I); end loop;
 
-            -- 12 × FP16 sub-block scales+mins
-            for I in 1 .. 12 loop
-               Scales (I) := F16_To_F32 (
-                 Byte (Character'Pos (X (Pos))),
-                 Byte (Character'Pos (X (Pos + 1))));
-               Pos := Pos + 2;
-            end loop;
-
-            -- qs: 128 bytes (256 × 4 bit / 8)
-            for I in 1 .. 128 loop
-               QS (I) := Byte (Character'Pos (X (Pos + I - 1)));
-            end loop;
-            Pos := Pos + 128;
-
-            -- qh: 16 bytes (additional 2 bits, 1 byte per 16 el = nibble pair)
-            for I in 1 .. 16 loop
-               QH (I) := Byte (Character'Pos (X (Pos + I - 1)));
-            end loop;
-            Pos := Pos + 16;
-
-            -- Dequant: 256 elements, grouped into sub-blocks of 32
-            for SB in 1 .. 8 loop
+            for G in 0 .. 3 loop                     -- the 4 groups of 64 elems
                declare
-                  Sub_Scale : constant Float := D * Scales (2 * ((SB + 2) / 4) * 4 + 1 - (SB mod 4) * 2);
-                  Sub_Min   : constant Float := DMin * Scales (2 * ((SB + 2) / 4) * 4 - (SB mod 4) * 2);
+                  Sc1, M1b, Sc2, M2b : Byte;
+                  QOff : constant Natural := QS_Base + G * 32;
                begin
-                  for I in 1 .. 32 loop
-                     declare
-                        El_Idx    : constant Natural := (SB - 1) * 32 + I;
-                        Nibble_Idx : constant Natural := (El_Idx - 1) / 2 + 1;
-                        Low_Nibble : constant Integer := Integer (QS (Nibble_Idx) and 15);
-                        High_Nibble_Hi : constant Integer := Integer (Shift_Right (QH ((SB - 1) * 2 + 1), 4));
-                        High_Nibble_Lo : constant Integer := Integer (Shift_Right (QH ((SB - 1) * 2 + 2), 4));
-                        QVal : Integer;
-                     begin
-                        if I <= 16 then
-                           QVal := Low_Nibble + High_Nibble_Hi * 16;
-                        else
-                           QVal := Low_Nibble + High_Nibble_Lo * 16;
-                        end if;
-                        Set_Flat (Q, Q_Pos, Sub_Scale * Float (QVal) + Sub_Min);
+                  Get_SM (Is_Idx,     Sc1, M1b);
+                  Get_SM (Is_Idx + 1, Sc2, M2b);
+                  declare
+                     D1 : constant Float := D * Float (Integer (Sc1));
+                     M1 : constant Float := DMin * Float (Integer (M1b));
+                     D2 : constant Float := D * Float (Integer (Sc2));
+                     M2 : constant Float := DMin * Float (Integer (M2b));
+                  begin
+                     for L in 0 .. 31 loop          -- low nibbles
+                        Set_Flat (Q, Q_Pos,
+                          D1 * Float (Integer (U8 (QOff + L) and 16#0F#)) - M1);
                         Q_Pos := Q_Pos + 1;
-                     end;
-                  end loop;
+                     end loop;
+                     for L in 0 .. 31 loop          -- high nibbles
+                        Set_Flat (Q, Q_Pos,
+                          D2 * Float (Integer (Shift_Right (U8 (QOff + L), 4))) - M2);
+                        Q_Pos := Q_Pos + 1;
+                     end loop;
+                  end;
+                  Is_Idx := Is_Idx + 2;
                end;
             end loop;
+            Pos := Pos + 144;
          end;
       end loop;
    end Dequant_Q4_K;
@@ -477,6 +471,24 @@ package body LLM_Dequant is
                     Byte (Character'Pos (Raw (Pos))),
                     Byte (Character'Pos (Raw (Pos + 1))));
                begin
+                  Set_Flat (Result, I, F);
+               end;
+            end loop;
+
+         when LLM_GGUF.GGML_TYPE_BF16 =>
+            --  BF16 is the high 16 bits of an F32: place the two BF16 bytes in
+            --  the high half of a 4-byte F32 (low half zero), reinterpret.
+            for I in 1 .. N loop
+               declare
+                  Pos : constant Natural := Raw'First + (I - 1) * 2;
+                  Bytes : String (1 .. 4);
+                  F     : Float;
+                  for F'Address use Bytes'Address;
+               begin
+                  Bytes (1) := Character'Val (0);
+                  Bytes (2) := Character'Val (0);
+                  Bytes (3) := Raw (Pos);
+                  Bytes (4) := Raw (Pos + 1);
                   Set_Flat (Result, I, F);
                end;
             end loop;

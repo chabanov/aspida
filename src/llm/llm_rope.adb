@@ -23,8 +23,16 @@ package body LLM_RoPE is
       Set_Flat (S, 3, 10.0);  -- section 2: dims 22-31
       Set_Flat (S, 4, 0.0);   -- section 3: unused
       P.Sections := S;
+      P.Use_FF := False;
+      P.Freq_Factors := New_Tensor ([1, 1]);  -- sentinel (unused)
       return P;
    end Create_Qwen_RoPE;
+
+   procedure Set_Freq_Factors (P : in out RoPE_Params; FF : Tensor) is
+   begin
+      P.Freq_Factors := FF;
+      P.Use_FF := True;
+   end Set_Freq_Factors;
 
    function Apply (P : RoPE_Params; X : Tensor; Pos : Integer) return Tensor is
       Half_Dim : constant Integer := P.Dim / 2;  -- 32 for Qwen
@@ -41,6 +49,11 @@ package body LLM_RoPE is
       --    out[i+d/2]      = x[i+d/2]*cos + x[i]*sin
       for I in 0 .. Half_Dim - 1 loop
          Theta := Float (Pos) / (P.Freq_Base ** (Float (2 * I) / Float (P.Dim)));
+         --  Gemma full-attention layers scale wavelengths by rope_freqs
+         --  (proportional / NTK RoPE): theta_i := theta_i / freq_factor_i.
+         if P.Use_FF then
+            Theta := Theta / Get_Flat (P.Freq_Factors, I + 1);
+         end if;
          Cos_Val := Cos (Theta);
          Sin_Val := Sin (Theta);
 

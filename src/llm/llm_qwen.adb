@@ -375,12 +375,17 @@ package body LLM_Qwen is
       Prompt_Ids     : LLM_Tokenizer.Token_Array;
       Max_New_Tokens : Integer;
       Stop1, Stop2   : Integer;
-      Sink           : access Token_Sink'Class) return String
+      Sink           : access Token_Sink'Class;
+      Params         : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
    is
       Dim     : constant Integer := M.Model_Dim;
       Cap     : constant Integer :=
         Integer'Max (1, Prompt_Ids'Length + Max_New_Tokens);
       Out_Buf : Unbounded_String;
+      Smp     : LLM_Sampler.Sampler := LLM_Sampler.Create (Params);
+      Hist    : LLM_Sampler.History (1 .. Integer'Max (1, Max_New_Tokens)) :=
+        (others => 0);
+      N_Hist  : Natural := 0;
 
       --  Per-layer decode state (KV cache for full-attn, recurrent state +
       --  conv window for delta-net), threaded across tokens. One forward
@@ -403,19 +408,6 @@ package body LLM_Qwen is
          end;
       end Decode;
 
-      function Argmax (Logits : Tensor) return Integer is
-         Best_Row : Integer := 1;
-         Best_S   : Float := Float'First;
-      begin
-         for I in 1 .. Numel (Logits) loop
-            if Get_Flat (Logits, I) > Best_S then
-               Best_S := Get_Flat (Logits, I);
-               Best_Row := I;
-            end if;
-         end loop;
-         return Best_Row;
-      end Argmax;
-
       Last_Logits : Tensor;
    begin
       for I in 1 .. M.N_Blocks loop
@@ -437,8 +429,11 @@ package body LLM_Qwen is
 
       for Step in 1 .. Max_New_Tokens loop
          declare
-            Best_Row : constant Integer := Argmax (Last_Logits);
-            Tid      : constant Integer := Best_Row - 1;   -- 0-based token id
+            Win : constant Natural :=
+              Integer'Min (N_Hist, Integer'Max (0, Params.Repeat_Last_N));
+            Tid : constant Integer := LLM_Sampler.Next
+              (Smp, Last_Logits, Hist (N_Hist - Win + 1 .. N_Hist));
+            Best_Row : constant Integer := Tid + 1;   -- 1-based embedding row
          begin
             exit when Best_Row < 1 or else Best_Row > M.Vocab_Sz;
             exit when Tid = Stop1 or else Tid = Stop2;     -- stop tokens
@@ -450,6 +445,7 @@ package body LLM_Qwen is
                   Sink.Emit (Piece);
                end if;
             end;
+            N_Hist := N_Hist + 1; Hist (N_Hist) := Tid;
             exit when Step = Max_New_Tokens;
             Last_Logits := Decode (Best_Row);
          end;
@@ -508,7 +504,8 @@ package body LLM_Qwen is
    end Marker;
 
    function Role_Str (R : Role_Kind) return String is
-     (case R is when Role_User => "user", when Role_Assistant => "assistant");
+     (case R is when Role_System => "system", when Role_User => "user",
+         when Role_Assistant => "assistant");
 
    --  Token ids for one message: <|im_start|>{role}\n{text}<|im_end|>\n
    function Msg_Ids (M : Qwen_Model; Msg : Message)
@@ -542,7 +539,8 @@ package body LLM_Qwen is
    function Chat
      (M : Qwen_Model; Conversation : Message_Array;
       Max_New_Tokens : Integer := 256;
-      Sink : access Token_Sink'Class := null) return String
+      Sink : access Token_Sink'Class := null;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
    is
       LF : constant String := [1 => ASCII.LF];
       use type LLM_Tokenizer.Token_Array;
@@ -566,7 +564,7 @@ package body LLM_Qwen is
            & Marker (M, "</think>")
            & LLM_Tokenizer.Encode (M.Tok, LF & LF);
          Raw : constant String :=
-           Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id, Sink);
+           Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id, Sink, Params);
       begin
          return Strip_Think (Raw);
       end;
