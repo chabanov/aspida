@@ -60,18 +60,29 @@ package Secure_Channel is
    --  Wipe the session keys when the session ends (defence in depth).
    procedure Close (Ch : in out Channel);
 
+   --  Non-secret session metadata, for showing the user what protects the
+   --  channel. Cipher_Suite is the static algorithm list; Channel_Binding is
+   --  a 32-byte hash of the handshake transcript (public ephemeral keys) that
+   --  both endpoints derive identically — a fingerprint to display/compare;
+   --  Records_Sent/Received are the per-direction record (nonce) counters.
+   function Cipher_Suite return String;
+   function Channel_Binding (Ch : Channel) return Crypto.Byte_Array;
+   function Records_Sent (Ch : Channel) return Crypto.U64;
+   function Records_Received (Ch : Channel) return Crypto.U64;
+
 private
 
    subtype Key32 is Crypto.Byte_Array (0 .. 31);
 
    --  The transport is passed per call, not stored, to avoid anonymous-access
-   --  accessibility constraints; the Channel holds only the session keys and
-   --  per-direction nonce counters.
+   --  accessibility constraints; the Channel holds only the session keys,
+   --  per-direction nonce counters, and the (non-secret) channel binding.
    type Channel is limited record
       K_Send : Key32;
       K_Recv : Key32;
       N_Send : Crypto.U64 := 0;
       N_Recv : Crypto.U64 := 0;
+      Bind   : Key32 := [others => 0];
       Ready  : Boolean := False;
    end record;
 

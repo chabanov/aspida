@@ -14,15 +14,16 @@ export PATH
 SDKROOT     := $(shell xcrun --show-sdk-path 2>/dev/null)
 export SDKROOT
 
-# ── LLM model defaults (tiny for quick iteration) ───────────────────
-DIM         ?= 64
-LAYERS      ?= 2
+# ── Encrypted chat server ───────────────────────────────────────────
+PORT        ?= 8765
+HOST        ?= 127.0.0.1
+SESSION     ?= new
+PUBKEY_FILE := server_pub.hex
 
 # ── Project files ────────────────────────────────────────────────────
 MAIN_GPR    := aspida_cli.gpr
-LLM_GPR     := llm.gpr
+SECURE_GPR  := server.gpr
 TEST_GPR    := tests/aspida_tests.gpr
-LLM_GPR     := llm.gpr
 SRC_DIR     := src
 OBJ_DIR     := obj
 BIN         := $(OBJ_DIR)/main
@@ -50,13 +51,21 @@ all: build
 build: ## Build aspida CLI (debug)
 	$(GPRBUILD) -P $(MAIN_GPR) $(GPR_FLAGS)
 
-.PHONY: llm
-llm: ## Build LLM chat binary
-	$(GPRBUILD) -P $(LLM_GPR) $(GPR_FLAGS)
+.PHONY: server
+server: ## Build the encrypted chat server + client (the ONLY chat path — no plaintext mode)
+	$(GPRBUILD) -P $(SECURE_GPR) $(GPR_FLAGS)
+
+.PHONY: serve
+serve: server ## Build + launch the encrypted server (set ASPIDA_STORE_PASSWORD to persist history)
+	./$(OBJ_DIR)/secure_server $(PORT)
 
 .PHONY: chat
-chat: llm ## Build + launch chat REPL
-	./$(OBJ_DIR)/llm_main $(DIM) $(LAYERS)
+chat: server ## Open an interactive encrypted chat (needs a running `make serve`; SESSION=<id> to resume)
+	@test -f $(PUBKEY_FILE) || { \
+		echo "No $(PUBKEY_FILE) found — start the server first in another terminal:"; \
+		echo "    make serve"; exit 1; }
+	@echo "connecting to $(HOST):$(PORT) — pinning $$(cat $(PUBKEY_FILE))"
+	./$(OBJ_DIR)/secure_client $(HOST) $(PORT) $$(cat $(PUBKEY_FILE)) $(SESSION)
 
 .PHONY: release
 release: ## Build aspida CLI (optimized)
@@ -87,18 +96,31 @@ test-rmsnorm: ## Run RMSNorm unit test
 	./obj/test_rmsnorm
 
 .PHONY: test-llm
-test-llm: ## Build + run all LLM unit tests (rmsnorm, attention, moe, tokenizer, ssm)
+test-llm: ## Build + run all LLM unit tests
 	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
 	./obj/test_rmsnorm
-	./obj/test_attention
 	./obj/test_moe
 	./obj/test_tokenizer
-	./obj/test_ssm
 	./obj/test_tensor
 	./obj/test_deltanet
 	./obj/test_deltanet_blk
 	./obj/test_fullattn
 	./obj/test_block
+	./obj/test_pool
+
+.PHONY: test-crypto
+test-crypto: ## Build + run the crypto / E2EE test vectors (no model needed)
+	$(GPRBUILD) -P crypto_tests.gpr $(GPR_FLAGS)
+	$(GPRBUILD) -P secure_tests.gpr $(GPR_FLAGS)
+	./obj/test_crypto
+	./obj/test_hash
+	./obj/test_random
+	./obj/test_x25519
+	./obj/test_channel
+	./obj/test_pbkdf2
+	./obj/test_atrest
+	./obj/test_socket
+	./obj/test_session
 
 .PHONY: test-tokenizer-real
 test-tokenizer-real: ## Validate the tokenizer against the real GGUF vocab (needs model)
@@ -126,7 +148,8 @@ prove-report: ## Run SPARK + generate HTML report
 clean: ## Remove build artifacts
 	$(GPRCLEAN) -P $(MAIN_GPR) $(GPR_FLAGS) || true
 	$(GPRCLEAN) -P $(TEST_GPR) $(GPR_FLAGS) || true
-	$(GPRCLEAN) -P $(LLM_GPR) $(GPR_FLAGS) || true
+	$(GPRCLEAN) -P $(SECURE_GPR) $(GPR_FLAGS) || true
+	$(GPRCLEAN) -P tests/llm_tests.gpr $(GPR_FLAGS) || true
 	rm -rf $(OBJ_DIR)/tests
 
 .PHONY: distclean

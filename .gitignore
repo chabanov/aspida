@@ -1,3 +1,9 @@
+# Keys (never commit)
+*.key
+*.key.bin
+*_key.bin
+*_pub.hex
+
 # Build artifacts
 obj/
 lib/
@@ -5,6 +11,8 @@ lib/
 *.ali
 *.stdout
 *.stderr
+.env
+/sessions/
 
 *.log
 temp.log
