@@ -16,5 +16,6 @@ package Protocol is
    Tag_Token   : constant Crypto.U8 := Character'Pos ('t');  -- S->C: a token piece
    Tag_Prefill : constant Crypto.U8 := Character'Pos ('.');  -- S->C: prefill tick
    Tag_Done    : constant Crypto.U8 := Character'Pos ('!');  -- S->C: end of reply
+   Tag_Error   : constant Crypto.U8 := Character'Pos ('e');  -- S->C: error + reason
 
 end Protocol;

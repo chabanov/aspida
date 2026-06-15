@@ -157,6 +157,7 @@ package body Secure_Channel is
             Ch.K_Send := K_S2C; Ch.K_Recv := K_C2S;
             Ch.N_Send := 1;     -- nonce 0 consumed by the confirmation
             Ch.N_Recv := 0;
+            Ch.Bind := Byte_Array (Transcript);
             Ch.Ready := True;
             Wipe (F_Priv); Wipe (K_C2S); Wipe (K_S2C);
          end;
@@ -213,6 +214,7 @@ package body Secure_Channel is
                Ch.K_Send := K_C2S; Ch.K_Recv := K_S2C;
                Ch.N_Send := 0;
                Ch.N_Recv := 1;     -- nonce 0 consumed by the confirmation
+               Ch.Bind := Byte_Array (Transcript);
                Ch.Ready := True;
                Wipe (E_Priv); Wipe (K_C2S); Wipe (K_S2C);
             end;
@@ -272,5 +274,14 @@ package body Secure_Channel is
       Ch.N_Recv := 0;
       Ch.Ready := False;
    end Close;
+
+   function Cipher_Suite return String is
+     ("X25519 + ChaCha20-Poly1305 + HKDF-SHA256");
+
+   function Channel_Binding (Ch : Channel) return Byte_Array is (Ch.Bind);
+
+   function Records_Sent (Ch : Channel) return U64 is (Ch.N_Send);
+
+   function Records_Received (Ch : Channel) return U64 is (Ch.N_Recv);
 
 end Secure_Channel;

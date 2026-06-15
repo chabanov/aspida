@@ -1,12 +1,13 @@
 -- tests/llm_tests.gpr — LLM Unit Tests
 --
--- Build: gprbuild -P tests/llm_tests.gpr -XSDKROOT=$(xcrun --show-sdk-path) -largs -XSDKROOT=$(xcrun --show-sdk-path)
-
-with "../llm.gpr";
+-- Self-contained: pulls the engine sources directly from ../src and ../src/llm
+-- (there is no separate llm.gpr — the only chat path is the encrypted server).
+--
+-- Build: gprbuild -P tests/llm_tests.gpr -XSDKROOT=$(xcrun --show-sdk-path)
 
 project LLM_Tests is
 
-   for Source_Dirs use (".");
+   for Source_Dirs use (".", "../src", "../src/llm");
    for Object_Dir use "../obj/tests";
    for Exec_Dir use "../obj";
    for Main use ("test_rmsnorm.adb", "test_moe.adb",
@@ -16,15 +17,17 @@ project LLM_Tests is
                  "test_pool.adb");
 
    package Compiler is
-      for Default_Switches ("Ada") use LLM.Compiler'Default_Switches ("Ada");
+      for Default_Switches ("Ada") use ("-gnatwn", "-gnatX", "-O3", "-march=native");
    end Compiler;
 
    package Linker is
-      for Default_Switches ("Ada") use LLM.Linker'Default_Switches ("Ada");
+      for Default_Switches ("Ada") use
+        ("-L" & external ("SDKROOT", "") & "/usr/lib",
+         "-Wl,-syslibroot," & external ("SDKROOT", ""));
    end Linker;
 
    package Binder is
-      for Default_Switches ("Ada") use LLM.Binder'Default_Switches ("Ada");
+      for Default_Switches ("Ada") use ("-E");
    end Binder;
 
 end LLM_Tests;

@@ -1,11 +1,12 @@
 ---------------------------------------------------------------------
--- Secure_Server — encrypted chat server.
+-- Secure_Server — concurrent encrypted chat server.
 --
--- Loads the Qwen model once, holds a long-term X25519 keypair (persisted
--- in server_key.bin), and prints its public key (pin this on the client).
--- For each TCP connection it runs the responder handshake, then loops:
--- decrypt a Prompt record -> LLM_Qwen.Chat streaming each token back as an
--- encrypted Token record (via Encrypting_Sink) -> a Done record.
+-- Loads the Qwen model once (shared, read-only) and serves many clients
+-- at the same time: a pool of handler tasks each take a connection from a
+-- bounded queue, run the handshake + session, and chat. Inference itself
+-- is serialized by Infer_Lock (one model + a thread pool that already uses
+-- every core, so concurrent generations would only contend) — but I/O,
+-- handshakes and persistence run in parallel across connections.
 --
 -- Usage:  QWEN_MODEL_PATH=... ./obj/secure_server [port]
 ---------------------------------------------------------------------
@@ -24,8 +25,8 @@ with Crypto.X25519;
 with Crypto.Random;
 with Crypto.Memory;
 with Secure_Channel;
-with Session_Store;
 with Socket_Transport;
+with Session_Store;
 with Encrypting_Sink;
 with Protocol;
 with LLM_Qwen;
@@ -34,7 +35,9 @@ procedure Secure_Server is
 
    package SIO renames Ada.Streams.Stream_IO;
 
-   Key_File : constant String := "server_key.bin";
+   Key_File     : constant String := "server_key.bin";
+   Max_Clients  : constant := 8;     -- concurrent handler tasks
+   Max_Queue    : constant := 64;    -- pending-connection backlog
 
    function Hex (B : Byte_Array) return String is
       Digs : constant String := "0123456789abcdef";
@@ -49,20 +52,22 @@ procedure Secure_Server is
       return R;
    end Hex;
 
-   procedure Load_Or_Create (Secret : out Crypto.X25519.Key_256) is
+   function Load_Or_Create_Key return Crypto.X25519.Key_256 is
       F : SIO.File_Type;
+      K : Crypto.X25519.Key_256;
    begin
       if Ada.Directories.Exists (Key_File) then
          SIO.Open (F, SIO.In_File, Key_File);
-         Crypto.X25519.Key_256'Read (SIO.Stream (F), Secret);
+         Crypto.X25519.Key_256'Read (SIO.Stream (F), K);
          SIO.Close (F);
       else
-         Crypto.Random.Fill (Secret);
+         Crypto.Random.Fill (K);
          SIO.Create (F, SIO.Out_File, Key_File);
-         Crypto.X25519.Key_256'Write (SIO.Stream (F), Secret);
+         Crypto.X25519.Key_256'Write (SIO.Stream (F), K);
          SIO.Close (F);
       end if;
-   end Load_Or_Create;
+      return K;
+   end Load_Or_Create_Key;
 
    function Model_Path return String is
    begin
@@ -74,29 +79,249 @@ procedure Secure_Server is
         & "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf";
    end Model_Path;
 
-   Port     : Port_Type := 8765;
-   Secret   : Crypto.X25519.Key_256;
-   Model    : LLM_Qwen.Qwen_Model;
+   --  Loaded during elaboration, before the handler tasks activate.
+   Model    : constant LLM_Qwen.Qwen_Model := LLM_Qwen.Load (Model_Path);
+   Secret   : constant Crypto.X25519.Key_256 := Load_Or_Create_Key;
    Listener : Socket_Type;
+
+   --  Serializes the actual generation (single model + all-core pool).
+   protected Infer_Lock is
+      entry Acquire;
+      procedure Release;
+   private
+      Held : Boolean := False;
+   end Infer_Lock;
+
+   protected body Infer_Lock is
+      entry Acquire when not Held is
+      begin
+         Held := True;
+      end Acquire;
+      procedure Release is
+      begin
+         Held := False;
+      end Release;
+   end Infer_Lock;
+
+   --  Bounded hand-off of accepted sockets to the handler pool.
+   type Socket_Slots is array (1 .. Max_Queue) of Socket_Type;
+   protected Conn_Queue is
+      entry Put (S : Socket_Type);
+      entry Get (S : out Socket_Type);
+   private
+      Slots : Socket_Slots;
+      Cnt   : Natural := 0;
+      Hd    : Positive := 1;
+      Tl    : Positive := 1;
+   end Conn_Queue;
+
+   protected body Conn_Queue is
+      entry Put (S : Socket_Type) when Cnt < Max_Queue is
+      begin
+         Slots (Tl) := S; Tl := Tl mod Max_Queue + 1; Cnt := Cnt + 1;
+      end Put;
+      entry Get (S : out Socket_Type) when Cnt > 0 is
+      begin
+         S := Slots (Hd); Hd := Hd mod Max_Queue + 1; Cnt := Cnt - 1;
+      end Get;
+   end Conn_Queue;
+
+   --  At most one live connection per session id (the encrypted history file
+   --  and the conversation context must not be raced by two connections).
+   type Id_Array is array (1 .. Max_Clients) of Unbounded_String;
+   protected Active_Sessions is
+      procedure Acquire (Id : String; Ok : out Boolean);
+      procedure Release (Id : String);
+   private
+      Ids : Id_Array;
+      Cnt : Natural := 0;
+   end Active_Sessions;
+
+   protected body Active_Sessions is
+      procedure Acquire (Id : String; Ok : out Boolean) is
+      begin
+         for I in 1 .. Cnt loop
+            if To_String (Ids (I)) = Id then
+               Ok := False; return;            -- already in use
+            end if;
+         end loop;
+         if Cnt < Max_Clients then
+            Cnt := Cnt + 1; Ids (Cnt) := To_Unbounded_String (Id); Ok := True;
+         else
+            Ok := False;                        -- registry full
+         end if;
+      end Acquire;
+      procedure Release (Id : String) is
+      begin
+         for I in 1 .. Cnt loop
+            if To_String (Ids (I)) = Id then
+               Ids (I) := Ids (Cnt); Cnt := Cnt - 1; return;
+            end if;
+         end loop;
+      end Release;
+   end Active_Sessions;
+
+   ------------------------------------------------------------------
+   -- One client connection: handshake -> session -> chat turns.
+   ------------------------------------------------------------------
+   procedure Handle_Connection (Conn : Socket_Type) is
+      ST    : aliased Socket_Transport.Sock_Transport;
+      Ch    : aliased Secure_Channel.Channel;
+      Store : Session_Store.Store;
+      Id_B  : Byte_Array (0 .. 7);
+      Sid   : Unbounded_String;          -- acquired session id (for Release)
+   begin
+      ST.Sock := Conn;
+      Secure_Channel.Server_Handshake (Ch, ST'Access, Secret);
+
+      --  First record selects/creates the session (Tag_Session + id;
+      --  empty id = new). Reply with the assigned id.
+      declare
+         Hello : constant Byte_Array := Secure_Channel.Recv_Message (Ch, ST'Access);
+         Want  : Unbounded_String;
+         Ok    : Boolean;
+      begin
+         if Hello'Length >= 1 and then Hello (Hello'First) = Protocol.Tag_Session then
+            for I in Hello'First + 1 .. Hello'Last loop
+               Append (Want, Character'Val (Integer (Hello (I))));
+            end loop;
+         end if;
+         if Length (Want) = 0 then
+            Crypto.Random.Fill (Id_B);
+            Want := To_Unbounded_String (Hex (Id_B));
+         end if;
+
+         --  Refuse a second live connection to the same session.
+         Active_Sessions.Acquire (To_String (Want), Ok);
+         if not Ok then
+            declare
+               Msg : constant String := "session busy or server full";
+               Err : Byte_Array (0 .. Msg'Length);
+            begin
+               Err (0) := Protocol.Tag_Error;
+               for I in Msg'Range loop
+                  Err (I - Msg'First + 1) := U8 (Character'Pos (Msg (I)));
+               end loop;
+               Secure_Channel.Send_Message (Ch, ST'Access, Err);
+            end;
+            Put_Line ("  [" & To_String (Want) & "] rejected (busy/full)");
+            Secure_Channel.Close (Ch);
+            Close_Socket (Conn);
+            return;
+         end if;
+         Sid := Want;
+
+         Session_Store.Open (Store, To_String (Want));
+         declare
+            Reply : Byte_Array (0 .. Length (Want));
+         begin
+            Reply (0) := Protocol.Tag_Session;
+            for I in 1 .. Length (Want) loop
+               Reply (I) := U8 (Character'Pos (Element (Want, I)));
+            end loop;
+            Secure_Channel.Send_Message (Ch, ST'Access, Reply);
+         end;
+         Put_Line ("  [" & To_String (Want) & "] connected, resumed turns:"
+           & Session_Store.Turn_Count (Store)'Image);
+      end;
+
+      loop
+         declare
+            Req : constant Byte_Array := Secure_Channel.Recv_Message (Ch, ST'Access);
+            Sink : aliased Encrypting_Sink.Enc_Sink :=
+              (LLM_Qwen.Token_Sink with
+                 Ch => Ch'Unchecked_Access, T => ST'Unchecked_Access);
+            Prompt : String (1 .. Integer'Max (0, Req'Length - 1));
+         begin
+            for I in Prompt'Range loop
+               Prompt (I) := Character'Val (Integer (Req (Req'First + I)));
+            end loop;
+            declare
+               N    : constant Natural := Session_Store.Turn_Count (Store);
+               Conv : LLM_Qwen.Message_Array (1 .. 2 * N + 1);
+               Locked : Boolean := False;
+               R_Val  : Unbounded_String;
+            begin
+               for I in 1 .. N loop
+                  Conv (2 * I - 1) := (LLM_Qwen.Role_User,
+                    To_Unbounded_String (Session_Store.User_Of (Store, I)));
+                  Conv (2 * I) := (LLM_Qwen.Role_Assistant,
+                    To_Unbounded_String (Session_Store.Assistant_Of (Store, I)));
+               end loop;
+               Conv (2 * N + 1) :=
+                 (LLM_Qwen.Role_User, To_Unbounded_String (Prompt));
+
+               --  Only one generation runs at a time across all clients.
+               Infer_Lock.Acquire; Locked := True;
+               R_Val := To_Unbounded_String
+                 (LLM_Qwen.Chat (Model, Conv, 256, Sink'Access));
+               Infer_Lock.Release; Locked := False;
+
+               Secure_Channel.Send_Message (Ch, ST'Access, [0 => Protocol.Tag_Done]);
+               Session_Store.Append_Turn (Store, Prompt, To_String (R_Val));
+            exception
+               when others =>
+                  if Locked then Infer_Lock.Release; end if;
+                  raise;
+            end;
+         end;
+      end loop;
+   exception
+      when E : others =>
+         Put_Line ("  connection closed: " & Exception_Message (E));
+         if Length (Sid) > 0 then
+            Active_Sessions.Release (To_String (Sid));
+         end if;
+         Session_Store.Close (Store);
+         Secure_Channel.Close (Ch);
+         begin
+            Close_Socket (Conn);
+         exception
+            when others => null;
+         end;
+   end Handle_Connection;
+
+   task type Handler;
+   task body Handler is
+      Conn : Socket_Type;
+   begin
+      loop
+         Conn_Queue.Get (Conn);
+         Handle_Connection (Conn);     -- has its own exception handling
+      end loop;
+   end Handler;
+
+   Handlers : array (1 .. Max_Clients) of Handler;
+   pragma Unreferenced (Handlers);
+
+   Port : Port_Type := 8765;
 begin
    if Ada.Command_Line.Argument_Count >= 1 then
       Port := Port_Type'Value (Ada.Command_Line.Argument (1));
    end if;
 
-   Load_Or_Create (Secret);
    if not Crypto.Memory.Lock (Secret'Address, Secret'Length) then
       Put_Line ("note: could not mlock the static key (swap not prevented).");
    end if;
    Put_Line ("server public key (pin this on the client):");
    Put_Line ("  " & Hex (Crypto.X25519.Public_Key (Secret)));
-
-   Model := LLM_Qwen.Load (Model_Path);
+   --  Also drop it next to the binary so `make chat` can pin it automatically.
+   declare
+      F : Ada.Text_IO.File_Type;
+   begin
+      Ada.Text_IO.Create (F, Ada.Text_IO.Out_File, "server_pub.hex");
+      Ada.Text_IO.Put_Line (F, Hex (Crypto.X25519.Public_Key (Secret)));
+      Ada.Text_IO.Close (F);
+   exception
+      when others => null;   -- non-fatal: the key is already on screen
+   end;
 
    Create_Socket (Listener);
    Set_Socket_Option (Listener, Socket_Level, (Reuse_Address, True));
    Bind_Socket (Listener, (Family_Inet, Any_Inet_Addr, Port));
    Listen_Socket (Listener);
-   Put_Line ("listening on port" & Port_Type'Image (Port));
+   Put_Line ("listening on port" & Port_Type'Image (Port)
+     & " (up to" & Integer'Image (Max_Clients) & " concurrent clients)");
 
    loop
       declare
@@ -104,102 +329,7 @@ begin
          From : Sock_Addr_Type;
       begin
          Accept_Socket (Listener, Conn, From);
-         declare
-            ST    : aliased Socket_Transport.Sock_Transport;
-            Ch    : aliased Secure_Channel.Channel;
-            Store : Session_Store.Store;
-            Id_B  : Byte_Array (0 .. 7);
-         begin
-            ST.Sock := Conn;
-            Secure_Channel.Server_Handshake (Ch, ST'Access, Secret);
-
-            --  First record selects/creates the session (Tag_Session + id;
-            --  empty id = new). Reply with the assigned id.
-            declare
-               Hello : constant Byte_Array :=
-                 Secure_Channel.Recv_Message (Ch, ST'Access);
-               Want  : Unbounded_String;
-            begin
-               if Hello'Length >= 1 and then Hello (Hello'First) = Protocol.Tag_Session then
-                  for I in Hello'First + 1 .. Hello'Last loop
-                     Append (Want, Character'Val (Integer (Hello (I))));
-                  end loop;
-               end if;
-               if Length (Want) = 0 then
-                  Crypto.Random.Fill (Id_B);
-                  Want := To_Unbounded_String (Hex (Id_B));
-               end if;
-               Session_Store.Open (Store, To_String (Want));
-               declare
-                  Reply : Byte_Array (0 .. Length (Want));
-               begin
-                  Reply (0) := Protocol.Tag_Session;
-                  for I in 1 .. Length (Want) loop
-                     Reply (I) := U8 (Character'Pos (Element (Want, I)));
-                  end loop;
-                  Secure_Channel.Send_Message (Ch, ST'Access, Reply);
-               end;
-               Put_Line ("  session " & To_String (Want)
-                 & (if Session_Store.Enabled then " (encrypted on disk)"
-                    else " (not persisted)")
-                 & ", resumed turns:" & Session_Store.Turn_Count (Store)'Image);
-            end;
-
-            loop
-               declare
-                  Req : constant Byte_Array :=
-                    Secure_Channel.Recv_Message (Ch, ST'Access);
-                  Sink : aliased Encrypting_Sink.Enc_Sink :=
-                    (LLM_Qwen.Token_Sink with
-                       Ch => Ch'Unchecked_Access, T => ST'Unchecked_Access);
-                  Prompt : String (1 .. Integer'Max (0, Req'Length - 1));
-               begin
-                  for I in Prompt'Range loop
-                     Prompt (I) := Character'Val (Integer (Req (Req'First + I)));
-                  end loop;
-                  declare
-                     --  Multi-turn context: prior turns (user+assistant) then
-                     --  the current user message last.
-                     N    : constant Natural := Session_Store.Turn_Count (Store);
-                     Conv : LLM_Qwen.Message_Array (1 .. 2 * N + 1);
-                  begin
-                     for I in 1 .. N loop
-                        Conv (2 * I - 1) :=
-                          (LLM_Qwen.Role_User,
-                           To_Unbounded_String (Session_Store.User_Of (Store, I)));
-                        Conv (2 * I) :=
-                          (LLM_Qwen.Role_Assistant,
-                           To_Unbounded_String (Session_Store.Assistant_Of (Store, I)));
-                     end loop;
-                     Conv (2 * N + 1) :=
-                       (LLM_Qwen.Role_User, To_Unbounded_String (Prompt));
-                     declare
-                        R : constant String :=
-                          LLM_Qwen.Chat (Model, Conv, 256, Sink'Access);
-                     begin
-                        Secure_Channel.Send_Message
-                          (Ch, ST'Access, [0 => Protocol.Tag_Done]);
-                        Session_Store.Append_Turn (Store, Prompt, R);
-                     end;
-                  end;
-                  --  Scrub the decrypted prompt before its memory is reused.
-                  Prompt := [others => ASCII.NUL];
-               end;
-            end loop;
-         exception
-            when others =>
-               Session_Store.Close (Store);  -- drop plaintext history from RAM
-               Secure_Channel.Close (Ch);    -- wipe session keys on disconnect
-               raise;
-         end;
-      exception
-         when E : others =>
-            Put_Line ("  connection closed: " & Exception_Message (E));
-            begin
-               Close_Socket (Conn);
-            exception
-               when others => null;
-            end;
+         Conn_Queue.Put (Conn);        -- a free handler will pick it up
       end;
    end loop;
 end Secure_Server;
