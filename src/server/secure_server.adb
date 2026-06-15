@@ -30,6 +30,7 @@ with Session_Store;
 with Encrypting_Sink;
 with Protocol;
 with LLM_Qwen;
+with LLM_Engine;
 
 procedure Secure_Server is
 
@@ -100,7 +101,7 @@ procedure Secure_Server is
    end Model_Path;
 
    --  Loaded during elaboration, before the handler tasks activate.
-   Model    : constant LLM_Qwen.Qwen_Model := LLM_Qwen.Load (Model_Path);
+   Model    : constant LLM_Engine.Engine := LLM_Engine.Load (Model_Path);
    Secret   : constant Crypto.X25519.Key_256 := Load_Or_Create_Key;
    Listener : Socket_Type;
 
@@ -291,7 +292,7 @@ procedure Secure_Server is
                --  Only one generation runs at a time across all clients.
                Infer_Lock.Acquire; Locked := True;
                R_Val := To_Unbounded_String
-                 (LLM_Qwen.Chat (Model, Conv, Max_Reply_Tokens, Sink'Access));
+                 (LLM_Engine.Chat (Model, Conv, Max_Reply_Tokens, Sink'Access));
                Infer_Lock.Release; Locked := False;
 
                Secure_Channel.Send_Message (Ch, ST'Access, [0 => Protocol.Tag_Done]);

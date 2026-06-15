@@ -33,6 +33,11 @@ package LLM_Weight is
    --  y[out] = W[out,in] . x[in].
    function MatVec (W : Weight; X : LLM_Tensor.Tensor) return LLM_Tensor.Tensor;
 
+   --  Dequantize a single row (0-based) of a [in, out]-shaped weight, i.e. an
+   --  embedding-table lookup without materialising the whole F32 tensor.
+   --  Returns a [1, in] tensor.
+   function Get_Row (W : Weight; Row : Integer) return LLM_Tensor.Tensor;
+
    --  3D expert weight (row-major [n_experts, out_e, in]); matvec one expert.
    function N_Experts (W : Weight) return Integer;
    function Expert_Out (W : Weight) return Integer;   -- per-expert output dim

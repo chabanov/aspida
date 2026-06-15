@@ -27,8 +27,13 @@ package body LLM_Tokenizer is
       Merges     : Str_Int_Maps.Map;   -- "left<NUL>right" -> rank
       Loaded     : Boolean := False;
       Byte_Level : Boolean := False;   -- GPT-2 byte->unicode remap
+      Gemma_Mode : Boolean := False;   -- SentencePiece: U+2581 space, <0xXX> bytes
       Unk_Id     : Integer := -1;      -- tokenizer.ggml.unknown_token_id (-1 = none)
    end record;
+
+   --  U+2581 "lower one eighth block" — SentencePiece's visible space.
+   SP_Space : constant String :=
+     Character'Val (16#E2#) & Character'Val (16#96#) & Character'Val (16#81#);
 
    --------------------------------------------------------------------
    -- GPT-2 byte <-> unicode bijection (computed once at elaboration)
@@ -154,7 +159,13 @@ package body LLM_Tokenizer is
       for I in 1 .. NM loop
          Add_Merge (T, LLM_GGUF.Merge_At (G, I), I);      -- rank = file order
       end loop;
-      T.Byte_Level := LLM_GGUF.Metadata (G, "tokenizer.ggml.model") = "gpt2";
+      declare
+         Model : constant String := LLM_GGUF.Metadata (G, "tokenizer.ggml.model");
+      begin
+         T.Byte_Level := Model = "gpt2";
+         T.Gemma_Mode := Model = "gemma4" or else Model = "gemma"
+                         or else Model = "llama";
+      end;
       --  The model's unknown-token id, used as the fallback for a piece that
       --  is absent from the vocab (instead of the magic 0, a valid token).
       --  Absent for an exhaustive byte-level vocab -> stays -1.
@@ -195,6 +206,34 @@ package body LLM_Tokenizer is
    -- Decode
    --------------------------------------------------------------------
 
+   --  Gemma/SentencePiece piece -> text: U+2581 becomes a space and a
+   --  <0xHH> byte-fallback token becomes its raw byte.
+   function Gemma_Unmap (Piece : String) return String is
+      R : Unbounded_String;
+      I : Integer := Piece'First;
+      function Hex_Val (C : Character) return Integer is
+        (case C is
+            when '0' .. '9' => Character'Pos (C) - Character'Pos ('0'),
+            when 'A' .. 'F' => Character'Pos (C) - Character'Pos ('A') + 10,
+            when 'a' .. 'f' => Character'Pos (C) - Character'Pos ('a') + 10,
+            when others => 0);
+   begin
+      while I <= Piece'Last loop
+         if I + 5 <= Piece'Last
+           and then Piece (I .. I + 2) = "<0x" and then Piece (I + 5) = '>'
+         then
+            Append (R, Character'Val
+              (Hex_Val (Piece (I + 3)) * 16 + Hex_Val (Piece (I + 4))));
+            I := I + 6;
+         elsif I + 2 <= Piece'Last and then Piece (I .. I + 2) = SP_Space then
+            Append (R, ' '); I := I + 3;
+         else
+            Append (R, Piece (I)); I := I + 1;
+         end if;
+      end loop;
+      return To_String (R);
+   end Gemma_Unmap;
+
    function Decode_One (T : Tokenizer; Id : Integer) return String is
    begin
       if T /= null and then T.Id2Tok.Contains (Id) then
@@ -203,6 +242,8 @@ package body LLM_Tokenizer is
          begin
             if T.Byte_Level then
                return Unmap_Bytes (Piece);
+            elsif T.Gemma_Mode then
+               return Gemma_Unmap (Piece);
             else
                return Piece;
             end if;
@@ -257,19 +298,63 @@ package body LLM_Tokenizer is
       declare
          Pieces : array (1 .. Text'Length) of Unbounded_String;
          N      : Natural := Text'Length;
+
+         function Byte_Token (B : Natural) return String is
+            Hx : constant String := "0123456789ABCDEF";
+         begin
+            return "<0x" & Hx (B / 16 + 1) & Hx (B mod 16 + 1) & ">";
+         end Byte_Token;
       begin
-         for I in 1 .. Text'Length loop
+         if T.Gemma_Mode then
+            --  SentencePiece: space -> U+2581, then per-UTF-8-character initial
+            --  pieces, falling back to <0xHH> byte tokens for unknown chars.
+            N := 0;
             declare
-               B : constant Natural := Character'Pos (Text (Text'First + I - 1));
+               I : Integer := Text'First;
             begin
-               if T.Byte_Level then
-                  Pieces (I) := To_Unbounded_String (Byte_To_Piece (B));
-               else
-                  Pieces (I) :=
-                    To_Unbounded_String (Text (Text'First + I - 1 .. Text'First + I - 1));
-               end if;
+               while I <= Text'Last loop
+                  if Text (I) = ' ' then
+                     N := N + 1; Pieces (N) := To_Unbounded_String (SP_Space);
+                     I := I + 1;
+                  else
+                     declare
+                        Lead : constant Natural := Character'Pos (Text (I));
+                        CL   : constant Integer :=
+                          (if    Lead < 16#80#  then 1
+                           elsif Lead >= 16#F0# then 4
+                           elsif Lead >= 16#E0# then 3
+                           elsif Lead >= 16#C0# then 2 else 1);
+                        LB   : constant Integer := Integer'Min (Text'Last, I + CL - 1);
+                        Ch   : constant String := Text (I .. LB);
+                     begin
+                        if T.Vocab.Contains (Ch) then
+                           N := N + 1; Pieces (N) := To_Unbounded_String (Ch);
+                        else
+                           for J in I .. LB loop
+                              N := N + 1;
+                              Pieces (N) := To_Unbounded_String
+                                (Byte_Token (Character'Pos (Text (J))));
+                           end loop;
+                        end if;
+                        I := LB + 1;
+                     end;
+                  end if;
+               end loop;
             end;
-         end loop;
+         else
+            for I in 1 .. Text'Length loop
+               declare
+                  B : constant Natural := Character'Pos (Text (Text'First + I - 1));
+               begin
+                  if T.Byte_Level then
+                     Pieces (I) := To_Unbounded_String (Byte_To_Piece (B));
+                  else
+                     Pieces (I) := To_Unbounded_String
+                       (Text (Text'First + I - 1 .. Text'First + I - 1));
+                  end if;
+               end;
+            end loop;
+         end if;
 
          loop
             declare

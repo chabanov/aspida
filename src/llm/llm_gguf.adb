@@ -95,10 +95,10 @@ package body LLM_GGUF is
    end Read_F32;
 
    function Read_Bool (FD : C_Int) return Boolean is
-      V : U32;
    begin
-      V := Read_U32 (FD);
-      return V /= 0;
+      --  GGUF BOOL is a single byte (not a 32-bit word) — reading 4 would
+      --  desync the cursor and corrupt every later metadata entry.
+      return Read_U8 (FD) /= 0;
    end Read_Bool;
 
    function Read_String (FD : C_Int) return String is
@@ -218,8 +218,11 @@ package body LLM_GGUF is
       N_Tensors : U64;
       N_Meta    : U64;
    begin
-      -- Open file via POSIX
-      FD := C_Open (Path, O_RDONLY, 0);
+      -- Open file via POSIX. C's open() needs a NUL-terminated string; an Ada
+      -- String is not, so append the terminator explicitly (passing a bare Ada
+      -- String relied on whatever byte followed it in memory — it happened to
+      -- work for a string literal but not for an env-var value).
+      FD := C_Open (Path & Character'Val (0), O_RDONLY, 0);
       if FD < 0 then
          Ada.Text_IO.Put_Line ("ERROR: cannot open " & Path);
          return;
@@ -435,6 +438,21 @@ package body LLM_GGUF is
       Read_Exact (FD, Buffer, Buf_Size);
    end Read_Tensor_Raw;
 
+   procedure Read_Tensor_Range
+     (File        : in out GGUF_File;
+      Info        : Tensor_Info;
+      Byte_Offset : U64;
+      Buffer      : System.Address;
+      Buf_Size    : Natural)
+   is
+      FD  : constant C_Int := C_Int (File.FD);
+      Off : constant C_Off :=
+        C_Off (File.Data_Start + Info.Offset + Byte_Offset);
+   begin
+      Ignore (C_LSeek (FD, Off, SEEK_SET));
+      Read_Exact (FD, Buffer, Buf_Size);
+   end Read_Tensor_Range;
+
    function Tensor_Byte_Size (Info : Tensor_Info) return U64 is
       N_Elements : constant U64 := Tensor_Num_Elements (Info);
    begin
@@ -448,7 +466,8 @@ package body LLM_GGUF is
          when GGML_TYPE_Q5_K => return (N_Elements / 256) * 176;
          when GGML_TYPE_Q6_K => return (N_Elements / 256) * 210;
          when GGML_TYPE_Q8_K => return (N_Elements / 256) * 292;
-         when GGML_TYPE_Q8_0 => return N_Elements;
+         --  Q8_0: 32-element block = f16 scale (2) + 32 int8 = 34 bytes.
+         when GGML_TYPE_Q8_0 => return (N_Elements / 32) * 34;
          when others => return N_Elements * 4;
       end case;
    end Tensor_Byte_Size;

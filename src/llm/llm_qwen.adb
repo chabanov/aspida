@@ -96,6 +96,19 @@ package body LLM_Qwen is
          raise Model_Load_Error with "cannot open GGUF file: " & Path;
       end if;
 
+      --  This engine implements the qwen35moe hybrid (MoE + gated delta-net).
+      --  Refuse any other architecture up front with a clear message instead
+      --  of crashing later on a missing config key or tensor.
+      declare
+         Arch : constant String := Metadata (G, "general.architecture");
+      begin
+         if Arch /= "qwen35moe" and then Arch /= "qwen2" then
+            raise Model_Load_Error with
+              "unsupported architecture '" & Arch
+              & "' — this engine supports qwen35moe only";
+         end if;
+      end;
+
       -- Read config from metadata (try qwen35moe.* first, fallback to qwen2.*)
       declare
          function Read_Meta_Int (Key : String) return Integer is
