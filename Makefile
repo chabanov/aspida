@@ -10,7 +10,16 @@ GPRBUILD_BIN ?= $(firstword $(wildcard $(TOOLCHAINS)/gprbuild_*/bin))
 PATH        := $(GNAT_BIN):$(GPRBUILD_BIN):$(PATH)
 export PATH
 
-# ── SDK / macOS ──────────────────────────────────────────────────────
+# ── Target OS / SDK ──────────────────────────────────────────────────
+# Linux vs macOS selects the linker flags in shared.gpr (-XOS). On macOS we
+# also need the SDK root; on Linux xcrun is absent (SDKROOT stays empty and is
+# unused because the darwin linker branch is not taken).
+UNAME_S     := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+  OS_NAME   := linux
+else
+  OS_NAME   := darwin
+endif
 SDKROOT     := $(shell xcrun --show-sdk-path 2>/dev/null)
 export SDKROOT
 
@@ -40,7 +49,7 @@ FORMATTER   := $(GNAT_BIN)/gnatpp
 # ── Flags ────────────────────────────────────────────────────────────
 # ARCH=portable drops -march=native (binaries run on any CPU); see shared.gpr.
 ARCH        ?= native
-GPR_FLAGS   := -XSDKROOT=$(SDKROOT) -XARCH=$(ARCH)
+GPR_FLAGS   := -XSDKROOT=$(SDKROOT) -XARCH=$(ARCH) -XOS=$(OS_NAME)
 SPARK_FLAGS := -P $(MAIN_GPR) $(GPR_FLAGS) --mode=flow
 
 # ── Default ──────────────────────────────────────────────────────────

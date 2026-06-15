@@ -315,7 +315,7 @@ package body LLM_Gemma is
          declare
             B    : G_Block renames M.Blocks (Lr);
             HD   : constant Integer := B.Head_Dim;   -- 256 (SWA) / 512 (full)
-            RoPE : LLM_RoPE.RoPE_Params :=
+            RoPE : constant LLM_RoPE.RoPE_Params :=
               (if B.Is_SWA then M.RoPE_SWA else M.RoPE_Glob);
             Win  : constant Integer :=
               (if B.Is_SWA then M.Sliding_Window else Pos + 1);

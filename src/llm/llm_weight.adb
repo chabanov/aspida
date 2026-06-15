@@ -196,6 +196,37 @@ package body LLM_Weight is
       end if;
    end MatVec;
 
+   function Raw_Address (W : Weight) return System.Address is
+   begin
+      if W.Is_Quant and then W.Bytes /= null then
+         return W.Bytes.all'Address;
+      else
+         return System.Null_Address;
+      end if;
+   end Raw_Address;
+
+   function Raw_Bytes (W : Weight) return Long_Long_Integer is
+   begin
+      if W.Is_Quant and then W.Bytes /= null then
+         return Long_Long_Integer (W.Bytes.all'Length);
+      else
+         return 0;
+      end if;
+   end Raw_Bytes;
+
+   function Kind_Code (W : Weight) return Integer is
+      use type LLM_GGUF.GGML_Type;
+   begin
+      if not W.Is_Quant then
+         return -1;
+      end if;
+      case W.Info.Kind is
+         when LLM_GGUF.GGML_TYPE_Q4_K => return 0;
+         when LLM_GGUF.GGML_TYPE_Q6_K => return 1;
+         when others => return -1;
+      end case;
+   end Kind_Code;
+
    function N_Experts (W : Weight) return Integer is
    begin
       if W.Is_Quant then

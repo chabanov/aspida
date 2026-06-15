@@ -9,6 +9,7 @@
 
 with LLM_Tensor;
 with LLM_GGUF;
+with System;
 
 package LLM_Weight is
 
@@ -37,6 +38,13 @@ package LLM_Weight is
    --  embedding-table lookup without materialising the whole F32 tensor.
    --  Returns a [1, in] tensor.
    function Get_Row (W : Weight; Row : Integer) return LLM_Tensor.Tensor;
+
+   --  Raw quantized-tensor access, for offloading the matvec to a GPU backend
+   --  (LLM_GPU). Address/length of the still-quantized bytes and a small kind
+   --  code (0 = Q4_K, 1 = Q6_K, -1 = other/dense) the GPU kernels understand.
+   function Raw_Address (W : Weight) return System.Address;
+   function Raw_Bytes   (W : Weight) return Long_Long_Integer;
+   function Kind_Code   (W : Weight) return Integer;
 
    --  3D expert weight (row-major [n_experts, out_e, in]); matvec one expert.
    function N_Experts (W : Weight) return Integer;
