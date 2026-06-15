@@ -117,6 +117,16 @@ package LLM_GGUF is
       Buffer : System.Address;
       Buf_Size : Natural);
 
+   --  Read Buf_Size bytes starting Byte_Offset into a tensor's data — used to
+   --  stream individual rows of tensors too large to hold in one buffer
+   --  (e.g. a >2 GiB per-layer embedding table). The file is kept open.
+   procedure Read_Tensor_Range
+     (File        : in out GGUF_File;
+      Info        : Tensor_Info;
+      Byte_Offset : U64;
+      Buffer      : System.Address;
+      Buf_Size    : Natural);
+
    -- Byte size of a tensor given its type and element count
    function Tensor_Byte_Size (Info : Tensor_Info) return U64;
 

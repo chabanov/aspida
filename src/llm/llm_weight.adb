@@ -131,6 +131,35 @@ package body LLM_Weight is
       end if;
    end Count;
 
+   function Get_Row (W : Weight; Row : Integer) return Tensor is
+   begin
+      if not W.Is_Quant then
+         declare
+            In_Dim : constant Integer := Shape (W.Dense) (2);
+            R : Tensor := New_Tensor ([1, In_Dim]);
+         begin
+            for I in 1 .. In_Dim loop
+               Set_Flat (R, I, Get (W.Dense, [Row + 1, I]));
+            end loop;
+            return R;
+         end;
+      end if;
+      declare
+         Row_Info : LLM_GGUF.Tensor_Info := W.Info;
+      begin
+         Row_Info.N_Dims := 2;
+         Row_Info.Dims   := [W.Info.Dims (1), 1, 0, 0];
+         declare
+            BPR : constant Natural :=
+              Natural (LLM_GGUF.Tensor_Byte_Size (Row_Info));
+            RS  : constant Natural := W.Bytes'First + Row * BPR;
+         begin
+            return LLM_Dequant.Dequantize
+              (Row_Info, W.Bytes (RS .. RS + BPR - 1));
+         end;
+      end;
+   end Get_Row;
+
    function Dense_MatVec (D, X : Tensor) return Tensor is
       Out_Dim : constant Integer := Shape (D) (1);
       In_Dim  : constant Integer := Shape (D) (2);

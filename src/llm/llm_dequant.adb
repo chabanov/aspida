@@ -417,6 +417,33 @@ package body LLM_Dequant is
       end return;
    end Logical_Shape;
 
+   --  Q8_0: 32-element blocks of [f16 scale d | 32 x int8 q]; w = d * q.
+   procedure Dequant_Q8_0 (X : String; Q : out Tensor; N : Natural) is
+      Pos : Natural := X'First;
+      Idx : Natural := 0;
+   begin
+      while Idx < N loop
+         declare
+            D : constant Float := F16_To_F32
+              (Byte (Character'Pos (X (Pos))),
+               Byte (Character'Pos (X (Pos + 1))));
+         begin
+            Pos := Pos + 2;
+            for J in 0 .. 31 loop
+               exit when Idx >= N;
+               declare
+                  B : constant Integer := Character'Pos (X (Pos + J));
+                  S : constant Integer := (if B >= 128 then B - 256 else B);
+               begin
+                  Set_Flat (Q, Idx + 1, D * Float (S));
+               end;
+               Idx := Idx + 1;
+            end loop;
+            Pos := Pos + 32;
+         end;
+      end loop;
+   end Dequant_Q8_0;
+
    --  Dequantize into a caller-provided (already-allocated) tensor — no heap
    --  allocation, so it can be called in a hot/parallel loop with a reused buffer.
    procedure Fill
@@ -458,6 +485,7 @@ package body LLM_Dequant is
          when LLM_GGUF.GGML_TYPE_Q8_K => Dequant_Q8_K (Raw, Result, N);
          when LLM_GGUF.GGML_TYPE_Q6_K => Dequant_Q6_K (Raw, Result, N);
          when LLM_GGUF.GGML_TYPE_Q4_K => Dequant_Q4_K (Raw, Result, N);
+         when LLM_GGUF.GGML_TYPE_Q8_0 => Dequant_Q8_0 (Raw, Result, N);
 
          when others =>
             Ada.Text_IO.Put_Line ("Dequantize: unsupported type " &
