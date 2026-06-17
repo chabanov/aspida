@@ -2,7 +2,7 @@
 # Build: alr build
 
 name = "aspida"
-description = "ADA/SPARK monorepo: HTTP client generator (WIP) + native Qwen GGUF LLM inference"
+description = "End-to-end encrypted LLM inference in Ada/SPARK: own GGUF engine (Llama/Qwen/Gemma) + own cryptography, no third-party libraries"
 version = "0.1.0-dev"
 authors = ["Aspida contributors"]
 licenses = "MIT"

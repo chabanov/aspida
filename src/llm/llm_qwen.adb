@@ -14,6 +14,7 @@ with LLM_GGUF;    use LLM_GGUF;
 with LLM_Dequant; use LLM_Dequant;
 with LLM_Tensor;  use LLM_Tensor;
 with LLM_MoE;
+with LLM_Step_Lock;
 with LLM_RMSNorm;
 with LLM_FullAttn;
 with LLM_DeltaNet_Blk;
@@ -105,7 +106,7 @@ package body LLM_Qwen is
          if Arch /= "qwen35moe" and then Arch /= "qwen2" then
             raise Model_Load_Error with
               "unsupported architecture '" & Arch
-              & "' — this engine supports qwen35moe only";
+              & "' — this backend supports qwen35moe and qwen2";
          end if;
       end;
 
@@ -392,9 +393,12 @@ package body LLM_Qwen is
       --  step costs O(1) matmuls instead of recomputing the sequence.
       Cache : array (1 .. M.N_Blocks) of LLM_Qwen_Blk.Block_State;
 
+      --  One forward step under the shared step lock, released between steps
+      --  (incl. on exception) so concurrent generations interleave per token.
       function Decode (Embed_Row : Integer) return Tensor is
          H : Tensor := New_Tensor ([1, Dim]);
       begin
+         LLM_Step_Lock.Acquire;
          for D in 1 .. Dim loop
             Set_Flat (H, D, Get (M.Token_Emb, [Embed_Row, D]));
          end loop;
@@ -403,9 +407,15 @@ package body LLM_Qwen is
          end loop;
          declare
             Normed : constant Tensor := LLM_RMSNorm.Forward (H, M.Final_Norm);
+            R      : constant Tensor := MatVec_Rows (M.LM_Head, Normed);
          begin
-            return MatVec_Rows (M.LM_Head, Normed);
+            LLM_Step_Lock.Release;
+            return R;
          end;
+      exception
+         when others =>
+            LLM_Step_Lock.Release;
+            raise;
       end Decode;
 
       Last_Logits : Tensor;

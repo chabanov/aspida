@@ -277,14 +277,6 @@ package body LLM_Dequant is
          end;
       end loop;
    end Dequant_Q4_K;
-   --
-   -- N = block size (typically 256)
-   -- Blocks = N / 256
-   -- Each block of 256:
-   --   - 24 bytes of scales (12 × FP16 → 12 values in FP32)
-   --   - (N/8) bytes of qs (compressed 5-bit values, 8 per byte)
-   --   - (N/16) bytes of qh (high bits, 1 per 2 values for 5th bit)
-   --------------------------------------------------------------------
 
    --  Q5_K super-block (llama.cpp block_q5_K, 176 bytes / 256 elements):
    --    ggml_half d;        -- f16 super-block scale for the 6-bit scales
@@ -438,6 +430,77 @@ package body LLM_Dequant is
       end loop;
    end Dequant_Q8_0;
 
+   --------------------------------------------------------------------
+   -- Q4_0: 32-element block = f16 d (2) + qs (16). Two nibbles per byte map
+   -- to positions j and j+16; value = (nibble - 8) * d. (llama.cpp block_q4_0.)
+   --------------------------------------------------------------------
+   procedure Dequant_Q4_0 (X : String; Q : out Tensor; N : Natural) is
+      Blocks : constant Natural := N / 32;
+      Pos    : Natural := X'First;
+      Q_Pos  : Natural := 1;
+      function U8 (P : Natural) return Byte is (Byte (Character'Pos (X (P))));
+   begin
+      for B in 1 .. Blocks loop
+         declare
+            D  : constant Float := F16_To_F32 (U8 (Pos), U8 (Pos + 1));
+            QB : constant Natural := Pos + 2;
+         begin
+            for J in 0 .. 15 loop
+               declare
+                  C  : constant Byte := U8 (QB + J);
+                  X0 : constant Integer := Integer (C and 16#0F#) - 8;
+                  X1 : constant Integer := Integer (Shift_Right (C, 4)) - 8;
+               begin
+                  Set_Flat (Q, Q_Pos + J,      D * Float (X0));
+                  Set_Flat (Q, Q_Pos + J + 16, D * Float (X1));
+               end;
+            end loop;
+            Q_Pos := Q_Pos + 32;
+            Pos   := Pos + 18;
+         end;
+      end loop;
+   end Dequant_Q4_0;
+
+   --------------------------------------------------------------------
+   -- Q5_0: 32-element block = f16 d (2) + qh (4, the 5th bit per element as a
+   -- LE uint32) + qs (16). value = ((low4 | high5th) - 16) * d.
+   --------------------------------------------------------------------
+   procedure Dequant_Q5_0 (X : String; Q : out Tensor; N : Natural) is
+      Blocks : constant Natural := N / 32;
+      Pos    : Natural := X'First;
+      Q_Pos  : Natural := 1;
+      function U8 (P : Natural) return Byte is (Byte (Character'Pos (X (P))));
+   begin
+      for B in 1 .. Blocks loop
+         declare
+            D  : constant Float := F16_To_F32 (U8 (Pos), U8 (Pos + 1));
+            QH : constant Unsigned_32 :=
+                 Unsigned_32 (U8 (Pos + 2))
+               + Shift_Left (Unsigned_32 (U8 (Pos + 3)), 8)
+               + Shift_Left (Unsigned_32 (U8 (Pos + 4)), 16)
+               + Shift_Left (Unsigned_32 (U8 (Pos + 5)), 24);
+            QB : constant Natural := Pos + 6;
+         begin
+            for J in 0 .. 15 loop
+               declare
+                  C   : constant Byte := U8 (QB + J);
+                  XH0 : constant Integer :=
+                    Integer (Shift_Left (Shift_Right (QH, J), 4) and 16#10#);
+                  XH1 : constant Integer :=
+                    Integer (Shift_Right (QH, J + 12) and 16#10#);
+                  X0  : constant Integer := (Integer (C and 16#0F#) + XH0) - 16;
+                  X1  : constant Integer := (Integer (Shift_Right (C, 4)) + XH1) - 16;
+               begin
+                  Set_Flat (Q, Q_Pos + J,      D * Float (X0));
+                  Set_Flat (Q, Q_Pos + J + 16, D * Float (X1));
+               end;
+            end loop;
+            Q_Pos := Q_Pos + 32;
+            Pos   := Pos + 22;
+         end;
+      end loop;
+   end Dequant_Q5_0;
+
    --  Dequantize into a caller-provided (already-allocated) tensor — no heap
    --  allocation, so it can be called in a hot/parallel loop with a reused buffer.
    procedure Fill
@@ -498,6 +561,8 @@ package body LLM_Dequant is
          when LLM_GGUF.GGML_TYPE_Q6_K => Dequant_Q6_K (Raw, Result, N);
          when LLM_GGUF.GGML_TYPE_Q4_K => Dequant_Q4_K (Raw, Result, N);
          when LLM_GGUF.GGML_TYPE_Q8_0 => Dequant_Q8_0 (Raw, Result, N);
+         when LLM_GGUF.GGML_TYPE_Q4_0 => Dequant_Q4_0 (Raw, Result, N);
+         when LLM_GGUF.GGML_TYPE_Q5_0 => Dequant_Q5_0 (Raw, Result, N);
 
          when others =>
             Ada.Text_IO.Put_Line ("Dequantize: unsupported type " &

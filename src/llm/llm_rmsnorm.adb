@@ -9,7 +9,8 @@ package body LLM_RMSNorm is
    --  Called per token per layer; indices derive from the vector length.
    pragma Suppress (All_Checks);
 
-   function Forward (X : Tensor; Weight : Tensor) return Tensor is
+   function Forward (X : Tensor; Weight : Tensor; Eps : Float := Epsilon)
+      return Tensor is
       N : constant Integer := Numel (X);
       -- Compute mean of squares
       Sum_Sq : Float := 0.0;
@@ -24,7 +25,7 @@ package body LLM_RMSNorm is
 
       declare
          Rms : constant Float := Ada.Numerics.Elementary_Functions.Sqrt
-           (Sum_Sq / Float (N) + Epsilon);
+           (Sum_Sq / Float (N) + Eps);
          Result : Tensor := New_Tensor ([1, N]);
       begin
          for I in 1 .. N loop

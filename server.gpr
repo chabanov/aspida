@@ -1,11 +1,12 @@
 -- server.gpr — encrypted chat server + client (engine + crypto + sockets).
 --
--- Builds the Qwen engine together with the secure session layer and the
--- two mains. Withs session.gpr (crypto + secure channel); owns the engine
--- sources, the socket transport/protocol, and the server-side integration.
+-- Builds the inference engine (Llama / Qwen / Gemma backends from GGUF)
+-- together with the secure session layer and the mains. Withs session.gpr
+-- (crypto + secure channel); owns the engine sources, the socket
+-- transport/protocol, and the server-side integration.
 --
 -- Build: gprbuild -P server.gpr -XSDKROOT=$(xcrun --show-sdk-path)
--- Run:   QWEN_MODEL_PATH=... ./obj/secure_server [port]
+-- Run:   QWEN_MODEL_PATH=<any-supported-gguf> ./obj/secure_server [port]
 --        ./obj/secure_client <host> <port> <server_pub_hex> <prompt...>
 
 with "shared.gpr";
@@ -16,7 +17,8 @@ project Server is
    for Source_Dirs use ("src/llm", "src/secure", "src/server");
    for Object_Dir use "obj/server";
    for Exec_Dir use "obj";
-   for Main use ("secure_server.adb", "secure_client.adb");
+   for Main use ("secure_server.adb", "secure_client.adb", "openai_proxy.adb",
+                 "ws_bridge.adb");
 
    package Compiler is
       for Default_Switches ("Ada") use Shared.Ada_O3;

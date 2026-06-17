@@ -33,7 +33,7 @@ package body LLM_Engine is
 
    --  Peek general.architecture: open, read metadata, close. (One-time on
    --  load; the chosen backend reopens the file to stream tensor data.)
-   function Detect (Path : String) return String is
+   function Detect_Arch (Path : String) return String is
       G : LLM_GGUF.GGUF_File;
    begin
       LLM_GGUF.Open (G, Path);
@@ -45,10 +45,23 @@ package body LLM_Engine is
       do
          LLM_GGUF.Close (G);
       end return;
-   end Detect;
+   exception
+      when others =>
+         return "";
+   end Detect_Arch;
+
+   function Supports (Arch : String) return Boolean is
+   begin
+      for R of Registry loop
+         if R.Arch.all = Arch then
+            return True;
+         end if;
+      end loop;
+      return False;
+   end Supports;
 
    function Load (Path : String) return Engine is
-      Arch : constant String := Detect (Path);
+      Arch : constant String := Detect_Arch (Path);
    begin
       if Arch = "" then
          raise Model_Load_Error with "cannot open GGUF file: " & Path;

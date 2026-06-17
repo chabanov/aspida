@@ -13,6 +13,9 @@ lib/
 *.stderr
 .env
 /sessions/
+/blog/
+/docs/
+
 
 *.log
 temp.log

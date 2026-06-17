@@ -35,6 +35,13 @@ package LLM_Engine is
    function Vocab_Size (E : Engine) return Integer;
    function Arch_Name  (E : Engine) return String;
 
+   --  Discovery helpers (no model load). Peek a GGUF's general.architecture
+   --  ("" if the file cannot be opened), and test whether the engine has a
+   --  backend for that architecture. Used by LLM_Catalog to enumerate the
+   --  models present on the system without loading any weights.
+   function Detect_Arch (Path : String) return String;
+   function Supports (Arch : String) return Boolean;
+
 private
 
    type Engine is record

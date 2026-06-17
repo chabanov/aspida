@@ -6,9 +6,10 @@ forward graph, sampling, chat templates, crypto) in Ada. Validated end to end
 on real Llama-3.3-70B.
 
 ## Status (validated on DigitalOcean NVIDIA H100/H200)
-- **Kernels** (`phase1/`): Q4_K + Q6_K dequant & matvec (bit-exact vs CPU),
-  RMSNorm / RoPE / SiLU / GQA-attention (≤1e-6), full transformer layer (2.3e-7),
-  throughput ~2.25 tok/s un-tiled (~180× CPU at 70B scale). See `phase1/README.md`.
+- **Kernels** (`experiments/phase1/`): Q4_K + Q6_K dequant & matvec (bit-exact vs
+  CPU), RMSNorm / RoPE / SiLU / GQA-attention (≤1e-6), full transformer layer
+  (2.3e-7), throughput ~2.25 tok/s un-tiled (~180× CPU at 70B scale). See
+  `experiments/phase1/README.md`.
 - **Full integration** (`gpu_matvec.cu` + `src/llm/llm_gpu.{ads,adb}`): the Ada
   `LLM_Llama` forward routes its 8 matvecs per layer through a CUDA shim
   (`aspida_gpu_matvec`) loaded at runtime via `dlopen` — so a CPU build/host is

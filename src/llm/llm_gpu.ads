@@ -27,4 +27,19 @@ package LLM_GPU is
       X       : System.Address;
       Y       : System.Address);
 
+   --  True iff the loaded shim also exports the batched matmul entry point.
+   function Has_MatMul return Boolean;
+
+   --  Batched: Y[Batch,Out] = X[Batch,In] . W (row-major). One weight read
+   --  serves all Batch rows — the continuous-batching throughput primitive.
+   procedure MatMul
+     (W_Addr  : System.Address;
+      W_Bytes : Long_Long_Integer;
+      Kind    : Integer;
+      In_Dim  : Integer;
+      Out_Dim : Integer;
+      Batch   : Integer;
+      X       : System.Address;
+      Y       : System.Address);
+
 end LLM_GPU;

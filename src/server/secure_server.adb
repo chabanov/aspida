@@ -1,14 +1,17 @@
 ---------------------------------------------------------------------
 -- Secure_Server — concurrent encrypted chat server.
 --
--- Loads the Qwen model once (shared, read-only) and serves many clients
--- at the same time: a pool of handler tasks each take a connection from a
--- bounded queue, run the handshake + session, and chat. Inference itself
--- is serialized by Infer_Lock (one model + a thread pool that already uses
--- every core, so concurrent generations would only contend) — but I/O,
--- handshakes and persistence run in parallel across connections.
+-- Loads the model once (shared, read-only — backend chosen from the GGUF
+-- architecture: Llama / Qwen / Gemma) and serves many clients at the same
+-- time: a pool of handler tasks each take a connection from a bounded
+-- queue, run the handshake + session, and chat. I/O, handshakes and
+-- persistence run in parallel across connections; the engine interleaves
+-- concurrent generations per step (and the Llama backend batches them
+-- through a shared forward pass). Infer_Lock is now a no-op kept for
+-- structure — serialization is handled inside the engine.
 --
--- Usage:  QWEN_MODEL_PATH=... ./obj/secure_server [port]
+-- Usage:  QWEN_MODEL_PATH=<any-supported-gguf> ./obj/secure_server [port]
+--         (the env var name is historical; it accepts any supported GGUF)
 ---------------------------------------------------------------------
 
 with Ada.Text_IO;             use Ada.Text_IO;
@@ -31,7 +34,9 @@ with Encrypting_Sink;
 with Protocol;
 with LLM_Qwen;
 with LLM_Engine;
+with LLM_Catalog;
 with LLM_Sampler;
+with OpenAI;
 
 procedure Secure_Server is
 
@@ -42,7 +47,21 @@ procedure Secure_Server is
    Default_Port : constant := 8765;
    Max_Clients  : constant := 8;     -- concurrent handler tasks
    Max_Queue    : constant := 64;    -- pending-connection backlog
-   Max_Reply_Tokens : constant := 256;   -- generation cap per turn
+
+   --  Generation cap per turn. Default 256; override with ASPIDA_MAX_TOKENS
+   --  (e.g. a small value keeps a CPU demo snappy by bounding worst-case
+   --  latency — short answers still stop early on EOS).
+   function Max_Reply_Tokens return Integer is
+   begin
+      if Ada.Environment_Variables.Exists ("ASPIDA_MAX_TOKENS") then
+         begin
+            return Integer'Max (1, Integer'Value
+              (Ada.Environment_Variables.Value ("ASPIDA_MAX_TOKENS")));
+         exception when others => null;
+         end;
+      end if;
+      return 256;
+   end Max_Reply_Tokens;
 
    --  How long a connection may stay silent before its handler reclaims the
    --  slot (anti-DoS: a client that handshakes then never sends must not pin a
@@ -138,22 +157,25 @@ procedure Secure_Server is
    Secret   : constant Crypto.X25519.Key_256 := Load_Or_Create_Key;
    Listener : Socket_Type;
 
-   --  Serializes the actual generation (single model + all-core pool).
+   --  Generations no longer serialize as a whole. Correctness (shared GPU
+   --  buffers + the all-core worker pool) is now enforced per forward step by
+   --  LLM_Step_Lock, so concurrent sessions INTERLEAVE token-by-token instead
+   --  of one waiting behind the other. These stay as no-ops so the handler's
+   --  existing acquire/release structure is unchanged. (Concurrency is still
+   --  bounded by Max_Clients connection slots.)
    protected Infer_Lock is
-      entry Acquire;
+      procedure Acquire;
       procedure Release;
-   private
-      Held : Boolean := False;
    end Infer_Lock;
 
    protected body Infer_Lock is
-      entry Acquire when not Held is
+      procedure Acquire is
       begin
-         Held := True;
+         null;
       end Acquire;
       procedure Release is
       begin
-         Held := False;
+         null;
       end Release;
    end Infer_Lock;
 
@@ -299,14 +321,82 @@ procedure Secure_Server is
       loop
          declare
             Req : constant Byte_Array := Secure_Channel.Recv_Message (Ch, ST'Access);
+            Tag : constant Crypto.U8 :=
+              (if Req'Length >= 1 then Req (Req'First) else 0);
             Sink : aliased Encrypting_Sink.Enc_Sink :=
               (LLM_Qwen.Token_Sink with
                  Ch => Ch'Unchecked_Access, T => ST'Unchecked_Access);
             Prompt : String (1 .. Integer'Max (0, Req'Length - 1));
+
+            --  Frame Tag + text into one AEAD record and send it.
+            procedure Send_Tagged (T : Crypto.U8; S : String) is
+               Out_B : Byte_Array (0 .. S'Length);
+            begin
+               Out_B (0) := T;
+               for I in 1 .. S'Length loop
+                  Out_B (I) := Crypto.U8 (Character'Pos (S (S'First + I - 1)));
+               end loop;
+               Secure_Channel.Send_Message (Ch, ST'Access, Out_B);
+            end Send_Tagged;
          begin
             for I in Prompt'Range loop
                Prompt (I) := Character'Val (Integer (Req (Req'First + I)));
             end loop;
+
+            --  OpenAI-compatible routes (tunneled JSON). The proxy maps HTTP.
+            if Tag = Protocol.Tag_Models then
+               Send_Tagged (Protocol.Tag_Resp,
+                 OpenAI.Models_Response (LLM_Engine.Arch_Name (Model)));
+
+            elsif Tag = Protocol.Tag_Chat then
+               declare
+                  Locked : Boolean := False;
+               begin
+                  declare
+                     Rq      : constant OpenAI.Request := OpenAI.Parse_Chat (Prompt);
+                     Eff_Max : constant Integer :=
+                       Integer'Min (Integer'Max (1, Rq.Max_Tokens), Max_Reply_Tokens);
+                     P       : LLM_Sampler.Params := Rq.Params;
+                  begin
+                     if Rq.N = 0 then
+                        Send_Tagged (Protocol.Tag_Resp,
+                          OpenAI.Error_Response ("messages required"));
+                     else
+                        --  Never trust client params: clamp.
+                        if P.Temperature < 0.0 then P.Temperature := 0.0;
+                        elsif P.Temperature > 2.0 then P.Temperature := 2.0; end if;
+                        if P.Top_P <= 0.0 or else P.Top_P > 1.0 then P.Top_P := 1.0; end if;
+                        if P.Top_K < 0 then P.Top_K := 0; end if;
+                        Infer_Lock.Acquire; Locked := True;
+                        if Rq.Stream then
+                           declare
+                              R : constant String := LLM_Engine.Chat
+                                (Model, Rq.Messages, Eff_Max, Sink'Access, P);
+                              pragma Unreferenced (R);
+                           begin null; end;
+                           Infer_Lock.Release; Locked := False;
+                           Secure_Channel.Send_Message
+                             (Ch, ST'Access, [0 => Protocol.Tag_Done]);
+                        else
+                           declare
+                              R : constant String := LLM_Engine.Chat
+                                (Model, Rq.Messages, Eff_Max, null, P);
+                           begin
+                              Infer_Lock.Release; Locked := False;
+                              Send_Tagged (Protocol.Tag_Resp,
+                                OpenAI.Chat_Response (To_String (Rq.Model), R));
+                           end;
+                        end if;
+                     end if;
+                  end;
+               exception
+                  when others =>
+                     if Locked then Infer_Lock.Release; end if;
+                     Send_Tagged (Protocol.Tag_Resp,
+                       OpenAI.Error_Response ("bad request"));
+               end;
+
+            else
             declare
                N    : constant Natural := Session_Store.Turn_Count (Store);
                Conv : LLM_Qwen.Message_Array (1 .. 2 * N + 1);
@@ -336,6 +426,7 @@ procedure Secure_Server is
                   if Locked then Infer_Lock.Release; end if;
                   raise;
             end;
+            end if;
          end;
       end loop;
    exception
@@ -375,10 +466,27 @@ procedure Secure_Server is
    Handlers : array (1 .. Max_Clients) of Handler;
    pragma Unreferenced (Handlers);
 
-   Port : Port_Type := Default_Port;
+   Port      : Port_Type := Default_Port;
+   Bind_Addr : Inet_Addr_Type := Any_Inet_Addr;
 begin
    if Ada.Command_Line.Argument_Count >= 1 then
       Port := Port_Type'Value (Ada.Command_Line.Argument (1));
+   end if;
+
+   --  Optionally restrict the listener to one address (e.g. 127.0.0.1 when
+   --  fronted by a reverse proxy / bridge). Default Any preserves direct
+   --  native-client access; an empty or "0.0.0.0" value also means Any.
+   if Ada.Environment_Variables.Exists ("ASPIDA_BIND") then
+      declare
+         B : constant String := Ada.Environment_Variables.Value ("ASPIDA_BIND");
+      begin
+         if B /= "" and then B /= "0.0.0.0" then
+            Bind_Addr := Inet_Addr (B);
+         end if;
+      exception
+         when others =>
+            Put_Line ("note: ASPIDA_BIND='" & B & "' invalid; binding Any.");
+      end;
    end if;
 
    if not Crypto.Memory.Lock (Secret'Address, Secret'Length) then
@@ -399,10 +507,33 @@ begin
 
    Create_Socket (Listener);
    Set_Socket_Option (Listener, Socket_Level, (Reuse_Address, True));
-   Bind_Socket (Listener, (Family_Inet, Any_Inet_Addr, Port));
+   Bind_Socket (Listener, (Family_Inet, Bind_Addr, Port));
    Listen_Socket (Listener);
    Put_Line ("listening on port" & Port_Type'Image (Port)
      & " (up to" & Integer'Image (Max_Clients) & " concurrent clients)");
+
+   --  Discovery: enumerate every model present on this system (metadata only,
+   --  no weights loaded), so it is clear what is available and which is active.
+   --  The active model is still the one given by QWEN_MODEL_PATH; selecting a
+   --  different one at runtime is a separate step.
+   declare
+      use type LLM_Catalog.Model_Status;
+      Catalog : constant LLM_Catalog.Entry_Vectors.Vector := LLM_Catalog.Discover;
+      Runnable : Natural := 0;
+   begin
+      Put_Line ("models available on this system (roots: "
+        & LLM_Catalog.Roots_Description & "):");
+      for E of Catalog loop
+         if E.Status = LLM_Catalog.Supported then
+            Runnable := Runnable + 1;
+         end if;
+         Put_Line ("  " & LLM_Catalog.Describe (E));
+      end loop;
+      Put_Line ("  -->" & Runnable'Image & " runnable; active:" & Model_Path);
+   exception
+      when others =>
+         Put_Line ("model discovery skipped (non-fatal).");
+   end;
 
    loop
       declare

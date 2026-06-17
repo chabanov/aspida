@@ -4,6 +4,7 @@
 ---------------------------------------------------------------------
 
 with Ada.Finalization;
+with System;
 
 package LLM_Tensor is
 
@@ -32,6 +33,11 @@ package LLM_Tensor is
    -- Element access by flat index (for loops)
    function Get_Flat (T : Tensor; I : Integer) return Float;
    procedure Set_Flat (T : in out Tensor; I : Integer; Value : Float);
+
+   --  Address of the contiguous flat FP32 buffer (1-based element 1). For
+   --  zero-copy interop with C/GPU code: the data is a plain Float_Array, and
+   --  Float is bit-identical to C's float on this platform. Valid while T lives.
+   function Data_Address (T : Tensor) return System.Address;
 
    -- Display
    procedure Print (T : Tensor; Name : String := "");
