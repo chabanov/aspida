@@ -30,13 +30,14 @@ SESSION     ?= new
 PUBKEY_FILE := server_pub.hex
 
 # ── Project files ────────────────────────────────────────────────────
-MAIN_GPR    := aspida_cli.gpr
-SECURE_GPR  := server.gpr
-TEST_GPR    := tests/aspida_tests.gpr
+MAIN_GPR    := aspida_cli.gpr             # WIP HTTP-client-generator CLI (main.adb)
+SECURE_GPR  := server.gpr                 # the product: E2EE inference server + client
+CRYPTO_TEST_GPR := crypto_tests.gpr       # RFC KAT suite for the crypto library
+SECURE_TEST_GPR := secure_tests.gpr       # TCP transport + secure-channel integration
+LLM_TEST_GPR    := tests/llm_tests.gpr    # model-free LLM unit tests
 SRC_DIR     := src
 OBJ_DIR     := obj
 BIN         := $(OBJ_DIR)/main
-TEST_BIN    := $(OBJ_DIR)/test_runner
 
 # ── Toolchain ────────────────────────────────────────────────────────
 GPRBUILD    := $(GPRBUILD_BIN)/gprbuild
@@ -85,19 +86,20 @@ release: ## Build aspida CLI (optimized)
 	$(GPRBUILD) -P $(MAIN_GPR) $(GPR_FLAGS) -XBUILD=release
 
 .PHONY: tests
-tests: ## Build the test binary
-	$(GPRBUILD) -P $(TEST_GPR) $(GPR_FLAGS)
+tests: ## Build every test suite (crypto/E2EE + model-free LLM)
+	$(GPRBUILD) -P $(CRYPTO_TEST_GPR) $(GPR_FLAGS)
+	$(GPRBUILD) -P $(SECURE_TEST_GPR) $(GPR_FLAGS)
+	$(GPRBUILD) -P $(LLM_TEST_GPR) $(GPR_FLAGS)
 
 # ══════════════════════════════════════════════════════════════════════
 #  TEST
 # ══════════════════════════════════════════════════════════════════════
 
 .PHONY: test
-test: tests ## Run all unit tests
-	./$(TEST_BIN)
+test: test-crypto test-llm ## Run all model-free unit tests (crypto/E2EE + LLM)
 
 .PHONY: check
-check: build test ## Build + run tests (CI target)
+check: build test ## Build CLI + run model-free tests (CI target)
 
 # ══════════════════════════════════════════════════════════════════════
 #  SPARK (formal verification)
@@ -162,9 +164,10 @@ prove-flow: ## SPARK flow analysis (init/deps/aliasing) over the whole crypto li
 .PHONY: clean
 clean: ## Remove build artifacts
 	$(GPRCLEAN) -P $(MAIN_GPR) $(GPR_FLAGS) || true
-	$(GPRCLEAN) -P $(TEST_GPR) $(GPR_FLAGS) || true
 	$(GPRCLEAN) -P $(SECURE_GPR) $(GPR_FLAGS) || true
-	$(GPRCLEAN) -P tests/llm_tests.gpr $(GPR_FLAGS) || true
+	$(GPRCLEAN) -P $(CRYPTO_TEST_GPR) $(GPR_FLAGS) || true
+	$(GPRCLEAN) -P $(SECURE_TEST_GPR) $(GPR_FLAGS) || true
+	$(GPRCLEAN) -P $(LLM_TEST_GPR) $(GPR_FLAGS) || true
 	rm -rf $(OBJ_DIR)/tests
 
 .PHONY: distclean

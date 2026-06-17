@@ -461,8 +461,11 @@ package body LLM_GGUF is
          when GGML_TYPE_F32 => return N_Elements * 4;
          when GGML_TYPE_F16 => return N_Elements * 2;
          when GGML_TYPE_BF16 => return N_Elements * 2;
-         when GGML_TYPE_Q5_0 => return ((N_Elements + 31) / 32) * 64;
-         when GGML_TYPE_Q5_1 => return ((N_Elements + 31) / 32) * 64;
+         --  Legacy 32-element blocks: Q4_0 = f16 d + 16 qs (18 B);
+         --  Q5_0 = f16 d + 4 qh + 16 qs (22 B).
+         when GGML_TYPE_Q4_0 => return ((N_Elements + 31) / 32) * 18;
+         when GGML_TYPE_Q5_0 => return ((N_Elements + 31) / 32) * 22;
+         when GGML_TYPE_Q5_1 => return ((N_Elements + 31) / 32) * 24;
          --  K-quant super-block sizes (bytes per 256 elements), per llama.cpp:
          when GGML_TYPE_Q4_K => return (N_Elements / 256) * 144;
          when GGML_TYPE_Q5_K => return (N_Elements / 256) * 176;

@@ -1,7 +1,8 @@
 -- crypto.gpr — self-contained pure-Ada cryptography (E2EE for the engine)
 --
 -- Primitives are implemented to their standards and validated bit-exact
--- against official test vectors (RFC 8439, RFC 5869, RFC 7748, RFC 6070).
+-- against official test vectors (RFC 8439, RFC 5869, RFC 7748, RFC 4231,
+-- RFC 7914 §11).
 -- No third-party libraries.
 
 with "shared.gpr";

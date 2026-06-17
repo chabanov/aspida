@@ -27,7 +27,17 @@ package body LLM_GPU is
 
    function To_Fn is new Ada.Unchecked_Conversion (System.Address, MatVec_Fn);
 
+   --  Matches  void aspida_gpu_matmul(const void* w, long wbytes, int kind,
+   --                  int in, int out, int batch, const float* x, float* y)
+   type MatMul_Fn is access procedure
+     (W : System.Address; WB : Interfaces.C.long; Kind : int;
+      In_D : int; Out_D : int; Batch : int; X : System.Address; Y : System.Address)
+     with Convention => C;
+
+   function To_MM is new Ada.Unchecked_Conversion (System.Address, MatMul_Fn);
+
    Fn        : MatVec_Fn := null;
+   MM_Fn     : MatMul_Fn := null;
    Init_Done : Boolean := False;
 
    procedure Init is
@@ -62,6 +72,16 @@ package body LLM_GPU is
                Fn := To_Fn (A);
             end if;
          end;
+         declare
+            CS : chars_ptr := New_String ("aspida_gpu_matmul");
+            A  : System.Address;
+         begin
+            A := C_dlsym (H, CS);
+            Free (CS);
+            if A /= System.Null_Address then
+               MM_Fn := To_MM (A);
+            end if;
+         end;
       end;
    end Init;
 
@@ -83,5 +103,25 @@ package body LLM_GPU is
       Fn (W_Addr, Interfaces.C.long (W_Bytes), int (Kind),
           int (In_Dim), int (Out_Dim), X, Y);
    end MatVec;
+
+   function Has_MatMul return Boolean is
+   begin
+      Init;
+      return MM_Fn /= null;
+   end Has_MatMul;
+
+   procedure MatMul
+     (W_Addr  : System.Address;
+      W_Bytes : Long_Long_Integer;
+      Kind    : Integer;
+      In_Dim  : Integer;
+      Out_Dim : Integer;
+      Batch   : Integer;
+      X       : System.Address;
+      Y       : System.Address) is
+   begin
+      MM_Fn (W_Addr, Interfaces.C.long (W_Bytes), int (Kind),
+             int (In_Dim), int (Out_Dim), int (Batch), X, Y);
+   end MatMul;
 
 end LLM_GPU;

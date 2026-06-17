@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Aspida — encrypted inference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Philosopher:ital,wght@0,400;0,700;1,400;1,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="view-demo">
+<header class="topbar">
+  <div class="brand">
+    <span class="logo"><svg class="ico-logo" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5 19.5 5.7V11c0 4.7-3.2 8-7.5 9.5C7.7 19 4.5 15.7 4.5 11V5.7L12 2.5Z"/><path d="M8.7 12l2.4 2.4L15.5 9.4"/></svg></span>
+    <div>
+      <div class="brand-name">ASPIDA</div>
+      <div class="brand-sub">end-to-end encrypted inference · our own engine · our own crypto</div>
+    </div>
+  </div>
+  <nav class="topnav" id="topnav">
+    <button type="button" data-view="demo" class="active">Demo</button>
+    <button type="button" data-view="docs">Docs</button>
+  </nav>
+  <div class="status" id="status" title="connection status">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">not connected</span>
+  </div>
+</header>
+
+<!-- framing hero (demo view; hidden on mobile + docs view) -->
+<section class="hero" id="hero">
+  <div class="hero-inner">
+    <h1>Private by design. <span class="accent">Proven on the wire.</span></h1>
+    <p class="hero-sub">End-to-end encrypted inference — our own engine, our own cryptography, built
+      entirely from scratch. Your words are sealed before they leave the browser; the network only
+      ever sees ciphertext. Watch it happen, live.</p>
+    <div class="hero-chips">
+      <span class="hchip">Sealed end to end</span>
+      <span class="hchip">No third-party crypto or ML libraries</span>
+      <span class="hchip">Streamed live · many sessions at once</span>
+    </div>
+  </div>
+</section>
+
+<!-- mobile-only tab switcher (hidden on desktop) -->
+<nav class="tabbar" id="tabbar">
+  <button type="button" data-tab="chat" class="active"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v11H8l-4 4V4Z"/></svg> Chat<span class="badge" id="chatBadge" hidden></span></button>
+  <button type="button" data-tab="wire"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9.5" rx="2"/><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/></svg> Crypto</button>
+  <button type="button" data-tab="docs"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h8l4 4v14H7Z"/><path d="M15 3v4h4"/><path d="M9.5 13h5M9.5 16.5h5"/></svg> Docs</button>
+</nav>
+
+<main class="layout">
+  <!-- ========================= CHAT ========================= -->
+  <section class="panel chat">
+    <div class="panel-head">
+      <div class="ph-title">
+        <h2>Chat</h2>
+        <span class="sub">your words, sealed before they leave the browser</span>
+      </div>
+      <div class="meta">
+        <span class="pill" id="modelPill" title="inference backend">engine: —</span>
+        <span class="pill mono" id="ratePill" title="decode speed">0 tok/s</span>
+      </div>
+    </div>
+    <div class="messages" id="messages"></div>
+    <form class="composer" id="composer" autocomplete="off">
+      <input id="input" placeholder="Type a message…" disabled>
+      <button id="send" type="submit" disabled aria-label="Send">↑</button>
+    </form>
+  </section>
+
+  <!-- ===================== CRYPTO / WIRE ==================== -->
+  <section class="panel wire">
+    <div class="panel-head">
+      <div class="ph-title">
+        <h2>On the wire</h2>
+        <span class="sub">everything the network sees — and it's only ciphertext</span>
+      </div>
+      <label class="toggle" title="show only what an operator/provider can observe">
+        <input type="checkbox" id="operatorView">
+        <span>server view</span>
+      </label>
+    </div>
+
+    <div class="opbanner" id="opbanner">operator view — plaintext hidden; only ciphertext is observable on the wire.</div>
+
+    <!-- handshake ladder -->
+    <div class="card">
+      <div class="card-title">
+        <span class="step-no">1</span>
+        Handshake
+        <span class="muted">authenticated key exchange · forward secrecy</span>
+      </div>
+      <div class="handshake" id="handshake">
+        <div class="hs-col"><div class="hs-who">YOU · browser</div></div>
+        <div class="hs-col"><div class="hs-who">SERVER</div></div>
+        <ol class="hs-steps" id="hsSteps"></ol>
+      </div>
+      <div class="binding" id="bindingBox" hidden>
+        <div class="kv"><span class="k">cipher</span> <code id="cipher"></code></div>
+        <div class="kv"><span class="k">pinned server key</span> <code id="srvKey" class="trunc"></code> <span class="ok"><svg class="ico-sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7"/></svg> verified</span></div>
+        <div class="kv"><span class="k">channel binding</span> <code id="binding" class="trunc"></code> <span class="muted">matches both ends → no MITM</span></div>
+      </div>
+    </div>
+
+    <!-- live ciphertext -->
+    <div class="card grow">
+      <div class="card-title">
+        <span class="step-no">2</span>
+        Live records
+        <span class="muted">each AEAD-sealed</span>
+        <span class="counter" id="recCount">0 records</span>
+      </div>
+      <div class="legend">
+        <span class="lg out">→ to server</span>
+        <span class="lg in">← from server</span>
+        <span class="lg hs">handshake</span>
+      </div>
+      <div class="frames" id="frames"></div>
+    </div>
+  </section>
+</main>
+
+<!-- ========================= DOCS ========================= -->
+<section class="docs" id="docs">
+ <article class="doc">
+  <header class="doc-hero">
+    <h1>Aspida API &amp; encryption</h1>
+    <p>How a client talks to the Aspida inference server, and how every byte on the wire stays sealed.
+       The transport, handshake, encryption and session layer are built from scratch in Ada/SPARK —
+       with the cryptographic core machine-checked in SPARK — and no third-party crypto or ML
+       libraries. The model engine is ours too: an Ada core driving our own GPU kernels. Our engine.
+       Our cryptography. Private by design.</p>
+  </header>
+
+  <section class="doc-section">
+    <h2>1 · What Aspida gives you</h2>
+    <p>Aspida is <strong>end-to-end encrypted inference</strong> — built on its own engine and its
+       own cryptography, with no third-party crypto libraries and no external services. The cryptography
+       and transport are written from the ground up in Ada and SPARK; the model engine is an Ada core
+       that drives our own GPU kernels. All of it is ours.</p>
+    <div class="ok-box"><div class="bx-h">Encrypted end to end</div>
+      <ul>
+        <li>Your prompt is sealed inside your browser before it ever leaves the device.</li>
+        <li>The network, the relay and the hosting provider only ever see ciphertext.</li>
+        <li><strong>Forward secrecy</strong> — captured traffic stays unreadable into the future.</li>
+        <li>The server is authenticated against a pinned key — no man-in-the-middle.</li>
+        <li>Conversation history can be sealed at rest under its own separate key.</li>
+        <li>Streamed token-by-token, with many sessions served at once by our own batching engine.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="doc-section">
+    <h2>2 · Transport &amp; endpoints</h2>
+    <p>A browser cannot open raw TCP, so a thin <strong>bridge</strong> relays a WebSocket to the
+       server's TCP socket — seeing only ciphertext. A native client may skip the bridge and speak
+       TCP directly.</p>
+    <table class="doc-table">
+      <thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /serverkey</code></td><td>The server's pinned static public key (hex). Pin this in the client.</td></tr>
+        <tr><td><code>GET /</code>, <code>/app.js</code>, …</td><td>Static web client (this demo).</td></tr>
+        <tr><td><code>WS /ws</code></td><td>WebSocket ⇄ TCP relay to the server (the encrypted channel rides inside it).</td></tr>
+        <tr><td><code>TCP :8765</code></td><td>Direct secure-channel socket for native clients (no bridge).</td></tr>
+      </tbody>
+    </table>
+    <p>Every message — handshake frame or sealed record — is a length-prefixed frame:</p>
+    <pre><code>[ 4 bytes, big-endian length N ][ N bytes payload ]</code></pre>
+  </section>
+
+  <section class="doc-section">
+    <h2>3 · Handshake</h2>
+    <p>A single round trip establishes the channel. The client and server exchange ephemeral public
+       keys and derive a fresh set of per-session keys:</p>
+    <ul class="doc-list">
+      <li><strong>Server authentication</strong> — the server is bound to its <em>pinned</em> public
+          key; the client rejects any other, so there is no man-in-the-middle.</li>
+      <li><strong>Forward secrecy</strong> — ephemeral keys on both sides mean recorded traffic stays
+          secret even if a long-term key later leaks.</li>
+      <li><strong>Channel binding</strong> — both ends independently derive an identical binding value;
+          a mismatch aborts the session.</li>
+    </ul>
+    <p class="dev-note">The exact key-schedule construction is withheld while the technology is in development.</p>
+  </section>
+
+  <section class="doc-section">
+    <h2>4 · Record encryption</h2>
+    <p>After the handshake, every record is sealed with <strong>authenticated encryption (AEAD)</strong>.
+       Each direction uses its own key and a unique, non-repeating nonce, and a per-record authentication
+       tag means any tampering makes decryption fail — so both ends reject altered bytes.</p>
+    <p class="dev-note">Cipher selection and construction specifics are withheld during development.</p>
+  </section>
+
+  <section class="doc-section">
+    <h2>5 · Protocol messages</h2>
+    <p>Inside each sealed record the <strong>first plaintext byte is a tag</strong>; the rest is the
+       UTF-8 payload.</p>
+    <table class="doc-table">
+      <thead><tr><th>Tag</th><th>Byte</th><th>Dir</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>Session</code></td><td><code>'s'</code></td><td>↔</td><td>Client: select/resume a session (id, or empty = new). Server: the assigned session id.</td></tr>
+        <tr><td><code>Prompt</code></td><td><code>'p'</code></td><td>→</td><td>The user message (UTF-8). Triggers generation.</td></tr>
+        <tr><td><code>Prefill</code></td><td><code>'.'</code></td><td>←</td><td>Progress tick while the prompt is being ingested.</td></tr>
+        <tr><td><code>Token</code></td><td><code>'t'</code></td><td>←</td><td>One generated token piece (UTF-8), streamed live.</td></tr>
+        <tr><td><code>Done</code></td><td><code>'!'</code></td><td>←</td><td>Generation finished.</td></tr>
+        <tr><td><code>Error</code></td><td><code>'e'</code></td><td>←</td><td>Error message (UTF-8).</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="doc-section">
+    <h2>6 · A full session</h2>
+    <p>A session is a short exchange of messages. Your client <strong>encrypts every message before
+       it is sent</strong> and decrypts every reply, so the readable text below is only what your own
+       code sees <em>locally</em>. On the network there is nothing but ciphertext (§4).</p>
+    <pre><code>1.  pin the server's public key      (GET /serverkey)
+2.  open the channel + handshake     (§3)
+3.  →  start a session               server replies with a session id
+4.  →  "What is the capital of France?"     ← your prompt
+5.  ←  "The"  "capital"  "is"  "Paris" …    ← reply, streamed token by token
+6.  ←  done                          reuse the channel for the next turn</code></pre>
+    <p>Those same words, as they actually travel on the wire — sealed and unreadable:</p>
+    <pre><code>→  a3 f9 1c 02 7b e4 55 90 1a 2c d6 …   your prompt (sealed)
+←  2f 75 ff 0a 53 1d 4a a0 6b f9 8e …   each token  (sealed)</code></pre>
+    <p class="dev-note">Only your browser and the server ever hold the keys. The relay, the network
+       and the hosting provider see only these sealed bytes — never your words. The plaintext above
+       exists solely inside your own client.</p>
+    <p>Concurrent sessions are served together by the engine's <strong>continuous-batching</strong>
+       scheduler: many sessions share each GPU forward pass, so N users cost far less than N× the
+       time. Session history is held in memory for the life of the conversation, and can be sealed
+       at rest under a separate key.</p>
+  </section>
+
+  <section class="doc-section">
+    <h2>7 · Cryptography</h2>
+    <p>Built entirely from scratch — no OpenSSL, no libsodium — on standard, well-studied building
+       blocks:</p>
+    <div class="chips">
+      <span class="chip">elliptic-curve key exchange</span>
+      <span class="chip">authenticated encryption (AEAD)</span>
+      <span class="chip">key derivation</span>
+      <span class="chip">encrypted at rest</span>
+    </div>
+    <p class="dev-note">Specific algorithm choices and parameters are withheld while the technology
+       is in development.</p>
+    <p class="doc-foot">Engine: Llama / Qwen / Gemma backends from GGUF — GGUF loading, continuous
+       batching and orchestration in Ada/SPARK, driving our own custom GPU inference kernels. No
+       third-party inference libraries.</p>
+  </section>
+ </article>
+</section>
+
+<div class="explainer" id="explainer">
+  <strong>How to read this:</strong> nothing you type leaves the browser in the clear. On the left is
+  your real conversation; on the right, the actual bytes crossing the network — sealed, unreadable,
+  ours end to end. The relay and the server never hold anything but ciphertext. Flip
+  <em>server view</em> to see exactly what they see: nothing.
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

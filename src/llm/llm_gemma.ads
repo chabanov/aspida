@@ -1,14 +1,13 @@
 ---------------------------------------------------------------------
 -- LLM_Gemma — loader + forward pass for the gemma4 (Gemma 3n E4B) GGUF.
 --
--- Status: FOUNDATION + honest forward. The standard Gemma transformer is
--- implemented faithfully (RMSNorm 1+w, embedding scaling, QK-norm attention
--- with dual RoPE + sliding-window masking + logit soft-capping, GeGLU FFN
--- with sandwich norms, tied output + final soft-cap). The Gemma-3n-specific
--- PER-LAYER-EMBEDDING (inp_gate / proj / layer_output_scale) and the
--- SHARED-KV-LAYER mechanisms are implemented BEST-EFFORT and are NOT yet
--- validated against a reference; until that validation, generated text is
--- expected to be poor. Every uncertain step is marked with `-- TODO(gemma3n)`.
+-- Status: full gemma4 forward, matching llama.cpp's gemma4 reference. The
+-- standard Gemma transformer (RMSNorm 1+w, embedding scaling, QK-norm
+-- attention with dual RoPE + sliding-window masking + logit soft-capping,
+-- GeGLU FFN with sandwich norms, tied output + final soft-cap) and the
+-- Gemma-3n-specific PER-LAYER-EMBEDDING (inp_gate / proj / layer_output_scale)
+-- and SHARED-KV-LAYER mechanisms are all implemented. The non-PLE 12B/26B
+-- variant (MQA, V=K) is handled by the same path.
 --
 -- Reuses LLM_Tensor / LLM_Weight / LLM_RMSNorm / LLM_RoPE / LLM_Tokenizer and
 -- LLM_Qwen's streaming Token_Sink + Message types (no cyclic dependency:

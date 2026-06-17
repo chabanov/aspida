@@ -23,7 +23,15 @@ package LLM_RoPE is
       Sections   : Tensor;  -- [1, 4] = [11, 11, 10, 0] (set 0 for unused)
       Use_FF     : Boolean := False;  -- divide theta by per-freq factors?
       Freq_Factors : Tensor;          -- [1, Dim/2] proportional-RoPE divisors
+      Interleaved : Boolean := False; -- pair adjacent dims (2i,2i+1) instead of
+                                      --  split-half (i,i+d/2). Llama GGUF Q/K
+                                      --  weights are permuted for this layout;
+                                      --  gemma/qwen use split-half (False).
    end record;
+
+   -- Switch a params record to interleaved (NORM) rotation. Call for Llama,
+   -- whose converter permutes Q/K weights so adjacent pairs rotate together.
+   procedure Set_Interleaved (P : in out RoPE_Params; On : Boolean := True);
 
    -- Create RoPE params. Defaults are the Qwen 3.5 values; the loader passes
    -- the GGUF metadata values when present so other configs work unchanged.

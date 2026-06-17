@@ -1,9 +1,9 @@
--- genref.gpr — builds gpu/phase1/gen_ref.adb (Phase-1 GPU reference generator).
--- Only includes gpu/phase1 (NOT gpu/phase0, whose main needs the CUDA object).
+-- genref.gpr — builds gpu/experiments/phase1/gen_ref.adb (Phase-1 GPU reference generator).
+-- Only includes gpu/experiments/phase1 (NOT gpu/experiments/phase0, whose main needs the CUDA object).
 with "shared.gpr";
 
 project Genref is
-   for Source_Dirs use ("gpu/phase1", "src", "src/llm");
+   for Source_Dirs use ("gpu/experiments/phase1", "src", "src/llm");
    for Object_Dir use "obj";
    for Exec_Dir use "obj";
    for Main use ("gen_ref.adb");

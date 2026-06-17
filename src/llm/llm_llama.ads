@@ -23,9 +23,10 @@ package LLM_Llama is
 
    function Load (Path : String) return Llama_Model;
 
-   --  Decode core: greedy generation from a ready token-id sequence, stopping
-   --  at Stop_A or Stop_B (token ids; -1 disables).  Shared by Chat/Complete
-   --  and used by the unified engine-level chat layer.
+   --  Decode core: single-stream sampling from a ready token-id sequence
+   --  (sampler Params; greedy by default), stopping at Stop_A or Stop_B
+   --  (token ids; -1 disables). Used by Complete and direct callers;
+   --  concurrent Chat sessions go through the batched scheduler (Run_Request).
    function Generate
      (M : Llama_Model; Ids : LLM_Tokenizer.Token_Array;
       Stop_A, Stop_B : Integer := -1;
@@ -49,6 +50,16 @@ package LLM_Llama is
    function Vocab_Size  (M : Llama_Model) return Integer;
    function Dim         (M : Llama_Model) return Integer;
    function Block_Count (M : Llama_Model) return Integer;
+
+   --  Validate the batched forward (continuous-batching primitive): runs two
+   --  equal-length sequences both single-step and batched, returns the max
+   --  abs logit difference. ~0 (FP noise) means Forward_Batch is correct.
+   function Batch_Self_Test (M : Llama_Model) return Float;
+
+   --  Validate the continuous-batch scheduler: generate two prompts both
+   --  one-at-a-time and batched-together (greedy), report whether each
+   --  sequence's completion is identical. Returns a human-readable summary.
+   function Batch_Gen_Self_Test (M : Llama_Model; Max_New : Integer) return String;
 
 private
 

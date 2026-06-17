@@ -1,8 +1,8 @@
 ---------------------------------------------------------------------
--- LLM_Dequant — Q5_K_M and other GGML quantization → FP32
+-- LLM_Dequant — GGML quantization → FP32 (Q4_K/Q5_K/Q6_K/Q8_K, Q4_0/Q5_0/
+-- Q8_0, F16/BF16), shared across the Llama / Qwen / Gemma backends.
 --
--- Q5_K_M is the format used by parts of the Qwen 3.5 model.
--- Layout per Q5_K super-block of 256 elements (block_q5_K in llama.cpp):
+-- Example layout — Q5_K super-block of 256 elements (block_q5_K in llama.cpp):
 --   - d:      FP16 (2 bytes)   super-block scale
 --   - dmin:   FP16 (2 bytes)   super-block min
 --   - scales: 12 bytes         8 × 6-bit (scale, min) packed

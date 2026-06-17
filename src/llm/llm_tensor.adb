@@ -161,6 +161,11 @@ package body LLM_Tensor is
       T.Data.Ptr.Data (I) := Value;
    end Set_Flat;
 
+   function Data_Address (T : Tensor) return System.Address is
+   begin
+      return T.Data.Ptr.Data (1)'Address;
+   end Data_Address;
+
    --------------------------------------------------------------------
    -- Display
    --------------------------------------------------------------------

@@ -223,6 +223,7 @@ package body LLM_Weight is
       case W.Info.Kind is
          when LLM_GGUF.GGML_TYPE_Q4_K => return 0;
          when LLM_GGUF.GGML_TYPE_Q6_K => return 1;
+         when LLM_GGUF.GGML_TYPE_Q5_K => return 2;
          when others => return -1;
       end case;
    end Kind_Code;
