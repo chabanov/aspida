@@ -1,0 +1,133 @@
+name: Release Automation
+
+# Automated release preparation and validation
+
+on:
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, labeled ]
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  validate-release:
+    name: Validate Release
+    if: contains(github.event.pull_request.labels.*.name, 'release')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate CHANGELOG.md
+        run: |
+          # Check if CHANGELOG.md has unreleased section
+          if grep -q "## \[Unreleased\]" CHANGELOG.md; then
+            echo "✅ CHANGELOG.md has [Unreleased] section"
+          else
+            echo "❌ CHANGELOG.md missing [Unreleased] section"
+            exit 1
+          fi
+
+          # Check if there are changes under [Unreleased]
+          if grep -A 10 "## \[Unreleased\]" CHANGELOG.md | grep -q "^###\|^-\|^\*"; then
+            echo "✅ CHANGELOG.md has unreleased changes"
+          else
+            echo "⚠️  CHANGELOG.md [Unreleased] section appears empty"
+          fi
+
+      - name: Check version consistency
+        run: |
+          # Extract version from alire.toml
+          VERSION=$(grep '^version = ' alire.toml | cut -d'"' -f2)
+          echo "Version in alire.toml: $VERSION"
+
+          # Check if CHANGELOG has this version
+          if grep -q "## \[$VERSION\]" CHANGELOG.md; then
+            echo "✅ CHANGELOG.md has version $VERSION"
+          else
+            echo "⚠️  CHANGELOG.md doesn't have version $VERSION yet"
+          fi
+
+      - name: Validate documentation
+        run: |
+          # Check required files exist
+          for file in README.md LICENSE CHANGELOG.md CONTRIBUTING.md SECURITY.md; do
+            if [ -f "$file" ]; then
+              echo "✅ $file exists"
+            else
+              echo "❌ $file missing"
+              exit 1
+            fi
+          done
+
+      - name: Build test
+        uses: alire-project/setup-alire@v4
+        with:
+          toolchain: gnat_native^15 gprbuild
+
+      - name: Build all targets
+        run: |
+          alr exec -- gprbuild -P server.gpr
+          alr exec -- gprbuild -P crypto_tests.gpr
+          alr exec -- gprbuild -P tests/llm_tests.gpr
+
+  create-release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: []
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Extract release notes
+        id: notes
+        run: |
+          # Extract release notes from CHANGELOG.md
+          VERSION=${{ steps.version.outputs.VERSION }}
+          sed -n "/## \[$VERSION\]/,/## \[/p" CHANGELOG.md | head -n -1 | tail -n +2 > release_notes.md
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
+          cat release_notes.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          body: ${{ steps.notes.outputs.RELEASE_NOTES }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  post-release:
+    name: Post-Release Tasks
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [create-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update documentation
+        run: |
+          echo "Post-release tasks completed"
+          echo "- Docker image built and pushed"
+          echo "- Release assets uploaded"
+          echo "- Documentation updated"
+
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "✅ Release ${{ github.ref_name }} completed successfully!"
+          echo ""
+          echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}"

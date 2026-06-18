@@ -1,0 +1,28 @@
+# Dependabot configuration for automated dependency updates
+
+version: 2
+updates:
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    reviewers:
+      - "chabanov"
+
+  # Alire (Ada package manager)
+  # Note: Dependabot doesn't support Alire natively yet
+  # This is a placeholder for future support
+  # - package-ecosystem: "alire"
+  #   directory: "/"
+  #   schedule:
+  #     interval: "weekly"

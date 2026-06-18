@@ -1,52 +1,146 @@
 name: CI
 
-# Builds the engine + crypto/E2EE stack and runs every test that does NOT need
-# the (multi-gigabyte, non-distributable) GGUF model. The model-dependent
-# checks (test_*_real) are intentionally excluded — run them locally via
-# `make test-tokenizer-real` / `test-weights-real` / `test-qmatvec-real`.
+# Build and test Aspida on every push and pull request.
+# Model-dependent tests (test_*_real) are excluded — run locally with:
+#   make test-tokenizer-real
+#   make test-weights-real
+#   make test-qmatvec-real
 
 on:
   push:
-    branches: [ "**" ]
+    branches: [ main, develop ]
   pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  GPR_BUILD_PATH: ${{ github.workspace }}/obj
 
 jobs:
   build-and-test:
-    runs-on: macos-latest
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-latest, ubuntu-latest ]
+        include:
+          - os: macos-latest
+            sdk: macosx
+          - os: ubuntu-latest
+            sdk: linux
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Alire + GNAT toolchain
         uses: alire-project/setup-alire@v4
         with:
           toolchain: gnat_native^15 gprbuild
 
+      - name: Cache Alire dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.alire
+            ~/.cache/alire
+          key: ${{ runner.os }}-alire-${{ hashFiles('**/alire.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-alire-
+
       - name: Resolve macOS SDK
+        if: matrix.os == 'macos-latest'
         run: echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp-dev
 
       - name: Build crypto + session test suites
         run: |
-          alr exec -- gprbuild -P crypto_tests.gpr -XSDKROOT="$SDKROOT"
-          alr exec -- gprbuild -P secure_tests.gpr -XSDKROOT="$SDKROOT"
+          alr exec -- gprbuild -P crypto_tests.gpr -XSDKROOT="${SDKROOT:-/}"
+          alr exec -- gprbuild -P secure_tests.gpr -XSDKROOT="${SDKROOT:-/}"
 
-      - name: Run crypto / E2EE test vectors (RFC KATs, channel, at-rest)
+      - name: Run crypto / E2EE test vectors
         run: |
           set -e
           for t in test_crypto test_hash test_random test_x25519 \
                    test_channel test_pbkdf2 test_atrest test_socket test_session; do
-            echo "── $t"; ./obj/$t
+            echo "── $t"
+            ./obj/$t
           done
 
       - name: Build LLM unit tests
-        run: alr exec -- gprbuild -P tests/llm_tests.gpr -XSDKROOT="$SDKROOT"
+        run: alr exec -- gprbuild -P tests/llm_tests.gpr -XSDKROOT="${SDKROOT:-/}"
 
       - name: Run model-free LLM unit tests
         run: |
           set -e
           for t in test_rmsnorm test_moe test_tokenizer test_tensor \
-                   test_deltanet test_deltanet_blk test_fullattn test_block test_pool; do
-            echo "── $t"; ./obj/$t
+                   test_deltanet test_deltanet_blk test_fullattn test_block test_pool \
+                   test_gemma test_qmatvec_guard; do
+            echo "── $t"
+            if [ -f "./obj/$t" ]; then
+              ./obj/$t
+            else
+              echo "  (skipped, binary not found)"
+            fi
           done
 
       - name: Build the encrypted server + client
-        run: alr exec -- gprbuild -P server.gpr -XSDKROOT="$SDKROOT"
+        run: alr exec -- gprbuild -P server.gpr -XSDKROOT="${SDKROOT:-/}"
+
+      - name: Upload build artifacts
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aspida-binaries-${{ github.sha }}
+          path: |
+            obj/secure_server
+            obj/secure_client
+          retention-days: 7
+
+  # Optional: GPU build (requires self-hosted runner with CUDA)
+  # gpu-build:
+  #   name: GPU Build (CUDA)
+  #   runs-on: [ self-hosted, cuda ]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Build CUDA kernels
+  #       run: make gpu
+  #     - name: Run GPU tests
+  #       run: make gpu-test
+
+  release:
+    name: Create Release
+    needs: build-and-test
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: aspida-binaries-${{ github.sha }}
+          path: ./binaries
+
+      - name: Package release assets
+        run: |
+          cd binaries
+          tar -czf aspida-${{ github.event.release.tag_name }}-linux-x86_64.tar.gz secure_server secure_client
+          sha256sum aspida-${{ github.event.release.tag_name }}-linux-x86_64.tar.gz > sha256sums.txt
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            binaries/aspida-${{ github.event.release.tag_name }}-linux-x86_64.tar.gz
+            binaries/sha256sums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

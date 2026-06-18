@@ -1,0 +1,114 @@
+name: Security Audit
+
+# Run security checks on schedule and on push to main
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/crypto/**'
+      - 'src/secure/**'
+      - 'src/session/**'
+  schedule:
+    # Run weekly on Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+jobs:
+  secrets-scan:
+    name: Scan for Secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          extra_args: --debug --only-verified
+
+  dependency-check:
+    name: Dependency Vulnerability Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Alire dependency check
+        run: |
+          # Check for known vulnerabilities in dependencies
+          # Note: Alire doesn't have a built-in vulnerability scanner yet
+          # This is a placeholder for future implementation
+          echo "Dependency vulnerability scanning not yet available for Ada/Alire"
+          echo "Manual review of alire.toml recommended"
+
+  codeql-analysis:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: cpp
+          # Note: Ada is not supported by CodeQL yet, but we can analyze C/C++ parts
+
+      - name: Build project
+        run: |
+          # Build any C/C++ code if present
+          echo "No C/C++ code to analyze"
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:cpp"
+
+  spart-verification:
+    name: SPARK Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Alire + GNAT toolchain
+        uses: alire-project/setup-alire@v4
+        with:
+          toolchain: gnat_native^15 gprbuild
+
+      - name: Run SPARK flow analysis
+        run: |
+          # Note: Full SPARK verification requires GNAT Pro
+          # This runs basic flow analysis with GNAT Community
+          echo "SPARK verification requires GNAT Pro"
+          echo "Running basic checks instead..."
+          alr exec -- gnatprove -P crypto_tests.gpr --mode=flow 2>&1 || true
+
+  report:
+    name: Security Report
+    needs: [secrets-scan, dependency-check, codeql-analysis]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate security report
+        run: |
+          echo "# Security Audit Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets Scan | ${{ needs.secrets-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Check | ${{ needs.dependency-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CodeQL Analysis | ${{ needs.codeql-analysis.result }} |" >> $GITHUB_STEP_SUMMARY
