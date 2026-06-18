@@ -137,7 +137,7 @@ jobs:
           sha256sum aspida-${{ github.event.release.tag_name }}-linux-x86_64.tar.gz > sha256sums.txt
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             binaries/aspida-${{ github.event.release.tag_name }}-linux-x86_64.tar.gz
