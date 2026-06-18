@@ -4,6 +4,7 @@
 
 with JSON;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
+with LLM_Catalog;
 
 package body OpenAI is
 
@@ -32,7 +33,10 @@ package body OpenAI is
             end;
          end loop;
          R.Model      := To_Unbounded_String (JSON.As_String (JSON.Get (V, "model"), "aspida"));
-         R.Max_Tokens := JSON.As_Int (JSON.Get (V, "max_tokens"), 256);
+         --  Omitted max_tokens means "as much as allowed" (OpenAI semantics):
+         --  default high and let the server cap bound it, instead of a low 256
+         --  that silently truncates normal answers.
+         R.Max_Tokens := JSON.As_Int (JSON.Get (V, "max_tokens"), 1_000_000);
          R.Stream     := JSON.As_Bool (JSON.Get (V, "stream"), False);
          --  Sampling: honour OpenAI fields (temperature default 1.0, top_p 1.0).
          R.Params.Temperature := JSON.As_Float (JSON.Get (V, "temperature"), 1.0);
@@ -47,7 +51,11 @@ package body OpenAI is
       end return;
    end Parse_Chat;
 
-   function Chat_Response (Model, Content : String) return String is
+   function Chat_Response
+     (Model, Content : String;
+      Prompt_Tokens, Completion_Tokens : Natural := 0;
+      Finish : String := "stop") return String
+   is
       Root    : constant JSON.Value_Ref := JSON.New_Object;
       Choices : constant JSON.Value_Ref := JSON.New_Array;
       Choice  : constant JSON.Value_Ref := JSON.New_Object;
@@ -58,11 +66,11 @@ package body OpenAI is
       JSON.Set (Msg, "content", JSON.Str (Content));
       JSON.Set (Choice, "index", JSON.Int (0));
       JSON.Set (Choice, "message", Msg);
-      JSON.Set (Choice, "finish_reason", JSON.Str ("stop"));
+      JSON.Set (Choice, "finish_reason", JSON.Str (Finish));
       JSON.Append (Choices, Choice);
-      JSON.Set (Usage, "prompt_tokens", JSON.Int (0));
-      JSON.Set (Usage, "completion_tokens", JSON.Int (0));
-      JSON.Set (Usage, "total_tokens", JSON.Int (0));
+      JSON.Set (Usage, "prompt_tokens", JSON.Int (Prompt_Tokens));
+      JSON.Set (Usage, "completion_tokens", JSON.Int (Completion_Tokens));
+      JSON.Set (Usage, "total_tokens", JSON.Int (Prompt_Tokens + Completion_Tokens));
       JSON.Set (Root, "id", JSON.Str (ID_Str));
       JSON.Set (Root, "object", JSON.Str ("chat.completion"));
       JSON.Set (Root, "created", JSON.Int (0));
@@ -93,19 +101,28 @@ package body OpenAI is
       return JSON.To_String (Root);
    end Chat_Chunk;
 
-   function Chat_Done_Chunk (Model : String) return String is
+   function Chat_Done_Chunk
+     (Model : String;
+      Prompt_Tokens, Completion_Tokens : Natural := 0;
+      Finish : String := "stop") return String
+   is
       Root    : constant JSON.Value_Ref := JSON.New_Object;
       Choices : constant JSON.Value_Ref := JSON.New_Array;
       Choice  : constant JSON.Value_Ref := JSON.New_Object;
+      Usage   : constant JSON.Value_Ref := JSON.New_Object;
    begin
       JSON.Set (Choice, "index", JSON.Int (0));
       JSON.Set (Choice, "delta", JSON.New_Object);
-      JSON.Set (Choice, "finish_reason", JSON.Str ("stop"));
+      JSON.Set (Choice, "finish_reason", JSON.Str (Finish));
       JSON.Append (Choices, Choice);
       JSON.Set (Root, "id", JSON.Str (ID_Str));
       JSON.Set (Root, "object", JSON.Str ("chat.completion.chunk"));
       JSON.Set (Root, "model", JSON.Str (Model));
       JSON.Set (Root, "choices", Choices);
+      JSON.Set (Usage, "prompt_tokens", JSON.Int (Prompt_Tokens));
+      JSON.Set (Usage, "completion_tokens", JSON.Int (Completion_Tokens));
+      JSON.Set (Usage, "total_tokens", JSON.Int (Prompt_Tokens + Completion_Tokens));
+      JSON.Set (Root, "usage", Usage);
       return JSON.To_String (Root);
    end Chat_Done_Chunk;
 
@@ -124,12 +141,68 @@ package body OpenAI is
       return JSON.To_String (Root);
    end Models_Response;
 
-   function Error_Response (Message : String) return String is
+   function Catalog_Response
+     (Active_Path : String; Switchable : Boolean) return String
+   is
+      use type LLM_Catalog.Model_Status;
+      Cat  : constant LLM_Catalog.Entry_Vectors.Vector := LLM_Catalog.Discover;
+      Root : constant JSON.Value_Ref := JSON.New_Object;
+      Data : constant JSON.Value_Ref := JSON.New_Array;
+   begin
+      for E of Cat loop
+         --  Only list things a user could pick: runnable models, plus
+         --  valid-but-unsupported architectures (greyed out by the client).
+         if E.Status = LLM_Catalog.Supported
+           or else E.Status = LLM_Catalog.Unsupported
+         then
+            declare
+               M    : constant JSON.Value_Ref := JSON.New_Object;
+               Path : constant String := To_String (E.Path);
+               MiB  : constant Long_Long_Integer := 1024 * 1024;
+            begin
+               JSON.Set (M, "id", JSON.Str (Path));
+               JSON.Set (M, "object", JSON.Str ("model"));
+               JSON.Set (M, "created", JSON.Int (0));
+               JSON.Set (M, "owned_by", JSON.Str ("aspida"));
+               JSON.Set (M, "name", JSON.Str (To_String (E.Name)));
+               JSON.Set (M, "arch", JSON.Str (To_String (E.Arch)));
+               JSON.Set (M, "quant", JSON.Str (To_String (E.Quant)));
+               JSON.Set (M, "params", JSON.Str (To_String (E.Params)));
+               JSON.Set (M, "size", JSON.Str (LLM_Catalog.Human_Size (E.Size)));
+               JSON.Set (M, "size_mb", JSON.Int (Integer (E.Size / MiB)));
+               JSON.Set (M, "supported",
+                 JSON.Bool (E.Status = LLM_Catalog.Supported));
+               JSON.Set (M, "active", JSON.Bool (Path = Active_Path));
+               JSON.Append (Data, M);
+            end;
+         end if;
+      end loop;
+      JSON.Set (Root, "object", JSON.Str ("list"));
+      JSON.Set (Root, "switchable", JSON.Bool (Switchable));
+      JSON.Set (Root, "data", Data);
+      return JSON.To_String (Root);
+   end Catalog_Response;
+
+   function Select_Result
+     (OK : Boolean; Reload : Boolean; Message : String) return String
+   is
+      Root : constant JSON.Value_Ref := JSON.New_Object;
+   begin
+      JSON.Set (Root, "ok", JSON.Bool (OK));
+      JSON.Set (Root, "reload", JSON.Bool (Reload));
+      JSON.Set (Root, "message", JSON.Str (Message));
+      return JSON.To_String (Root);
+   end Select_Result;
+
+   function Error_Response (Message : String; Code : String := "") return String is
       Root : constant JSON.Value_Ref := JSON.New_Object;
       Err  : constant JSON.Value_Ref := JSON.New_Object;
    begin
       JSON.Set (Err, "message", JSON.Str (Message));
       JSON.Set (Err, "type", JSON.Str ("invalid_request_error"));
+      if Code /= "" then
+         JSON.Set (Err, "code", JSON.Str (Code));
+      end if;
       JSON.Set (Root, "error", Err);
       return JSON.To_String (Root);
    end Error_Response;

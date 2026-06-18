@@ -15,6 +15,7 @@ lib/
 /sessions/
 /blog/
 /docs/
+.claude
 
 
 *.log
@@ -26,6 +27,8 @@ alire/
 
 # Models (large binary files)
 models/
+*.gguf
+*.model
 
 # Snaga local state
 .snaga/

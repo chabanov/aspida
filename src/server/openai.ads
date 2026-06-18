@@ -23,18 +23,39 @@ package OpenAI is
    --  Parse a request body. May raise JSON.Parse_Error on malformed input.
    function Parse_Chat (Body_JSON : String) return Request;
 
-   --  Non-streaming chat.completion response.
-   function Chat_Response (Model, Content : String) return String;
+   --  Non-streaming chat.completion response, with OpenAI-standard usage and
+   --  finish_reason ("stop" = natural end-of-turn, "length" = hit the token
+   --  cap). Prompt/Completion are the real token counts.
+   function Chat_Response
+     (Model, Content : String;
+      Prompt_Tokens, Completion_Tokens : Natural := 0;
+      Finish : String := "stop") return String;
 
    --  Streaming: one chat.completion.chunk per token piece, then a final
-   --  stop chunk. (The proxy wraps each in an SSE "data: ...\n\n" line.)
+   --  chunk carrying finish_reason + usage. (The proxy wraps each in an SSE
+   --  "data: ...\n\n" line.)
    function Chat_Chunk      (Model, Piece : String; First : Boolean) return String;
-   function Chat_Done_Chunk (Model : String) return String;
+   function Chat_Done_Chunk
+     (Model : String;
+      Prompt_Tokens, Completion_Tokens : Natural := 0;
+      Finish : String := "stop") return String;
 
-   --  /v1/models list response.
+   --  /v1/models list response (single active model).
    function Models_Response (Model_Id : String) return String;
 
-   --  Error envelope.
-   function Error_Response (Message : String) return String;
+   --  /v1/models list of EVERY model discovered on this system (via
+   --  LLM_Catalog), each with extra aspida fields: name, arch, quant, params,
+   --  size, supported, active. Active_Path marks the currently-loaded model;
+   --  Switchable says whether this server can change models at runtime.
+   function Catalog_Response
+     (Active_Path : String; Switchable : Boolean) return String;
+
+   --  Result of a model-selection request.
+   function Select_Result
+     (OK : Boolean; Reload : Boolean; Message : String) return String;
+
+   --  Error envelope. Code is the OpenAI machine-readable error code (e.g.
+   --  "context_length_exceeded"); omitted => only the human message + type.
+   function Error_Response (Message : String; Code : String := "") return String;
 
 end OpenAI;

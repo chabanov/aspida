@@ -26,11 +26,16 @@ package LLM_Engine is
    subtype Sampling is LLM_Sampler.Params;
    Greedy : LLM_Sampler.Params renames LLM_Sampler.Greedy;
 
+   --  Per-generation accounting (token counts + truncated flag) for
+   --  OpenAI-standard usage/finish_reason; pass an access to receive it.
+   subtype Gen_Stats is LLM_Qwen.Gen_Stats;
+
    function Chat
      (E : Engine; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink : access LLM_Qwen.Token_Sink'Class := null;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access Gen_Stats := null) return String;
 
    function Vocab_Size (E : Engine) return Integer;
    function Arch_Name  (E : Engine) return String;

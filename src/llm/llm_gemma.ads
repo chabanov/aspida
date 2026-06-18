@@ -31,7 +31,8 @@ package LLM_Gemma is
      (M : Gemma_Model; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink : access LLM_Qwen.Token_Sink'Class := null;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access LLM_Qwen.Gen_Stats := null) return String;
 
    --  Raw greedy completion (BOS + prompt, no turn template) — for validation.
    function Complete

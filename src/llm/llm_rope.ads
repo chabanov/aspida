@@ -27,6 +27,18 @@ package LLM_RoPE is
                                       --  split-half (i,i+d/2). Llama GGUF Q/K
                                       --  weights are permuted for this layout;
                                       --  gemma/qwen use split-half (False).
+      Freq_Scale : Float := 1.0;      -- linear position interpolation (PI):
+                                      --  theta := pos*Freq_Scale/base^(...).
+                                      --  1.0 = none; 1/factor extends context
+                                      --  (== llama.cpp rope_freq_scale).
+      --  YaRN (NTK-by-parts): per-dimension blend of extrapolation (theta) and
+      --  interpolation (Freq_Scale*theta) across [Corr_Low, Corr_High], plus an
+      --  attention-temperature M_Scale on cos/sin. M_Scale=1 & Yarn_On=False is
+      --  exactly standard RoPE (no-op).
+      Yarn_On   : Boolean := False;
+      Corr_Low  : Float   := 0.0;
+      Corr_High : Float   := 0.0;
+      M_Scale   : Float   := 1.0;
    end record;
 
    -- Switch a params record to interleaved (NORM) rotation. Call for Llama,
@@ -43,6 +55,26 @@ package LLM_RoPE is
    -- Enable proportional RoPE: theta_i := theta_i / FF(i)  (Gemma full-attn
    -- layers use this with rope_freqs.weight). FF must hold Dim/2 values.
    procedure Set_Freq_Factors (P : in out RoPE_Params; FF : Tensor);
+
+   -- Linear RoPE scaling (Position Interpolation). Factor > 1 stretches the
+   -- trained context by that ratio (Freq_Scale := 1/Factor). Factor <= 1 is a
+   -- no-op. This is the well-understood baseline; YaRN is a future refinement.
+   procedure Set_Linear_Scale (P : in out RoPE_Params; Factor : Float);
+
+   -- NTK-aware RoPE scaling: scale the frequency base instead of positions,
+   -- base' := base * Factor**(Dim/(Dim-2)). Preserves high-frequency detail
+   -- better than linear PI, so it degrades less when extending context. No-op
+   -- for Factor <= 1. (A documented stepping stone toward full YaRN.)
+   procedure Set_NTK_Scale (P : in out RoPE_Params; Factor : Float);
+
+   -- Full YaRN scaling (per the llama.cpp rope_yarn reference): extrapolate
+   -- high-frequency dims, interpolate low-frequency dims, ramp between the
+   -- correction dims derived from Beta_Fast/Beta_Slow, and apply the attention
+   -- temperature M_Scale = 1 + 0.1*ln(Factor). N_Ctx_Orig is the model's
+   -- original trained context. No-op for Factor <= 1.
+   procedure Set_Yarn_Scale
+     (P : in out RoPE_Params; Factor : Float; N_Ctx_Orig : Integer;
+      Beta_Fast : Float := 32.0; Beta_Slow : Float := 1.0);
 
    -- Apply rotary embedding to input tensor
    -- X: query or key tensor [1, head_dim] (single head, single token)

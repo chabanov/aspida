@@ -48,6 +48,12 @@ package LLM_Tokenizer is
    -- (e.g. "<|im_start|>", "<|im_end|>") that byte-level Encode would split.
    function Token_To_Id (T : Tokenizer; Piece : String) return Integer;
 
+   -- GPT-2 byte-level representation of a raw byte string: each byte mapped
+   -- through the byte<->unicode bijection and concatenated. Use this to EXPORT
+   -- a learned vocabulary in exactly the form byte-level Load_From_GGUF expects
+   -- (tokenizer.ggml.model = "gpt2"), so the trained tokenizer round-trips.
+   function Byte_Level_Piece (Raw : String) return String;
+
 private
 
    type Tokenizer_Data;

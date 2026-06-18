@@ -12,7 +12,8 @@ project Probe is
    for Exec_Dir use "obj";
    for Main use ("gguf_probe.adb", "gemma_probe.adb", "gemma_tok.adb",
                  "llama_probe.adb", "sampler_probe.adb", "q4k_probe.adb",
-                 "quant_probe.adb", "meta_dump.adb", "model_scan.adb");
+                 "quant_probe.adb", "meta_dump.adb", "model_scan.adb",
+                 "chat_probe.adb");
 
    package Compiler is
       for Default_Switches ("Ada") use ("-gnatwn", "-gnatX", "-g");

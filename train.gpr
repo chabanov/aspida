@@ -1,0 +1,32 @@
+-- train.gpr — from-scratch training core (autograd primitives + AdamW) and
+-- its self-test. Pure Ada/SPARK; no third-party ML libraries.
+--
+-- Build & run: gprbuild -P train.gpr -XSDKROOT=$(xcrun --show-sdk-path)
+--              ./obj/test_train
+
+with "shared.gpr";
+
+project Train is
+
+   for Source_Dirs use ("src/train", "tests/train", "src/llm", "tools");
+   for Object_Dir use "obj/train";
+   for Exec_Dir use "obj";
+   for Main use ("test_train.adb", "test_block.adb", "test_distill.adb",
+                 "test_distill_train.adb", "test_gguf.adb", "test_serve.adb",
+                 "test_teacher.adb", "test_scale.adb", "test_train_gpu.adb",
+                 "test_mha.adb", "test_ckpt.adb", "test_bpe.adb",
+                 "test_bpe_gguf.adb", "train_aspida.adb");
+
+   package Compiler is
+      for Default_Switches ("Ada") use Shared.Ada_O2;
+   end Compiler;
+
+   package Linker is
+      for Default_Switches ("Ada") use Shared.Linker_Switches;
+   end Linker;
+
+   package Binder is
+      for Default_Switches ("Ada") use ("-E");
+   end Binder;
+
+end Train;

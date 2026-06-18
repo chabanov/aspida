@@ -588,12 +588,14 @@ package body LLM_Gemma is
    function Decode
      (M : Gemma_Model; Prompt : LLM_Tokenizer.Token_Array;
       Max_New : Integer; Sink : access LLM_Qwen.Token_Sink'Class;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access LLM_Qwen.Gen_Stats := null) return String
    is
       Cap    : constant Integer := Integer'Max (1, Prompt'Length + Max_New);
       Cache  : KV_Cache (1 .. M.N_Blocks);
       Len    : Integer := 0;        -- positions consumed so far (= next Pos)
       Out_S  : Unbounded_String;
+      Hit_Stop : Boolean := False;  -- stopped on an end-of-turn token, not cap
       Logits : Tensor;
       Smp    : LLM_Sampler.Sampler := LLM_Sampler.Create (Params);
       Hist   : LLM_Sampler.History (1 .. Integer'Max (1, Max_New)) :=
@@ -654,8 +656,12 @@ package body LLM_Gemma is
                Ada.Text_IO.Put_Line ("  step" & Img (Step) & " -> tok " & Img (Tid)
                  & " [" & LLM_Tokenizer.Decode_One (M.Tok, Tid) & "]");
             end if;
-            exit when Tid = M.Eos or else Tid = M.EOT
-              or else (M.SOT >= 0 and then Tid = M.SOT);
+            if Tid = M.Eos or else Tid = M.EOT
+              or else (M.SOT >= 0 and then Tid = M.SOT)
+            then
+               Hit_Stop := True;
+               exit;
+            end if;
             --  Harmony: a reasoning channel (<|channel> .. <channel|>) is the
             --  model's private thinking; bracket tokens and their content are
             --  fed back to the model but never shown to the user.
@@ -680,6 +686,12 @@ package body LLM_Gemma is
          Free (Cache (L).K);
          Free (Cache (L).V);
       end loop;
+      if Stats /= null then
+         Stats.all := (Prompt_Tokens     => Prompt'Length,
+                       Completion_Tokens => N_Hist,
+                       Truncated         => not Hit_Stop,
+                       Overflow          => False);
+      end if;
       return To_String (Out_S);
    end Decode;
 
@@ -687,7 +699,8 @@ package body LLM_Gemma is
      (M : Gemma_Model; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink : access LLM_Qwen.Token_Sink'Class := null;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access LLM_Qwen.Gen_Stats := null) return String
    is
       use type LLM_Tokenizer.Token_Array;
       LF : constant Character := Character'Val (10);
@@ -737,7 +750,7 @@ package body LLM_Gemma is
    begin
       return Decode
         (M, One (M.Bos) & Conv_Ids (Conversation'First) & Gen_Prompt,
-         Max_New_Tokens, Sink, Params);
+         Max_New_Tokens, Sink, Params, Stats);
    end Chat;
 
    function Complete

@@ -35,6 +35,18 @@ package LLM_Qwen is
    procedure Emit (Sink : in out Token_Sink; Piece : String) is abstract;
    procedure Tick (Sink : in out Token_Sink) is null;
 
+   --  Per-generation accounting for OpenAI-standard usage + finish_reason.
+   --  Truncated = generation stopped on the token/context cap, not a natural
+   --  end-of-turn token (=> finish_reason "length" rather than "stop"). Lives
+   --  here so every backend and the engine can share it (as with the other
+   --  conversation types) without a circular dependency on LLM_Backend.
+   type Gen_Stats is record
+      Prompt_Tokens     : Natural := 0;
+      Completion_Tokens : Natural := 0;
+      Truncated         : Boolean := False;   -- stopped on the token cap
+      Overflow          : Boolean := False;   -- request refused: prompt > window
+   end record;
+
    -- Generate text from prompt (raw completion; no chat template, no stop).
    function Generate
      (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128;
@@ -61,7 +73,8 @@ package LLM_Qwen is
      (M : Qwen_Model; Conversation : Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink : access Token_Sink'Class := null;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access Gen_Stats := null) return String;
 
    -- Model params count (total, not activated)
    function Param_Count (M : Qwen_Model) return Long_Long_Integer;

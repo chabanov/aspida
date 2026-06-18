@@ -68,6 +68,15 @@ package body LLM_Tokenizer is
       return CP_UTF8 (Byte_CP (B));
    end Byte_To_Piece;
 
+   function Byte_Level_Piece (Raw : String) return String is
+      R : Unbounded_String;
+   begin
+      for C of Raw loop
+         Append (R, Byte_To_Piece (Character'Pos (C)));
+      end loop;
+      return To_String (R);
+   end Byte_Level_Piece;
+
    --  Invert: a UTF-8 string of GPT-2 code points -> original bytes.
    function Unmap_Bytes (S : String) return String is
       R : Unbounded_String;

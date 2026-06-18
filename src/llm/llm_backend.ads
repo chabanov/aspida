@@ -24,12 +24,16 @@ package LLM_Backend is
 
    --  Generate the assistant reply for a full conversation (system/user/
    --  assistant turns), streaming each piece via Sink, sampled with Params.
+   --  When Stats /= null it is filled with token counts and the stop reason
+   --  (for OpenAI-standard usage + finish_reason). Gen_Stats lives in LLM_Qwen
+   --  alongside the other shared conversation types (no circular dependency).
    function Chat
      (M              : Model_Backend;
       Conversation   : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink           : access LLM_Qwen.Token_Sink'Class := null;
-      Params         : LLM_Sampler.Params := LLM_Sampler.Greedy)
+      Params         : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats          : access LLM_Qwen.Gen_Stats := null)
       return String is abstract;
 
    function Vocab_Size  (M : Model_Backend) return Integer is abstract;

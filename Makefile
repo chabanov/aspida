@@ -70,8 +70,14 @@ server: ## Build the encrypted chat server + client (the ONLY chat path — no p
 	$(GPRBUILD) -P $(SECURE_GPR) $(GPR_FLAGS)
 
 .PHONY: serve
-serve: server ## Build + launch the encrypted server (set ASPIDA_STORE_PASSWORD to persist history)
-	./$(OBJ_DIR)/secure_server $(PORT)
+serve: server ## Build + launch the server; model switches auto-reload (Ctrl-C to stop)
+	@echo "serving on $(PORT) — runtime model switching enabled; Ctrl-C to stop"
+	@ASPIDA_AUTORELOAD=1; export ASPIDA_AUTORELOAD; \
+	while true; do \
+	  ./$(OBJ_DIR)/secure_server $(PORT); code=$$?; \
+	  if [ $$code -eq 75 ]; then echo "[serve] reloading with newly selected model…"; continue; fi; \
+	  exit $$code; \
+	done
 
 .PHONY: chat
 chat: server ## Open an interactive encrypted chat (needs a running `make serve`; SESSION=<id> to resume)
@@ -100,6 +106,18 @@ test: test-crypto test-llm ## Run all model-free unit tests (crypto/E2EE + LLM)
 
 .PHONY: check
 check: build test ## Build CLI + run model-free tests (CI target)
+
+.PHONY: train-test
+train-test: ## Build + run the from-scratch training-core self-tests (grad-check + distill + block)
+	$(GPRBUILD) -P train.gpr $(GPR_FLAGS)
+	./obj/test_train
+	./obj/test_block
+	./obj/test_distill
+	./obj/test_distill_train
+	./obj/test_gguf
+	./obj/test_serve
+	./obj/test_teacher
+	./obj/test_scale
 
 # ══════════════════════════════════════════════════════════════════════
 #  SPARK (formal verification)
