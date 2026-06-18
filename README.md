@@ -79,14 +79,23 @@ src/
 └── train/         — Training/distillation infrastructure
 ```
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full request lifecycle, backends,
+context management, security model, and configuration.
+
 ## API
 
 ### OpenAI-Compatible Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/chat/completions` | POST | Streaming chat completions (SSE) |
+| `/v1/chat/completions` | POST | Chat completions (non-stream + SSE streaming) |
 | `/v1/models` | GET | List available models |
+
+Responses follow the OpenAI schema: real `usage` (`prompt_tokens` /
+`completion_tokens` / `total_tokens`) and a correct `finish_reason` —
+`"stop"` for a natural end-of-turn, `"length"` when the token cap was hit (so a
+truncated reply is never reported as complete). Streaming emits a final chunk
+carrying `finish_reason` + `usage`. Client `max_tokens` is honored.
 
 ### Example Request
 
@@ -101,17 +110,55 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+> **Why `http://` and not `https://`?** The OpenAI-compatible endpoint is a
+> **local proxy** that binds `127.0.0.1` only. This hop is plaintext **on
+> loopback (the same machine)** — it never touches the network. The proxy then
+> seals every request into the AEAD-encrypted, pinned-key channel for the
+> **network** hop to the (possibly remote) server. So encryption is real and
+> end-to-end *on the wire*; the only plaintext is the same-machine loopback step
+> that exists for OpenAI-SDK compatibility. For full end-to-end with **no
+> plaintext anywhere** (the client performs the handshake itself), use the
+> native CLI (`secure_client`) or the browser client.
+
 ## Configuration
 
 ### Environment Variables
 
+**Model & serving**
+
 | Variable | Description |
 |----------|-------------|
-| `ASPIDA_GPU` | Enable GPU offload (any non-empty value) |
+| `QWEN_MODEL_PATH` | Active model GGUF (any supported architecture) |
 | `ASPIDA_MODELS_DIR` | Colon-separated paths to scan for GGUF models |
-| `ASPIDA_CLIENT_TOKEN` | Authentication token for API access |
-| `ASPIDA_BIND` | Bind address (default: 0.0.0.0) |
-| `QWEN_MODEL_PATH` | Path to default model GGUF |
+| `ASPIDA_GPU` | Enable GPU offload (any non-empty value) |
+| `ASPIDA_MAX_TOKENS` | Per-turn generation cap (default 2048) |
+| `ASPIDA_AUTORELOAD` | Allow runtime model switching (supervisor restart) |
+
+**Context window** (Llama backend)
+
+| Variable | Description |
+|----------|-------------|
+| `ASPIDA_CTX` | Served window (default 4096, clamped to the model's trained context) |
+| `ASPIDA_NO_CTX_SHIFT` | Disable context-shift ("infinite generation"); default on |
+| `ASPIDA_STRICT_CTX` | Return `context_length_exceeded` instead of trimming an over-long prompt |
+| `ASPIDA_ROPE_NTK` | NTK-aware context extension factor for an unscaled model |
+
+**Security & network**
+
+| Variable | Description |
+|----------|-------------|
+| `ASPIDA_CLIENT_TOKEN` | Require this shared-secret client auth token |
+| `ASPIDA_BIND` | Listener address (default `0.0.0.0`; e.g. `127.0.0.1` behind a proxy) |
+| `ASPIDA_RATE_MAX` / `ASPIDA_RATE_WINDOW` | New-connection rate limit (default off) |
+| `ASPIDA_IDLE_TIMEOUT` | Seconds before a silent connection is reclaimed (default 600) |
+
+**Sampling** (default greedy)
+
+| Variable | Description |
+|----------|-------------|
+| `ASPIDA_TEMP` / `ASPIDA_TOP_P` / `ASPIDA_TOP_K` | Temperature / nucleus / top-k |
+| `ASPIDA_REPEAT_PENALTY` / `ASPIDA_REPEAT_LAST_N` | Repetition penalty + window |
+| `ASPIDA_SEED` | RNG seed |
 
 ## Testing
 
@@ -135,6 +182,9 @@ make prove
 - **SPARK contracts** — Cryptographic core verified for absence of runtime errors
 - **Constant-time operations** — Timing-safe comparisons, secure memory wiping
 - **Forward secrecy** — Ephemeral key exchange per session
+- **Trust boundary** — Network traffic is AEAD-sealed end to end; the only
+  plaintext is the same-machine loopback hop on the OpenAI proxy (binds
+  `127.0.0.1` only). Native/browser clients have no plaintext hop at all.
 
 ## Performance
 
