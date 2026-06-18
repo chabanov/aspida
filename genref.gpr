@@ -3,7 +3,7 @@
 with "shared.gpr";
 
 project Genref is
-   for Source_Dirs use ("gpu/experiments/phase1", "src", "src/llm");
+   for Source_Dirs use ("gpu/experiments/phase1", "src/llm");
    for Object_Dir use "obj";
    for Exec_Dir use "obj";
    for Main use ("gen_ref.adb");
