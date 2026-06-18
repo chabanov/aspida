@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Alire + GNAT toolchain
-        uses: alire-project/setup-alire@v4
+        uses: alire-project/setup-alire@v6
         with:
           toolchain: gnat_native^15 gprbuild
 
