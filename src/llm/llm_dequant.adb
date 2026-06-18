@@ -692,6 +692,15 @@ package body LLM_Dequant is
                 & " is not a multiple of 256";
       end if;
 
+      --  The input vector must match the weight's in-dimension. Checks are
+      --  suppressed in this unit, so verify explicitly: otherwise a mismatched
+      --  X would read out of bounds (silent garbage) in the XL fill below.
+      if Numel (X) /= In_Dim then
+         raise Constraint_Error
+           with "QMatVec: input length" & Integer'Image (Numel (X))
+                & " /= weight in-dim" & Integer'Image (In_Dim);
+      end if;
+
       Row_Info.N_Dims := 2;
       Row_Info.Dims   := [Info.Dims (1), 1, 0, 0];
       BPR := Natural (LLM_GGUF.Tensor_Byte_Size (Row_Info));
