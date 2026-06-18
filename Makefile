@@ -30,7 +30,7 @@ SESSION     ?= new
 PUBKEY_FILE := server_pub.hex
 
 # ── Project files ────────────────────────────────────────────────────
-MAIN_GPR    := aspida_cli.gpr             # WIP HTTP-client-generator CLI (main.adb)
+MAIN_GPR    := legacy/aspida_cli.gpr      # legacy HTTP-client-generator CLI (main.adb)
 SECURE_GPR  := server.gpr                 # the product: E2EE inference server + client
 CRYPTO_TEST_GPR := crypto_tests.gpr       # RFC KAT suite for the crypto library
 SECURE_TEST_GPR := secure_tests.gpr       # TCP transport + secure-channel integration

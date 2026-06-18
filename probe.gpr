@@ -7,7 +7,7 @@ with "shared.gpr";
 
 project Probe is
 
-   for Source_Dirs use ("tools/probes", "src", "src/llm");
+   for Source_Dirs use ("tools/probes", "src/llm");
    for Object_Dir use "obj";
    for Exec_Dir use "obj";
    for Main use ("gguf_probe.adb", "gemma_probe.adb", "gemma_tok.adb",
