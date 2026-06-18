@@ -221,6 +221,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Inspired by [llama.cpp](https://github.com/ggerganov/llama.cpp)
 - Cryptographic primitives follow [RFC 8439](https://tools.ietf.org/html/rfc8439) (ChaCha20-Poly1305)
 
+## Further Reading
+
+- [What the Model Sees: The First Level Solved](https://snaga.ai/blog/what-the-model-sees-the-first-level-solved) — Deep dive into tokenization, context windows, and how LLMs process text
+
 ---
 
 **Note:** This project is under active development. APIs may change between versions.
