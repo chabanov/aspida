@@ -377,7 +377,8 @@ package body LLM_Qwen is
       Max_New_Tokens : Integer;
       Stop1, Stop2   : Integer;
       Sink           : access Token_Sink'Class;
-      Params         : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
+      Params         : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats          : access Gen_Stats := null) return String
    is
       Dim     : constant Integer := M.Model_Dim;
       Cap     : constant Integer :=
@@ -387,6 +388,8 @@ package body LLM_Qwen is
       Hist    : LLM_Sampler.History (1 .. Integer'Max (1, Max_New_Tokens)) :=
         (others => 0);
       N_Hist  : Natural := 0;
+      Produced : Natural := 0;       -- generated tokens (completion_tokens)
+      Hit_Stop : Boolean := False;   -- stopped on a stop token, not the cap
 
       --  Per-layer decode state (KV cache for full-attn, recurrent state +
       --  conv window for delta-net), threaded across tokens. One forward
@@ -446,7 +449,10 @@ package body LLM_Qwen is
             Best_Row : constant Integer := Tid + 1;   -- 1-based embedding row
          begin
             exit when Best_Row < 1 or else Best_Row > M.Vocab_Sz;
-            exit when Tid = Stop1 or else Tid = Stop2;     -- stop tokens
+            if Tid = Stop1 or else Tid = Stop2 then         -- natural stop
+               Hit_Stop := True;
+               exit;
+            end if;
             declare
                Piece : constant String := LLM_Tokenizer.Decode_One (M.Tok, Tid);
             begin
@@ -455,12 +461,19 @@ package body LLM_Qwen is
                   Sink.Emit (Piece);
                end if;
             end;
+            Produced := Produced + 1;
             N_Hist := N_Hist + 1; Hist (N_Hist) := Tid;
             exit when Step = Max_New_Tokens;
             Last_Logits := Decode (Best_Row);
          end;
       end loop;
 
+      if Stats /= null then
+         Stats.all := (Prompt_Tokens     => Prompt_Ids'Length,
+                       Completion_Tokens => Produced,
+                       Truncated         => not Hit_Stop,
+                       Overflow          => False);
+      end if;
       return To_String (Out_Buf);
    end Decode_Tokens;
 
@@ -550,7 +563,8 @@ package body LLM_Qwen is
      (M : Qwen_Model; Conversation : Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink : access Token_Sink'Class := null;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access Gen_Stats := null) return String
    is
       LF : constant String := [1 => ASCII.LF];
       use type LLM_Tokenizer.Token_Array;
@@ -574,7 +588,8 @@ package body LLM_Qwen is
            & Marker (M, "</think>")
            & LLM_Tokenizer.Encode (M.Tok, LF & LF);
          Raw : constant String :=
-           Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id, Sink, Params);
+           Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id,
+                          Sink, Params, Stats);
       begin
          return Strip_Think (Raw);
       end;

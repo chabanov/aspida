@@ -13,6 +13,7 @@
 
 with Ada.Text_IO;             use Ada.Text_IO;
 with Ada.Command_Line;        use Ada.Command_Line;
+with Ada.Environment_Variables;
 with Ada.Strings.Unbounded;   use Ada.Strings.Unbounded;
 with Interfaces;              use Interfaces;
 with GNAT.Sockets;            use GNAT.Sockets;
@@ -169,6 +170,14 @@ begin
       Connect_Socket (Sock, (Family_Inet, Inet_Addr (Argument (1)), Port));
       CT.Sock := Sock;
       Secure_Channel.Client_Handshake (Ch, CT'Access, Srv_Pub);
+
+      --  Optional client authentication: present the shared token first when
+      --  configured (ASPIDA_CLIENT_TOKEN). A server without a token ignores it.
+      if Ada.Environment_Variables.Exists ("ASPIDA_CLIENT_TOKEN") then
+         Secure_Channel.Send_Message
+           (Ch, CT'Access, Tagged_Msg (Protocol.Tag_Auth,
+              Ada.Environment_Variables.Value ("ASPIDA_CLIENT_TOKEN")));
+      end if;
 
       --  Show the user exactly what protects this session.
       New_Line;

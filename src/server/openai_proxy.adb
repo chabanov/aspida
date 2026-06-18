@@ -12,6 +12,7 @@
 
 with Ada.Command_Line;        use Ada.Command_Line;
 with Ada.Text_IO;             use Ada.Text_IO;
+with Ada.Environment_Variables;
 with Ada.Streams;             use Ada.Streams;
 with Ada.Strings.Fixed;
 with GNAT.Sockets;            use GNAT.Sockets;
@@ -51,6 +52,31 @@ procedure OpenAI_Proxy is
       return B;
    end Frame;
 
+   --  Parse a Tag_Done payload "stop|length <prompt_tokens> <completion_tokens>"
+   --  (whitespace-separated; absent fields default to 0/stop).
+   procedure Parse_Done
+     (S : String; Trunc : out Boolean; PT, CT : out Natural)
+   is
+      Idx : Natural := S'First;
+      function Grab return String is
+         Start : Natural;
+      begin
+         while Idx <= S'Last and then S (Idx) = ' ' loop Idx := Idx + 1; end loop;
+         Start := Idx;
+         while Idx <= S'Last and then S (Idx) /= ' ' loop Idx := Idx + 1; end loop;
+         return S (Start .. Idx - 1);
+      end Grab;
+   begin
+      Trunc := False; PT := 0; CT := 0;
+      Trunc := Grab = "length";
+      declare F : constant String := Grab; begin
+         if F /= "" then PT := Natural'Value (F); end if;
+      exception when others => PT := 0; end;
+      declare F : constant String := Grab; begin
+         if F /= "" then CT := Natural'Value (F); end if;
+      exception when others => CT := 0; end;
+   end Parse_Done;
+
    --  text of a record after its tag byte
    function Body_Of (R : Crypto.Byte_Array) return String is
       S : String (1 .. Integer'Max (0, R'Length - 1));
@@ -75,31 +101,44 @@ procedure OpenAI_Proxy is
    -- Minimal HTTP over a connected client socket
    ----------------------------------------------------------------
    procedure Sock_Write (S : Socket_Type; Str : String) is
-      Buf : Stream_Element_Array (1 .. Str'Length);
+      Buf  : Stream_Element_Array (1 .. Str'Length);
       Last : Stream_Element_Offset;
+      Pos  : Stream_Element_Offset := Buf'First;
    begin
       for I in Str'Range loop
          Buf (Stream_Element_Offset (I - Str'First + 1)) :=
            Stream_Element (Character'Pos (Str (I)));
       end loop;
-      Send_Socket (S, Buf, Last);
+      --  TCP may accept fewer bytes than offered; loop until the whole buffer
+      --  is sent, else the final SSE chunk / [DONE] / JSON tail can be dropped
+      --  (the answer "cuts off at the end").
+      while Pos <= Buf'Last loop
+         Send_Socket (S, Buf (Pos .. Buf'Last), Last);
+         exit when Last < Pos;          -- nothing sent -> peer gone; give up
+         Pos := Last + 1;
+      end loop;
    end Sock_Write;
 
-   --  Read the full HTTP request; return Method, Path and Body.
+   --  Read the full HTTP request; return Method, Path and Body. Err is 0 on
+   --  success, 400 for a malformed request (peer closed before the headers
+   --  terminated), 413 when the headers or declared body exceed our fixed
+   --  buffer (so an oversized request yields a clean error, not a dropped
+   --  connection or an out-of-range index).
    procedure Read_Request (S : Socket_Type; Method, Path, Req_Body : out String;
-                           M_Len, P_Len, B_Len : out Natural) is
+                           M_Len, P_Len, B_Len : out Natural; Err : out Natural) is
       Buf  : Stream_Element_Array (1 .. 65536);
       Last : Stream_Element_Offset;
       Data : String (1 .. 1_048_576);
       Len  : Natural := 0;
-      Hdr_End : Natural := 0;
-      CLen : Natural := 0;
+      Hdr_End  : Natural := 0;
+      CLen     : Natural := 0;
+      Overflow : Boolean := False;
 
       function Find (Pat : String; From : Natural) return Natural is
         (Ada.Strings.Fixed.Index (Data (1 .. Len), Pat, From));
    begin
       Method := [others => ' ']; Path := [others => ' ']; Req_Body := [others => ' '];
-      M_Len := 0; P_Len := 0; B_Len := 0;
+      M_Len := 0; P_Len := 0; B_Len := 0; Err := 0;
       --  read until end of headers
       loop
          Receive_Socket (S, Buf, Last);
@@ -111,9 +150,12 @@ procedure OpenAI_Proxy is
          Hdr_End := Find (Character'Val (13) & Character'Val (10)
                           & Character'Val (13) & Character'Val (10), 1);
          exit when Hdr_End > 0;
-         exit when Len > Data'Last - 70000;
+         if Len > Data'Last - 70000 then Overflow := True; exit; end if;
       end loop;
-      if Hdr_End = 0 then return; end if;
+      if Hdr_End = 0 then
+         Err := (if Overflow then 413 else 400);
+         return;
+      end if;
       --  request line: METHOD SP PATH SP HTTP/...
       declare
          SP1 : constant Natural := Find (" ", 1);
@@ -149,21 +191,32 @@ procedure OpenAI_Proxy is
       --  read the rest of the body (Hdr_End points at the first CR of CRLFCRLF)
       declare
          Body_Start : constant Natural := Hdr_End + 4;
-         Have : Natural := Len - Body_Start + 1;
       begin
-         while Have < CLen loop
-            Receive_Socket (S, Buf, Last);
-            exit when Last < Buf'First;
-            for I in 1 .. Integer (Last) loop
-               Len := Len + 1; Data (Len) := Character'Val (Integer (Buf (Stream_Element_Offset (I))));
-            end loop;
-            Have := Len - Body_Start + 1;
-         end loop;
-         B_Len := Integer'Min (CLen, Integer'Max (0, Len - Body_Start + 1));
-         if B_Len > 0 then
-            Req_Body (Req_Body'First .. Req_Body'First + B_Len - 1) :=
-              Data (Body_Start .. Body_Start + B_Len - 1);
+         --  A declared body that cannot fit the buffer is rejected up front
+         --  rather than read partially (and would otherwise overrun Data).
+         if CLen > Data'Last - Body_Start + 1 then
+            Err := 413;
+            return;
          end if;
+         declare
+            Have : Natural := Len - Body_Start + 1;
+         begin
+            while Have < CLen loop
+               Receive_Socket (S, Buf, Last);
+               exit when Last < Buf'First;
+               for I in 1 .. Integer (Last) loop
+                  exit when Len >= Data'Last;   -- never index past the buffer
+                  Len := Len + 1;
+                  Data (Len) := Character'Val (Integer (Buf (Stream_Element_Offset (I))));
+               end loop;
+               Have := Len - Body_Start + 1;
+            end loop;
+            B_Len := Integer'Min (CLen, Integer'Max (0, Len - Body_Start + 1));
+            if B_Len > 0 then
+               Req_Body (Req_Body'First .. Req_Body'First + B_Len - 1) :=
+                 Data (Body_Start .. Body_Start + B_Len - 1);
+            end if;
+         end;
       end;
    end Read_Request;
 
@@ -191,6 +244,12 @@ begin
                           Port_Type'Value (Argument (2))));
    CT.Sock := Sock;
    Secure_Channel.Client_Handshake (Ch, CT'Access, From_Hex (Argument (3)));
+   --  Optional client authentication (ASPIDA_CLIENT_TOKEN), sent first; a
+   --  server without a token ignores it.
+   if Ada.Environment_Variables.Exists ("ASPIDA_CLIENT_TOKEN") then
+      Secure_Channel.Send_Message (Ch, CT'Access, Frame (Protocol.Tag_Auth,
+        Ada.Environment_Variables.Value ("ASPIDA_CLIENT_TOKEN")));
+   end if;
    Secure_Channel.Send_Message (Ch, CT'Access, Frame (Protocol.Tag_Session, ""));
    declare
       Rep : constant Crypto.Byte_Array := Secure_Channel.Recv_Message (Ch, CT'Access);
@@ -214,15 +273,21 @@ begin
          Method : String (1 .. 16);
          Path   : String (1 .. 1024);
          RBody  : String (1 .. 1_048_576);
-         ML, PL, BL : Natural;
+         ML, PL, BL, Err : Natural;
       begin
          Accept_Socket (Listener, Client, Addr);
-         Read_Request (Client, Method, Path, RBody, ML, PL, BL);
+         Read_Request (Client, Method, Path, RBody, ML, PL, BL, Err);
          declare
             Pth : constant String := Path (Path'First .. Path'First + PL - 1);
             Bdy : constant String := RBody (RBody'First .. RBody'First + BL - 1);
          begin
-            if Ada.Strings.Fixed.Index (Pth, "/chat/completions") > 0 then
+            if Err = 400 then
+               Write_JSON (Client, "400 Bad Request",
+                 OpenAI.Error_Response ("malformed HTTP request"));
+            elsif Err = 413 then
+               Write_JSON (Client, "413 Payload Too Large",
+                 OpenAI.Error_Response ("request exceeds the proxy buffer"));
+            elsif Ada.Strings.Fixed.Index (Pth, "/chat/completions") > 0 then
                Secure_Channel.Send_Message (Ch, CT'Access, Frame (Protocol.Tag_Chat, Bdy));
                --  React to the server's reply type: Tag_Resp = one JSON;
                --  Tag_Token... / Tag_Done = streaming (emit SSE).
@@ -254,8 +319,17 @@ begin
                            First := False;
                         elsif Rec (Rec'First) = Protocol.Tag_Done then
                            if Streaming then
-                              Sock_Write (Client, "data: "
-                                & OpenAI.Chat_Done_Chunk (Model_Name) & CRLF & CRLF);
+                              declare
+                                 Trunc  : Boolean;
+                                 PT, CT : Natural;
+                              begin
+                                 Parse_Done (Body_Of (Rec), Trunc, PT, CT);
+                                 Sock_Write (Client, "data: "
+                                   & OpenAI.Chat_Done_Chunk
+                                       (Model_Name, PT, CT,
+                                        (if Trunc then "length" else "stop"))
+                                   & CRLF & CRLF);
+                              end;
                               Sock_Write (Client, "data: [DONE]" & CRLF & CRLF);
                            end if;
                            exit;

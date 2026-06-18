@@ -2,6 +2,8 @@
 -- LLM_RoPE body — mRoPE implementation for Qwen 3.5
 ---------------------------------------------------------------------
 
+with Ada.Numerics;
+use Ada.Numerics;
 with Ada.Numerics.Elementary_Functions;
 use Ada.Numerics.Elementary_Functions;
 
@@ -39,6 +41,46 @@ package body LLM_RoPE is
       P.Use_FF := True;
    end Set_Freq_Factors;
 
+   procedure Set_Linear_Scale (P : in out RoPE_Params; Factor : Float) is
+   begin
+      if Factor > 1.0 then
+         P.Freq_Scale := 1.0 / Factor;
+      else
+         P.Freq_Scale := 1.0;   -- no-op for factor <= 1
+      end if;
+   end Set_Linear_Scale;
+
+   procedure Set_NTK_Scale (P : in out RoPE_Params; Factor : Float) is
+   begin
+      if Factor > 1.0 and then P.Dim > 2 then
+         --  base' = base * factor^(dim/(dim-2))  (NTK-aware interpolation).
+         P.Freq_Base := P.Freq_Base
+           * Factor ** (Float (P.Dim) / Float (P.Dim - 2));
+      end if;
+   end Set_NTK_Scale;
+
+   procedure Set_Yarn_Scale
+     (P : in out RoPE_Params; Factor : Float; N_Ctx_Orig : Integer;
+      Beta_Fast : Float := 32.0; Beta_Slow : Float := 1.0)
+   is
+      --  Dimension at which a given number of rotations spans the original
+      --  context (llama.cpp ggml_rope_yarn_corr_dim).
+      function Corr_Dim (N_Rot : Float) return Float is
+        (Float (P.Dim)
+         * Log (Float (N_Ctx_Orig) / (N_Rot * 2.0 * Pi))
+         / (2.0 * Log (P.Freq_Base)));
+   begin
+      if Factor <= 1.0 or else N_Ctx_Orig <= 0 then
+         return;   -- no-op
+      end if;
+      P.Freq_Scale := 1.0 / Factor;
+      P.Corr_Low  := Float'Max (0.0, Float'Floor (Corr_Dim (Beta_Fast)));
+      P.Corr_High := Float'Min (Float (P.Dim - 1),
+                                Float'Ceiling (Corr_Dim (Beta_Slow)));
+      P.M_Scale   := 1.0 + 0.1 * Log (Factor);   -- attention temperature
+      P.Yarn_On   := True;
+   end Set_Yarn_Scale;
+
    function Apply (P : RoPE_Params; X : Tensor; Pos : Integer) return Tensor is
       Half_Dim : constant Integer := P.Dim / 2;  -- 32 for Qwen
       Result   : Tensor := New_Tensor ([1, P.Dim]);
@@ -54,14 +96,38 @@ package body LLM_RoPE is
       --    out[i]          = x[i]*cos - x[i+d/2]*sin
       --    out[i+d/2]      = x[i+d/2]*cos + x[i]*sin
       for I in 0 .. Half_Dim - 1 loop
-         Theta := Float (Pos) / (P.Freq_Base ** (Float (2 * I) / Float (P.Dim)));
+         declare
+            --  theta_extrap = pos / base^(2i/dim) (raw / extrapolation).
+            Extrap : constant Float :=
+              Float (Pos) / (P.Freq_Base ** (Float (2 * I) / Float (P.Dim)));
+         begin
+            if P.Yarn_On then
+               --  Blend interpolation (Freq_Scale*extrap) and extrapolation by
+               --  the correction-dim ramp: high-freq dims extrapolate, low-freq
+               --  interpolate (llama.cpp rope_yarn).
+               declare
+                  Interp : constant Float := P.Freq_Scale * Extrap;
+                  Y      : constant Float :=
+                    (Float (I) - P.Corr_Low)
+                    / Float'Max (0.001, P.Corr_High - P.Corr_Low);
+                  Ramp   : constant Float :=
+                    1.0 - Float'Min (1.0, Float'Max (0.0, Y));
+               begin
+                  Theta := Interp * (1.0 - Ramp) + Extrap * Ramp;
+               end;
+            else
+               --  Freq_Scale = 1.0 default (no-op); < 1.0 = linear PI.
+               Theta := Extrap * P.Freq_Scale;
+            end if;
+         end;
          --  Gemma full-attention layers scale wavelengths by rope_freqs
          --  (proportional / NTK RoPE): theta_i := theta_i / freq_factor_i.
          if P.Use_FF then
             Theta := Theta / Get_Flat (P.Freq_Factors, I + 1);
          end if;
-         Cos_Val := Cos (Theta);
-         Sin_Val := Sin (Theta);
+         --  M_Scale = 1.0 unless YaRN set the attention temperature.
+         Cos_Val := Cos (Theta) * P.M_Scale;
+         Sin_Val := Sin (Theta) * P.M_Scale;
 
          if P.Interleaved then
             --  NORM / interleaved convention: pair adjacent dims (2i, 2i+1).

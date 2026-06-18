@@ -24,13 +24,27 @@ with LLM_Tensor;  use LLM_Tensor;
 with LLM_RMSNorm;
 with LLM_RoPE;
 with LLM_Weight;
+with LLM_Dequant;
 with LLM_GPU;
 with LLM_Pool;
 with LLM_Step_Lock;
+with Ctx_Window;
 
 package body LLM_Llama is
 
    use Ada.Strings.Fixed;
+
+   --  Strict mode: refuse an over-window request with context_length_exceeded
+   --  (OpenAI semantics) instead of the default graceful turn-trim.
+   Strict_Ctx : constant Boolean :=
+     Ada.Environment_Variables.Exists ("ASPIDA_STRICT_CTX");
+
+   --  Context-shift ("infinite" generation): on by default (like llama.cpp).
+   --  When a slot fills its window mid-generation, evict the oldest KV and keep
+   --  going instead of stopping. Disable with ASPIDA_NO_CTX_SHIFT.
+   Ctx_Shift_On : constant Boolean :=
+     not Ada.Environment_Variables.Exists ("ASPIDA_NO_CTX_SHIFT");
+   N_Sink : constant := 4;   -- attention-sink tokens kept at the front
 
    function Img (N : Integer) return String is
      (Trim (Integer'Image (N), Ada.Strings.Both));
@@ -129,8 +143,16 @@ package body LLM_Llama is
       function LQ (Name : String) return LLM_Weight.Weight is
          Info : constant Tensor_Info := Find_Tensor (G, Name);
          Size : constant Natural := Natural (Tensor_Byte_Size (Info));
-         B    : constant LLM_Weight.Byte_Data := new String (1 .. Size);
+         B    : LLM_Weight.Byte_Data;
       begin
+         --  Reject an unimplemented quantization up front (else a quantized
+         --  matrix would only fail at first inference, or worse, run garbage).
+         if not LLM_Dequant.Is_Supported (Info.Kind) then
+            raise Model_Load_Error with "weight " & Name
+              & ": unsupported quantization "
+              & LLM_GGUF.GGML_Type'Image (Info.Kind);
+         end if;
+         B := new String (1 .. Size);
          Read_Tensor_Raw (G, Info, B.all'Address, Size);
          return LLM_Weight.From_Quant (Info, B);
       exception
@@ -205,6 +227,36 @@ package body LLM_Llama is
       if M.Has_Freqs and then not Ada.Environment_Variables.Exists ("ASPIDA_NO_FF") then
          LLM_RoPE.Set_Freq_Factors (M.RoPE, M.Rope_Freqs);
       end if;
+      --  Long-context RoPE scaling. We implement the well-understood LINEAR
+      --  (Position Interpolation) method; "yarn" is read but not yet applied
+      --  (its per-dim ramp needs reference validation), so we leave such models
+      --  unscaled rather than risk wrong math.
+      declare
+         Kind   : constant String := Metadata (G, "llama.rope.scaling.type");
+         Factor : constant Float  := MF ("rope.scaling.factor", 1.0);
+      begin
+         if Kind = "linear" and then Factor > 1.0 then
+            LLM_RoPE.Set_Linear_Scale (M.RoPE, Factor);
+            Ada.Text_IO.Put_Line ("  rope scaling: linear x" & Factor'Image);
+         elsif Kind = "yarn" and then Factor > 1.0 then
+            --  Full YaRN (llama.cpp rope_yarn): per-dim ramp + attention temp.
+            LLM_RoPE.Set_Yarn_Scale
+              (M.RoPE, Factor,
+               N_Ctx_Orig => MI ("rope.scaling.original_context_length",
+                                 M.Ctx / Integer'Max (1, Integer (Factor))));
+            Ada.Text_IO.Put_Line ("  rope scaling: yarn x" & Factor'Image);
+         end if;
+         --  Operator override: extend an unscaled model's context (NTK-aware).
+         if Ada.Environment_Variables.Exists ("ASPIDA_ROPE_NTK") then
+            begin
+               LLM_RoPE.Set_NTK_Scale
+                 (M.RoPE,
+                  Float'Value (Ada.Environment_Variables.Value ("ASPIDA_ROPE_NTK")));
+               Ada.Text_IO.Put_Line ("  rope scaling: NTK override applied");
+            exception when others => null;
+            end;
+         end if;
+      end;
 
       M.Tok := LLM_Tokenizer.Create;
       LLM_Tokenizer.Load_From_GGUF (M.Tok, G);
@@ -876,7 +928,36 @@ package body LLM_Llama is
    --------------------------------------------------------------------
 
    Sched_Max_Seq : constant := 8;       -- concurrent sequences per batch
-   Sched_Cap     : constant := 4096;    -- KV positions per slot (prompt + gen)
+   --  Absolute ceiling for per-slot STATIC arrays (e.g. the sampler history).
+   --  Cheap (a few KB/slot); the costly KV cache is sized to Ctx_Cap below.
+   Sched_Cap_Max : constant := 32768;
+   --  Effective context window per slot (prompt + generation), set once at
+   --  scheduler init to min(model context, configured budget, ceiling). Default
+   --  preserves the previous 4096 footprint; raise via ASPIDA_CTX up to the
+   --  model's trained context. Read-only after init (single-shot Sched.Init).
+   Ctx_Cap : Natural := 4096;
+
+   --  Resolve the served window from the model's trained context and the
+   --  ASPIDA_CTX budget, clamped to [256, Sched_Cap_Max]. Sizing to the real
+   --  context (rather than a blind 4096) is honest and llama.cpp-like.
+   function Configured_Ctx (Model_Ctx : Integer) return Natural is
+      Mctx : constant Integer := Integer'Max (1, Model_Ctx);
+      Want : Integer := 4096;   -- memory-preserving default budget
+   begin
+      if Ada.Environment_Variables.Exists ("ASPIDA_CTX") then
+         Want := Integer'Value (Ada.Environment_Variables.Value ("ASPIDA_CTX"));
+      end if;
+      --  Effective window = min(budget, model context, static ceiling); NEVER
+      --  exceeds the model's trained context (so a small-context model is
+      --  served honestly, not over-promised).
+      return Natural
+        (Integer'Max (1,
+           Integer'Min (Integer'Min (Integer'Max (1, Want), Mctx),
+                        Sched_Cap_Max)));
+   exception
+      when others =>
+         return Natural (Integer'Max (1, Integer'Min (Mctx, 4096)));
+   end Configured_Ctx;
 
    type Sched_Tok_Ptr is access LLM_Tokenizer.Token_Array;
    type Sink_Ptr is access all LLM_Qwen.Token_Sink'Class;
@@ -893,6 +974,10 @@ package body LLM_Llama is
       --  longer-lived record, so we carry the address and rebuild the pointer.
       Sink_Addr : System.Address;
       Result    : Unbounded_String;
+      --  Generation accounting (filled by the scheduler before Retire).
+      Prompt_Toks : Natural := 0;
+      Comp_Toks   : Natural := 0;
+      Trunc       : Boolean := False;   -- retired on the cap, not a stop token
       Done      : Ada.Synchronous_Task_Control.Suspension_Object;
    end record;
    type Request_Acc is access all Request;
@@ -954,7 +1039,7 @@ package body LLM_Llama is
          In_Tok : Integer := 0;
          Ph     : Phase_T := Ph_Free;
          Smp    : LLM_Sampler.Sampler;
-         Hist   : LLM_Sampler.History (1 .. Sched_Cap) := [others => 0];
+         Hist   : LLM_Sampler.History (1 .. Sched_Cap_Max) := [others => 0];
          N_Hist : Natural := 0;
       end record;
       Slots  : array (1 .. Sched_Max_Seq) of SSlot;
@@ -964,11 +1049,58 @@ package body LLM_Llama is
          C : constant KV_Cache_Ptr := new KV_Cache (1 .. M.N_Blocks);
       begin
          for L in 1 .. M.N_Blocks loop
-            C (L).K := new Tensor_Array (1 .. Sched_Cap);
-            C (L).V := new Tensor_Array (1 .. Sched_Cap);
+            C (L).K := new Tensor_Array (1 .. Ctx_Cap);
+            C (L).V := new Tensor_Array (1 .. Ctx_Cap);
          end loop;
          return C;
       end New_Cache;
+
+      --  Context-shift: free room in slot S's full KV cache. Keep N_Sink
+      --  attention-sink tokens at the front + the most recent window, evict the
+      --  oldest E middle positions, slide the retained K/V down and re-rotate
+      --  the slid K back by E positions (RoPE composes additively, so the delta
+      --  rotation is Apply at -E; V is not rotated). Returns positions freed.
+      function Shift_KV (S : Integer) return Natural is
+         Pos : constant Integer := Slots (S).Pos;       -- cached token count
+         HD  : constant Integer := M.Head_Dim;
+         NKV : constant Integer := M.N_KV;
+         E   : constant Integer := Integer'Max (1, (Pos - N_Sink) / 2);
+      begin
+         if Pos <= N_Sink + E then return 0; end if;    -- nothing useful to free
+         for L in 1 .. M.N_Blocks loop
+            declare
+               KC : Tensor_Array_Ptr renames Slots (S).Cache (L).K;
+               VC : Tensor_Array_Ptr renames Slots (S).Cache (L).V;
+            begin
+               --  0-based positions: move [N_Sink+E .. Pos-1] down to [N_Sink ..].
+               for P in N_Sink .. Pos - E - 1 loop
+                  declare
+                     Src     : constant Tensor := KC (P + E + 1);
+                     Shifted : Tensor := New_Tensor ([1, NKV * HD]);
+                  begin
+                     for Hh in 0 .. NKV - 1 loop
+                        declare
+                           R : constant Tensor := LLM_RoPE.Apply
+                             (M.RoPE, Slice (Src, Hh * HD + 1, HD), -E);
+                        begin
+                           for J in 1 .. HD loop
+                              Set_Flat (Shifted, Hh * HD + J, Get_Flat (R, J));
+                           end loop;
+                        end;
+                     end loop;
+                     KC (P + 1) := Shifted;
+                     VC (P + 1) := VC (P + E + 1);   -- V: slide only (not rotated)
+                  end;
+               end loop;
+            end;
+         end loop;
+         Slots (S).Pos := Pos - E;
+         Ada.Text_IO.Put_Line
+           ("  [ctx-shift] window full; evicted" & E'Image
+            & " oldest positions, kept" & N_Sink'Image & " sinks");
+         Ada.Text_IO.Flush;
+         return E;
+      end Shift_KV;
 
       procedure Admit (R : Request_Acc) is
       begin
@@ -998,6 +1130,11 @@ package body LLM_Llama is
       end Retire;
    begin
       accept Init (Mdl : Llama_Model) do M := Mdl; end Init;
+      Ctx_Cap := Configured_Ctx (M.Ctx);
+      Ada.Text_IO.Put_Line
+        ("  context window:" & Ctx_Cap'Image & " tokens (model"
+         & M.Ctx'Image & ", set ASPIDA_CTX to change)");
+      Ada.Text_IO.Flush;
       for S in Slots'Range loop Slots (S).Cache := New_Cache; end loop;
 
       loop
@@ -1060,6 +1197,8 @@ package body LLM_Llama is
                         if Tid = M.Eos or else Tid = M.Eot
                            or else Tid = R.Stop_A or else Tid = R.Stop_B
                         then
+                           R.Comp_Toks := Slots (S).N_Gen;   -- natural stop
+                           R.Trunc     := False;
                            Retire (S);
                         else
                            declare
@@ -1077,10 +1216,21 @@ package body LLM_Llama is
                            Slots (S).Pos    := Slots (S).Pos + 1;
                            Slots (S).N_Gen  := Slots (S).N_Gen + 1;
                            Slots (S).Ph     := Ph_Decode;
-                           if Slots (S).N_Gen >= R.Max
-                              or else Slots (S).Pos >= Sched_Cap
-                           then
+                           if Slots (S).N_Gen >= R.Max then
+                              R.Comp_Toks := Slots (S).N_Gen;   -- output cap hit
+                              R.Trunc     := True;
                               Retire (S);
+                           elsif Slots (S).Pos >= Ctx_Cap then
+                              --  Window full: roll it forward (context-shift)
+                              --  and keep generating; only stop if no room can
+                              --  be freed or shift is disabled.
+                              if not Ctx_Shift_On
+                                or else Shift_KV (S) = 0
+                              then
+                                 R.Comp_Toks := Slots (S).N_Gen;
+                                 R.Trunc     := True;
+                                 Retire (S);
+                              end if;
                            end if;
                         end if;
                      end;
@@ -1118,8 +1268,10 @@ package body LLM_Llama is
      (M : Llama_Model; Prompt : LLM_Tokenizer.Token_Array;
       Max, Stop_A, Stop_B : Integer;
       Sink : access LLM_Qwen.Token_Sink'Class;
-      Params : LLM_Sampler.Params) return String
+      Params : LLM_Sampler.Params;
+      Stats : access LLM_Qwen.Gen_Stats := null) return String
    is
+      use type LLM_Tokenizer.Token_Array;
       procedure Free_R is new Ada.Unchecked_Deallocation (Request, Request_Acc);
       procedure Free_T is
         new Ada.Unchecked_Deallocation (LLM_Tokenizer.Token_Array, Sched_Tok_Ptr);
@@ -1129,25 +1281,37 @@ package body LLM_Llama is
       Init_Guard.Claim (Do_It);
       if Do_It then Sched.Init (M); end if;
       --  Clamp so prompt + generation fit the slot's KV cache (a long
-      --  multi-turn prompt would otherwise overflow). Keep the TAIL (most
-      --  recent context + the trailing assistant header).
+      --  multi-turn prompt would otherwise overflow). Keep the most recent
+      --  context but PIN the first token (BOS / start-of-sequence) so the
+      --  model never loses its sequence start when older turns are dropped.
       declare
-         Room : constant Integer := Sched_Cap - Integer'Max (1, Max) - 2;
+         Room : constant Integer := Ctx_Cap - Integer'Max (1, Max) - 2;
       begin
-         if Prompt'Length > Room and then Room > 0 then
+         if Prompt'Length > Room and then Room > 1 then
             R.Prompt := new LLM_Tokenizer.Token_Array'
-              (Prompt (Prompt'Last - Room + 1 .. Prompt'Last));
+              (Prompt (Prompt'First .. Prompt'First)
+               & Prompt (Prompt'Last - (Room - 1) + 1 .. Prompt'Last));
+            Ada.Text_IO.Put_Line
+              ("  [ctx] prompt" & Prompt'Length'Image & " > window" & Room'Image
+               & "; trimmed oldest turns (BOS pinned)");
          else
             R.Prompt := new LLM_Tokenizer.Token_Array'(Prompt);
          end if;
       end;
       R.Max := Max; R.Stop_A := Stop_A; R.Stop_B := Stop_B;
       R.Params := Params;
+      R.Prompt_Toks := R.Prompt'Length;
       R.Sink_Addr := (if Sink /= null then Sink.all'Address
                       else System.Null_Address);
       Ada.Synchronous_Task_Control.Set_False (R.Done);
       Req_Queue.Put (R);
       Ada.Synchronous_Task_Control.Suspend_Until_True (R.Done);
+      if Stats /= null then
+         Stats.all := (Prompt_Tokens     => R.Prompt_Toks,
+                       Completion_Tokens => R.Comp_Toks,
+                       Truncated         => R.Trunc,
+                       Overflow          => False);
+      end if;
       return Res : constant String := To_String (R.Result) do
          Free_T (R.Prompt);
          Free_R (R);
@@ -1157,6 +1321,41 @@ package body LLM_Llama is
    --------------------------------------------------------------------
    -- Greedy decode with incremental K/V cache.
    --------------------------------------------------------------------
+
+   function Forward_Logits
+     (M : Llama_Model; Ids : LLM_Tokenizer.Token_Array) return Logits_Flat
+   is
+      N     : constant Integer := Ids'Length;
+      Vc    : constant Integer := M.Vocab;
+      Cap   : constant Integer := Integer'Max (1, N);
+      Cache : KV_Cache (1 .. M.N_Blocks);
+      Res   : Logits_Flat (0 .. Integer'Max (0, N * Vc - 1));
+      procedure Free is
+        new Ada.Unchecked_Deallocation (Tensor_Array, Tensor_Array_Ptr);
+   begin
+      for L in 1 .. M.N_Blocks loop
+         Cache (L).K := new Tensor_Array (1 .. Cap);
+         Cache (L).V := new Tensor_Array (1 .. Cap);
+      end loop;
+      for P in 1 .. N loop
+         LLM_Step_Lock.Acquire;
+         begin
+            declare
+               L : constant Tensor :=
+                 Forward_Step (M, Cache, Ids (Ids'First + P - 1), P - 1);
+            begin
+               for K in 1 .. Vc loop
+                  Res ((P - 1) * Vc + (K - 1)) := Get_Flat (L, K);
+               end loop;
+            end;
+            LLM_Step_Lock.Release;
+         exception
+            when others => LLM_Step_Lock.Release; raise;
+         end;
+      end loop;
+      for L in 1 .. M.N_Blocks loop Free (Cache (L).K); Free (Cache (L).V); end loop;
+      return Res;
+   end Forward_Logits;
 
    function Generate
      (M : Llama_Model; Ids : LLM_Tokenizer.Token_Array;
@@ -1251,9 +1450,11 @@ package body LLM_Llama is
      (M : Llama_Model; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink : access LLM_Qwen.Token_Sink'Class := null;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access LLM_Qwen.Gen_Stats := null) return String
    is
       use type LLM_Tokenizer.Token_Array;
+      use type LLM_Qwen.Role_Kind;
       LF : constant Character := Character'Val (10);
 
       function One (Id : Integer) return LLM_Tokenizer.Token_Array is
@@ -1276,18 +1477,57 @@ package body LLM_Llama is
            & LLM_Tokenizer.Encode (M.Tok, To_String (Msg.Text)) & One (M.Eot);
       end Msg_Ids;
 
-      function Conv_Ids (I : Positive) return LLM_Tokenizer.Token_Array is
-      begin
-         if I > Conversation'Last then return LLM_Tokenizer.Token_Array'(2 .. 1 => 0); end if;
-         return Msg_Ids (Conversation (I)) & Conv_Ids (I + 1);
-      end Conv_Ids;
    begin
-      --  Route through the continuous-batch scheduler so concurrent chat
-      --  sessions share batched forward passes (Generate is the single-stream
-      --  path, kept for Complete / direct callers).
-      return Run_Request
-        (M, One (M.Bos) & Conv_Ids (Conversation'First) & Header ("assistant"),
-         Max_New_Tokens, -1, -1, Sink, Params);
+      --  Turn-aware context fitting: keep the system prompt (attention sink) +
+      --  the most recent turns within the window, dropping the oldest. Falls
+      --  back to a token-exact BOS-pinned trim inside Run_Request, and (in
+      --  strict mode) refuses an over-window request so the server can return
+      --  context_length_exceeded.
+      declare
+         N        : constant Natural := Conversation'Length;
+         Sys_1st  : constant Boolean := N >= 1 and then
+           Conversation (Conversation'First).Role = LLM_Qwen.Role_System;
+         Overhead : constant Natural :=
+           One (M.Bos)'Length + Header ("assistant")'Length;
+         Budget   : constant Natural := Natural'Max
+           (Overhead + 1,
+            Integer'Max (1, Effective_Context (M)
+                            - Integer'Max (1, Max_New_Tokens) - 4));
+         Lengths  : Ctx_Window.Len_Array  (1 .. Integer'Max (1, N));
+         Keep     : Ctx_Window.Keep_Array (1 .. Integer'Max (1, N)) :=
+           [others => True];
+         Ovf      : Boolean := False;
+
+         --  Concatenate the kept messages, in order.
+         function Kept_Ids (K : Positive) return LLM_Tokenizer.Token_Array is
+         begin
+            if K > N then return LLM_Tokenizer.Token_Array'(2 .. 1 => 0); end if;
+            if Keep (K) then
+               return Msg_Ids (Conversation (Conversation'First + K - 1))
+                      & Kept_Ids (K + 1);
+            else
+               return Kept_Ids (K + 1);
+            end if;
+         end Kept_Ids;
+      begin
+         if N > 0 then
+            for K in 1 .. N loop
+               Lengths (K) :=
+                 Msg_Ids (Conversation (Conversation'First + K - 1))'Length;
+            end loop;
+            Ctx_Window.Select_Messages
+              (Lengths (1 .. N), Sys_1st, Overhead, Budget, Keep (1 .. N), Ovf);
+         end if;
+
+         if Ovf and then Strict_Ctx then
+            if Stats /= null then Stats.Overflow := True; end if;
+            return "";   -- server maps this to context_length_exceeded
+         end if;
+
+         return Run_Request
+           (M, One (M.Bos) & Kept_Ids (1) & Header ("assistant"),
+            Max_New_Tokens, -1, -1, Sink, Params, Stats);
+      end;
    end Chat;
 
    function Complete
@@ -1305,5 +1545,8 @@ package body LLM_Llama is
    function Vocab_Size  (M : Llama_Model) return Integer is (M.Vocab);
    function Dim         (M : Llama_Model) return Integer is (M.Dim);
    function Block_Count (M : Llama_Model) return Integer is (M.N_Blocks);
+
+   function Effective_Context (M : Llama_Model) return Integer is
+     (Integer (Configured_Ctx (M.Ctx)));
 
 end LLM_Llama;

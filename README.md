@@ -59,6 +59,35 @@ QWEN_MODEL_PATH=<any-supported-gguf> ./obj/secure_server [port]   # env var name
 Bind address is `Any` by default; set `ASPIDA_BIND=127.0.0.1` to restrict it
 (e.g. behind the bridge / a reverse proxy).
 
+## Model discovery & selection
+
+At startup the server enumerates every GGUF model on the system (metadata only,
+no weights loaded) and logs the catalog. List them standalone with:
+
+```sh
+gprbuild -P probe.gpr && ./obj/model_scan      # or: ASPIDA_MODELS_DIR=/a:/b ./obj/model_scan
+```
+
+Search roots: `ASPIDA_MODELS_DIR` (`:`-separated, highest precedence) then common
+locations (`./models`, `~/.lmstudio/models`, `~/.cache/huggingface`, …). Projector
+files (`mmproj-*`) and architectures the engine can't run are flagged, not offered.
+
+The active model is resolved as: `QWEN_MODEL_PATH` env (deployments pin it) →
+a persisted runtime selection (`active_model` file) → a built-in default.
+
+A client may list the catalog and pick a model over the encrypted channel
+(`Tag_Models` / `Tag_Select`). Because a model can't be hot-swapped in place
+(the batch scheduler binds one model and backends don't unload), switching is
+**reload-based**: the selection is persisted and the server reloads with it.
+Run under the supervisor so switches apply automatically:
+
+```sh
+make serve     # sets ASPIDA_AUTORELOAD; reloads the server when a model is selected
+```
+
+The web demo shows a model dropdown only when the server advertises it is
+switchable (i.e. running under `make serve`); a pinned deployment hides it.
+
 ## Test & verify
 
 ```sh

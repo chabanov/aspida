@@ -10,8 +10,9 @@ package body LLM_Qwen.Backend is
       Conversation   : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink           : access LLM_Qwen.Token_Sink'Class := null;
-      Params         : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
-   is (LLM_Qwen.Chat (M.Model, Conversation, Max_New_Tokens, Sink, Params));
+      Params         : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats          : access LLM_Qwen.Gen_Stats := null) return String
+   is (LLM_Qwen.Chat (M.Model, Conversation, Max_New_Tokens, Sink, Params, Stats));
 
    overriding function Vocab_Size  (M : Qwen_Backend) return Integer
      is (LLM_Qwen.Vocab_Size (M.Model));

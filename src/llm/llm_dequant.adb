@@ -2,7 +2,6 @@
 -- LLM_Dequant body — GGML quantization → FP32 conversion
 ---------------------------------------------------------------------
 
-with Ada.Text_IO;
 with Interfaces; use Interfaces;
 with LLM_Pool;
 
@@ -360,6 +359,62 @@ package body LLM_Dequant is
       end loop;
    end Decode_Q5K_Block;
 
+   --  Decode one 256-element Q4_K super-block (144 bytes) into B (1 .. 256),
+   --  in the SAME element order Dequant_Q4_K produces. Logic mirrors the
+   --  (independently validated) Dequant_Q4_K bulk path; keeping the bulk
+   --  routine untouched lets the QMatVec test cross-check this against it.
+   procedure Decode_Q4K_Block (X : String; Pos : Natural; B : out Block256) is
+      function U8 (P : Natural) return Byte is (Byte (Character'Pos (X (P))));
+      D    : constant Float := F16_To_F32 (U8 (Pos),     U8 (Pos + 1));
+      DMin : constant Float := F16_To_F32 (U8 (Pos + 2), U8 (Pos + 3));
+      Sc   : array (0 .. 11) of Byte;          -- the 12 packed scale bytes
+      QS_Base : constant Natural := Pos + 16;  -- start of qs (128 bytes)
+      Idx    : Natural := 1;                   -- 1-based write cursor into B
+      Is_Idx : Natural := 0;
+
+      --  Extract the J-th (0..7) 6-bit scale (Dd) and min (Mm).
+      procedure Get_SM (J : Natural; Dd, Mm : out Byte) is
+      begin
+         if J < 4 then
+            Dd := Sc (J)     and 63;
+            Mm := Sc (J + 4) and 63;
+         else
+            Dd := (Sc (J + 4) and 16#0F#)
+                    or Shift_Left (Shift_Right (Sc (J - 4), 6), 4);
+            Mm := Shift_Right (Sc (J + 4), 4)
+                    or Shift_Left (Shift_Right (Sc (J), 6), 4);
+         end if;
+      end Get_SM;
+   begin
+      for I in 0 .. 11 loop Sc (I) := U8 (Pos + 4 + I); end loop;
+
+      for G in 0 .. 3 loop                     -- the 4 groups of 64 elems
+         declare
+            Sc1, M1b, Sc2, M2b : Byte;
+            QOff : constant Natural := QS_Base + G * 32;
+         begin
+            Get_SM (Is_Idx,     Sc1, M1b);
+            Get_SM (Is_Idx + 1, Sc2, M2b);
+            declare
+               D1 : constant Float := D * Float (Integer (Sc1));
+               M1 : constant Float := DMin * Float (Integer (M1b));
+               D2 : constant Float := D * Float (Integer (Sc2));
+               M2 : constant Float := DMin * Float (Integer (M2b));
+            begin
+               for L in 0 .. 31 loop          -- low nibbles
+                  B (Idx) := D1 * Float (Integer (U8 (QOff + L) and 16#0F#)) - M1;
+                  Idx := Idx + 1;
+               end loop;
+               for L in 0 .. 31 loop          -- high nibbles
+                  B (Idx) := D2 * Float (Integer (Shift_Right (U8 (QOff + L), 4))) - M2;
+                  Idx := Idx + 1;
+               end loop;
+            end;
+            Is_Idx := Is_Idx + 2;
+         end;
+      end loop;
+   end Decode_Q4K_Block;
+
    procedure Dequant_Q5_K (X : String; Q : out Tensor; N : Natural) is
       Blocks : constant Natural := N / 256;
       Bk     : Block256;
@@ -565,10 +620,27 @@ package body LLM_Dequant is
          when LLM_GGUF.GGML_TYPE_Q5_0 => Dequant_Q5_0 (Raw, Result, N);
 
          when others =>
-            Ada.Text_IO.Put_Line ("Dequantize: unsupported type " &
-              LLM_GGUF.GGML_Type'Image (Info.Kind));
+            --  Do NOT silently zero-fill: that yields a model that loads and
+            --  then emits garbage. Fail loudly so the caller (model load) can
+            --  reject the file with a clear, actionable message.
+            raise Unsupported_Quant with
+              "unsupported GGML quantization type "
+              & LLM_GGUF.GGML_Type'Image (Info.Kind)
+              & " (e.g. Q2_K/Q3_K/IQ* are not implemented)";
       end case;
    end Fill;
+
+   function Is_Supported (Kind : LLM_GGUF.GGML_Type) return Boolean is
+      use type LLM_GGUF.GGML_Type;
+   begin
+      return Kind in
+        LLM_GGUF.GGML_TYPE_F32 | LLM_GGUF.GGML_TYPE_F16
+        | LLM_GGUF.GGML_TYPE_BF16
+        | LLM_GGUF.GGML_TYPE_Q8_0 | LLM_GGUF.GGML_TYPE_Q4_0
+        | LLM_GGUF.GGML_TYPE_Q5_0
+        | LLM_GGUF.GGML_TYPE_Q4_K | LLM_GGUF.GGML_TYPE_Q5_K
+        | LLM_GGUF.GGML_TYPE_Q6_K | LLM_GGUF.GGML_TYPE_Q8_K;
+   end Is_Supported;
 
    function Dequantize
      (Info : LLM_GGUF.Tensor_Info;
@@ -598,8 +670,11 @@ package body LLM_Dequant is
       Kind     : constant LLM_GGUF.GGML_Type := Info.Kind;
       Is_Q5K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q5_K;
       Is_Q6K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q6_K;
+      Is_Q4K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q4_K;
+      Fused    : constant Boolean := Is_Q5K or else Is_Q6K or else Is_Q4K;
       N_Blk    : constant Integer := In_Dim / 256;
-      Blk_Bytes : constant Integer := (if Is_Q5K then 176 elsif Is_Q6K then 210 else 0);
+      Blk_Bytes : constant Integer :=
+        (if Is_Q5K then 176 elsif Is_Q6K then 210 elsif Is_Q4K then 144 else 0);
       Row_Info : LLM_GGUF.Tensor_Info := Info;
       BPR      : Natural;
 
@@ -611,7 +686,7 @@ package body LLM_Dequant is
       --  drops a partial trailing block. Guard explicitly (checks are
       --  suppressed in this unit) so a malformed tensor fails loudly here
       --  rather than silently producing a wrong dot product.
-      if (Is_Q5K or else Is_Q6K) and then In_Dim mod 256 /= 0 then
+      if Fused and then In_Dim mod 256 /= 0 then
          raise Constraint_Error
            with "QMatVec: K-quant in-dim" & Integer'Image (In_Dim)
                 & " is not a multiple of 256";
@@ -631,7 +706,7 @@ package body LLM_Dequant is
                Bk    : Block256;          -- one decoded super-block (stack)
                Row_T : Tensor;            -- fallback buffer (non-K-quant only)
             begin
-               if Is_Q5K or else Is_Q6K then
+               if Fused then
                   for O in Lo .. Hi loop
                      declare
                         RS  : constant Natural := Raw'First + (O - 1) * BPR;
@@ -644,6 +719,8 @@ package body LLM_Dequant is
                         for Blk in 0 .. N_Blk - 1 loop
                            if Is_Q5K then
                               Decode_Q5K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
+                           elsif Is_Q4K then
+                              Decode_Q4K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
                            else
                               Decode_Q6K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
                            end if;

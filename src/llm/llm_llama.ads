@@ -40,16 +40,30 @@ package LLM_Llama is
      (M : Llama_Model; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink : access LLM_Qwen.Token_Sink'Class := null;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access LLM_Qwen.Gen_Stats := null) return String;
 
    --  Raw greedy completion (BOS + prompt, no chat template) — for validation.
    function Complete
      (M : Llama_Model; Prompt : String; Max_New_Tokens : Integer := 8)
       return String;
 
+   --  Teacher-forcing forward for knowledge distillation: the full-vocab
+   --  next-token logits at every position of Ids, row-major and flat
+   --  ([Ids'Length * Vocab_Size]; row p, 0-based, at offset p*Vocab_Size).
+   --  Single-threaded; allocates a temporary KV cache.
+   type Logits_Flat is array (Natural range <>) of Float;
+   function Forward_Logits
+     (M : Llama_Model; Ids : LLM_Tokenizer.Token_Array) return Logits_Flat;
+
    function Vocab_Size  (M : Llama_Model) return Integer;
    function Dim         (M : Llama_Model) return Integer;
    function Block_Count (M : Llama_Model) return Integer;
+
+   --  The context window actually served (prompt + generation): the model's
+   --  trained context bounded by the ASPIDA_CTX budget. Used for turn-aware
+   --  prompt fitting and honest reporting.
+   function Effective_Context (M : Llama_Model) return Integer;
 
    --  Validate the batched forward (continuous-batching primitive): runs two
    --  equal-length sequences both single-step and batched, returns the max

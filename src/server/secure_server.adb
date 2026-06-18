@@ -20,9 +20,12 @@ with Ada.Strings.Unbounded;   use Ada.Strings.Unbounded;
 with Ada.Environment_Variables;
 with Ada.Streams.Stream_IO;
 with Ada.Directories;
+with Ada.Real_Time;
 with Ada.Exceptions;          use Ada.Exceptions;
 with Interfaces;              use Interfaces;
+with Interfaces.C;
 with GNAT.Sockets;            use GNAT.Sockets;
+with GNAT.OS_Lib;
 with Crypto;                  use Crypto;
 with Crypto.X25519;
 with Crypto.Random;
@@ -44,6 +47,8 @@ procedure Secure_Server is
 
    Key_File     : constant String := "server_key.bin";
    Pub_File     : constant String := "server_pub.hex";
+   Sel_File     : constant String := "active_model";  -- persisted model choice
+   Reload_Code  : constant := 75;   -- exit code: "switch model, supervisor reloads"
    Default_Port : constant := 8765;
    Max_Clients  : constant := 8;     -- concurrent handler tasks
    Max_Queue    : constant := 64;    -- pending-connection backlog
@@ -60,7 +65,7 @@ procedure Secure_Server is
          exception when others => null;
          end;
       end if;
-      return 256;
+      return 2048;   -- generous default; a length-bound deploy sets ASPIDA_MAX_TOKENS
    end Max_Reply_Tokens;
 
    --  How long a connection may stay silent before its handler reclaims the
@@ -79,6 +84,60 @@ procedure Secure_Server is
       end if;
       return 600.0;
    end Idle_Timeout;
+
+   function Env_Int (Name : String; D : Integer) return Integer is
+   begin
+      if Ada.Environment_Variables.Exists (Name) then
+         return Integer'Value (Ada.Environment_Variables.Value (Name));
+      end if;
+      return D;
+   exception when others => return D; end Env_Int;
+
+   --  Anti-DoS: cap NEW connections to Rate_Max per Rate_Window seconds
+   --  (global, across all sources). Default 0 = disabled, so the bridge-fronted
+   --  demo (every peer is 127.0.0.1) is unaffected unless an operator opts in
+   --  on a directly-exposed deployment. Tunable via ASPIDA_RATE_MAX /
+   --  ASPIDA_RATE_WINDOW.
+   Rate_Max    : constant Integer  := Env_Int ("ASPIDA_RATE_MAX", 0);
+   Rate_Window : constant Duration :=
+     Duration (Integer'Max (1, Env_Int ("ASPIDA_RATE_WINDOW", 1)));
+
+   --  Best-effort: restrict a sensitive file to owner read/write (0600). Used
+   --  for the server's static private key, whose leak is full impersonation.
+   procedure Set_Owner_Only (Path : String) is
+      use Interfaces.C;
+      function C_Chmod (P : char_array; Mode : int) return int
+        with Import, Convention => C, External_Name => "chmod";
+      Discard : constant int := C_Chmod (To_C (Path), 8#600#);
+      pragma Unreferenced (Discard);   -- best-effort; failure is non-fatal
+   begin
+      null;
+   end Set_Owner_Only;
+
+   --  Optional shared-secret client authentication. Empty (unset) => disabled,
+   --  preserving today's open behaviour (and the bridge-fronted demo). When
+   --  set, every client must present this token before a session begins.
+   function Client_Token return String is
+   begin
+      if Ada.Environment_Variables.Exists ("ASPIDA_CLIENT_TOKEN") then
+         return Ada.Environment_Variables.Value ("ASPIDA_CLIENT_TOKEN");
+      end if;
+      return "";
+   end Client_Token;
+
+   Required_Token : constant String  := Client_Token;
+   Auth_Required  : constant Boolean := Required_Token'Length > 0;
+
+   function To_Bytes (S : String) return Byte_Array is
+      B : Byte_Array (1 .. S'Length);
+   begin
+      for I in 1 .. S'Length loop
+         B (I) := U8 (Character'Pos (S (S'First + I - 1)));
+      end loop;
+      return B;
+   end To_Bytes;
+
+   Token_Bytes : constant Byte_Array := To_Bytes (Required_Token);
 
    --  Generation sampling, configured via environment (default = greedy, so
    --  behaviour is unchanged unless explicitly opted in):
@@ -139,21 +198,71 @@ procedure Secure_Server is
          Crypto.X25519.Key_256'Write (SIO.Stream (F), K);
          SIO.Close (F);
       end if;
+      --  Lock down perms whether freshly created or pre-existing (older keys
+      --  may have been written world-readable).
+      Set_Owner_Only (Key_File);
       return K;
    end Load_Or_Create_Key;
 
+   --  A model switch is only honored when a supervisor is present to restart
+   --  the process (e.g. `make serve`, which sets ASPIDA_AUTORELOAD). Without
+   --  it, a selection is persisted but applies on the next manual start.
+   function Autoreload return Boolean is
+     (Ada.Environment_Variables.Exists ("ASPIDA_AUTORELOAD"));
+
+   --  The runtime model selection persisted by a previous Tag_Select ("" if
+   --  none / unreadable). First non-empty line of Sel_File.
+   function Read_Selected return String is
+      F : Ada.Text_IO.File_Type;
+   begin
+      if not Ada.Directories.Exists (Sel_File) then
+         return "";
+      end if;
+      Ada.Text_IO.Open (F, Ada.Text_IO.In_File, Sel_File);
+      return L : constant String :=
+        (if Ada.Text_IO.End_Of_File (F) then "" else Ada.Text_IO.Get_Line (F))
+      do
+         Ada.Text_IO.Close (F);
+      end return;
+   exception
+      when others => return "";
+   end Read_Selected;
+
+   procedure Write_Selected (Path : String) is
+      F : Ada.Text_IO.File_Type;
+   begin
+      Ada.Text_IO.Create (F, Ada.Text_IO.Out_File, Sel_File);
+      Ada.Text_IO.Put_Line (F, Path);
+      Ada.Text_IO.Close (F);
+   exception
+      when others => null;   -- non-fatal: selection just won't persist
+   end Write_Selected;
+
+   --  Resolve the active model: explicit env wins (deployments pin it), then a
+   --  persisted runtime selection, then a built-in default.
    function Model_Path return String is
    begin
       if Ada.Environment_Variables.Exists ("QWEN_MODEL_PATH") then
          return Ada.Environment_Variables.Value ("QWEN_MODEL_PATH");
       end if;
+      declare
+         Sel : constant String := Read_Selected;
+      begin
+         if Sel'Length > 0 and then Ada.Directories.Exists (Sel) then
+            return Sel;
+         end if;
+      end;
       return "/Users/ceo/.lmstudio/models/HauhauCS/"
         & "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/"
         & "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf";
    end Model_Path;
 
-   --  Loaded during elaboration, before the handler tasks activate.
-   Model    : constant LLM_Engine.Engine := LLM_Engine.Load (Model_Path);
+   --  Assigned in the main body (guarded), NOT at elaboration: a bad/corrupt/
+   --  unsupported model must yield a clean operator error and a non-zero exit,
+   --  not an unhandled exception before main. Handler tasks block on the empty
+   --  connection queue until the accept loop runs (post-load), so they never
+   --  observe Model before it is set.
+   Model    : LLM_Engine.Engine;
    Secret   : constant Crypto.X25519.Key_256 := Load_Or_Create_Key;
    Listener : Socket_Type;
 
@@ -178,6 +287,37 @@ procedure Secure_Server is
          null;
       end Release;
    end Infer_Lock;
+
+   --  Global new-connection rate limiter (see Rate_Max above). Disabled when
+   --  Rate_Max <= 0.
+   protected Rate_Limiter is
+      procedure Check (Ok : out Boolean);
+   private
+      Window_Start : Ada.Real_Time.Time := Ada.Real_Time.Time_First;
+      Count        : Natural := 0;
+      Started      : Boolean := False;
+   end Rate_Limiter;
+
+   protected body Rate_Limiter is
+      procedure Check (Ok : out Boolean) is
+         use Ada.Real_Time;
+         Now : constant Time := Clock;
+      begin
+         if Rate_Max <= 0 then
+            Ok := True;
+            return;
+         end if;
+         if not Started
+           or else To_Duration (Now - Window_Start) >= Rate_Window
+         then
+            Window_Start := Now;
+            Count        := 0;
+            Started      := True;
+         end if;
+         Count := Count + 1;
+         Ok := Count <= Rate_Max;
+      end Check;
+   end Rate_Limiter;
 
    --  Bounded hand-off of accepted sockets to the handler pool.
    type Socket_Slots is array (1 .. Max_Queue) of Socket_Type;
@@ -246,6 +386,49 @@ procedure Secure_Server is
       Store : Session_Store.Store;
       Id_B  : Byte_Array (0 .. 7);
       Sid   : Unbounded_String;          -- acquired session id (for Release)
+
+      Auth_Failed : exception;
+
+      --  Consume an optional leading Tag_Auth record (validating it against the
+      --  configured token, in constant time), then return the real session
+      --  hello. Works in every on/off combination: a server without a token
+      --  just ignores a leading auth record; one with a token rejects any
+      --  client that omits it or sends the wrong one.
+      function Get_Session_Hello return Byte_Array is
+         procedure Reject (Msg : String) is
+            Err : Byte_Array (0 .. Msg'Length);
+         begin
+            Err (0) := Protocol.Tag_Error;
+            for I in Msg'Range loop
+               Err (I - Msg'First + 1) := U8 (Character'Pos (Msg (I)));
+            end loop;
+            Secure_Channel.Send_Message (Ch, ST'Access, Err);
+         end Reject;
+         First : constant Byte_Array := Secure_Channel.Recv_Message (Ch, ST'Access);
+      begin
+         if First'Length >= 1 and then First (First'First) = Protocol.Tag_Auth then
+            if Auth_Required then
+               declare
+                  Tok : Byte_Array (1 .. First'Length - 1);
+               begin
+                  for I in Tok'Range loop
+                     Tok (I) := First (First'First + I);
+                  end loop;
+                  if not Crypto.Const_Time_Equal (Tok, Token_Bytes) then
+                     Reject ("authentication failed");
+                     raise Auth_Failed;
+                  end if;
+               end;
+            end if;
+            --  token record consumed; the real session hello is the next one
+            return Secure_Channel.Recv_Message (Ch, ST'Access);
+         elsif Auth_Required then
+            Reject ("authentication required");
+            raise Auth_Failed;
+         else
+            return First;
+         end if;
+      end Get_Session_Hello;
    begin
       ST.Sock := Conn;
       Secure_Channel.Server_Handshake (Ch, ST'Access, Secret);
@@ -253,7 +436,7 @@ procedure Secure_Server is
       --  First record selects/creates the session (Tag_Session + id;
       --  empty id = new). Reply with the assigned id.
       declare
-         Hello : constant Byte_Array := Secure_Channel.Recv_Message (Ch, ST'Access);
+         Hello : constant Byte_Array := Get_Session_Hello;
          Want  : Unbounded_String;
          Ok    : Boolean;
       begin
@@ -345,8 +528,50 @@ procedure Secure_Server is
 
             --  OpenAI-compatible routes (tunneled JSON). The proxy maps HTTP.
             if Tag = Protocol.Tag_Models then
+               --  Full catalog of every model on this system + which is
+               --  active, so a client can show a picker.
                Send_Tagged (Protocol.Tag_Resp,
-                 OpenAI.Models_Response (LLM_Engine.Arch_Name (Model)));
+                 OpenAI.Catalog_Response (Model_Path, Autoreload));
+
+            elsif Tag = Protocol.Tag_Select then
+               --  Switch the active model. The body is the chosen model id
+               --  (its path, exactly as returned in the catalog). Validate it
+               --  against the catalog, persist it, and reload if supervised.
+               declare
+                  use type LLM_Catalog.Model_Status;
+                  Cat   : constant LLM_Catalog.Entry_Vectors.Vector :=
+                    LLM_Catalog.Discover;
+                  Found : Boolean := False;
+               begin
+                  for E of Cat loop
+                     if To_String (E.Path) = Prompt
+                       and then E.Status = LLM_Catalog.Supported
+                     then
+                        Found := True;
+                        exit;
+                     end if;
+                  end loop;
+
+                  if not Found then
+                     Send_Tagged (Protocol.Tag_Resp, OpenAI.Select_Result
+                       (False, False, "unknown or unsupported model"));
+                  elsif Prompt = Model_Path then
+                     Send_Tagged (Protocol.Tag_Resp, OpenAI.Select_Result
+                       (True, False, "already active"));
+                  else
+                     Write_Selected (Prompt);
+                     if Autoreload then
+                        Send_Tagged (Protocol.Tag_Resp, OpenAI.Select_Result
+                          (True, True, "switching model; reloading"));
+                        Put_Line ("model switch -> " & Prompt & "; reloading");
+                        delay 0.3;   -- let the reply flush to the client
+                        GNAT.OS_Lib.OS_Exit (Reload_Code);
+                     else
+                        Send_Tagged (Protocol.Tag_Resp, OpenAI.Select_Result
+                          (True, False, "selected; restart the server to apply"));
+                     end if;
+                  end if;
+               end;
 
             elsif Tag = Protocol.Tag_Chat then
                declare
@@ -357,6 +582,9 @@ procedure Secure_Server is
                      Eff_Max : constant Integer :=
                        Integer'Min (Integer'Max (1, Rq.Max_Tokens), Max_Reply_Tokens);
                      P       : LLM_Sampler.Params := Rq.Params;
+                     St      : aliased LLM_Engine.Gen_Stats;
+                     function Finish return String is
+                       (if St.Truncated then "length" else "stop");
                   begin
                      if Rq.N = 0 then
                         Send_Tagged (Protocol.Tag_Resp,
@@ -371,20 +599,40 @@ procedure Secure_Server is
                         if Rq.Stream then
                            declare
                               R : constant String := LLM_Engine.Chat
-                                (Model, Rq.Messages, Eff_Max, Sink'Access, P);
+                                (Model, Rq.Messages, Eff_Max, Sink'Access, P,
+                                 St'Access);
                               pragma Unreferenced (R);
                            begin null; end;
                            Infer_Lock.Release; Locked := False;
-                           Secure_Channel.Send_Message
-                             (Ch, ST'Access, [0 => Protocol.Tag_Done]);
+                           if St.Overflow then
+                              Send_Tagged (Protocol.Tag_Resp, OpenAI.Error_Response
+                                ("prompt exceeds the model context window",
+                                 "context_length_exceeded"));
+                           else
+                              --  Carry finish_reason + usage on the done record so
+                              --  the proxy emits a standards-correct final chunk.
+                              Send_Tagged (Protocol.Tag_Done,
+                                Finish & St.Prompt_Tokens'Image
+                                       & St.Completion_Tokens'Image);
+                           end if;
                         else
                            declare
                               R : constant String := LLM_Engine.Chat
-                                (Model, Rq.Messages, Eff_Max, null, P);
+                                (Model, Rq.Messages, Eff_Max, null, P, St'Access);
                            begin
                               Infer_Lock.Release; Locked := False;
-                              Send_Tagged (Protocol.Tag_Resp,
-                                OpenAI.Chat_Response (To_String (Rq.Model), R));
+                              if St.Overflow then
+                                 Send_Tagged (Protocol.Tag_Resp, OpenAI.Error_Response
+                                   ("prompt exceeds the model context window",
+                                    "context_length_exceeded"));
+                              else
+                                 Send_Tagged (Protocol.Tag_Resp,
+                                   OpenAI.Chat_Response
+                                     (To_String (Rq.Model), R,
+                                      Prompt_Tokens     => St.Prompt_Tokens,
+                                      Completion_Tokens => St.Completion_Tokens,
+                                      Finish            => Finish));
+                              end if;
                            end;
                         end if;
                      end if;
@@ -469,6 +717,18 @@ procedure Secure_Server is
    Port      : Port_Type := Default_Port;
    Bind_Addr : Inet_Addr_Type := Any_Inet_Addr;
 begin
+   --  Load the model first, with a guard: fail fast and clearly on a bad,
+   --  corrupt or unsupported-quantization model rather than crashing before
+   --  the server is even up.
+   begin
+      Model := LLM_Engine.Load (Model_Path);
+   exception
+      when E : others =>
+         Put_Line ("fatal: cannot load model """ & Model_Path & """: "
+                   & Exception_Message (E));
+         GNAT.OS_Lib.OS_Exit (1);
+   end;
+
    if Ada.Command_Line.Argument_Count >= 1 then
       Port := Port_Type'Value (Ada.Command_Line.Argument (1));
    end if;
@@ -541,11 +801,22 @@ begin
          From : Sock_Addr_Type;
       begin
          Accept_Socket (Listener, Conn, From);
-         --  Reclaim the slot from a silent peer: a read that stalls past the
-         --  idle timeout raises in the handler, which then cleans up.
-         Set_Socket_Option
-           (Conn, Socket_Level, (Receive_Timeout, Idle_Timeout));
-         Conn_Queue.Put (Conn);        -- a free handler will pick it up
+         declare
+            Permit : Boolean;
+         begin
+            Rate_Limiter.Check (Permit);
+            if not Permit then
+               --  Over the new-connection rate: drop immediately so a flood
+               --  cannot exhaust the queue/handler pool.
+               begin Close_Socket (Conn); exception when others => null; end;
+            else
+               --  Reclaim the slot from a silent peer: a read that stalls past
+               --  the idle timeout raises in the handler, which then cleans up.
+               Set_Socket_Option
+                 (Conn, Socket_Level, (Receive_Timeout, Idle_Timeout));
+               Conn_Queue.Put (Conn);     -- a free handler will pick it up
+            end if;
+         end;
       end;
    end loop;
 end Secure_Server;

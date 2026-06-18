@@ -23,6 +23,9 @@ export const Tag = {
   Prefill: '.'.charCodeAt(0),
   Done:    '!'.charCodeAt(0),
   Error:   'e'.charCodeAt(0),
+  Models:  'm'.charCodeAt(0),   // C->S: list models    S->C: catalog JSON (Resp)
+  Select:  'M'.charCodeAt(0),   // C->S: select model   S->C: result JSON (Resp)
+  Resp:    'r'.charCodeAt(0),   // S->C: a JSON response
 };
 
 const be32 = (n) => new Uint8Array([(n>>>24)&255, (n>>>16)&255, (n>>>8)&255, n&255]);

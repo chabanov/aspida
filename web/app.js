@@ -13,7 +13,7 @@ const els = {
   hsSteps: $('hsSteps'), bindingBox: $('bindingBox'),
   cipher: $('cipher'), srvKey: $('srvKey'), binding: $('binding'),
   frames: $('frames'), recCount: $('recCount'),
-  modelPill: $('modelPill'), ratePill: $('ratePill'),
+  modelPill: $('modelPill'), ratePill: $('ratePill'), modelSelect: $('modelSelect'),
   operatorView: $('operatorView'), chatBadge: $('chatBadge'),
 };
 
@@ -145,8 +145,59 @@ const hooks = {
     bumpRec();
   },
   onAuthError() { setStatus('err', 'authentication error'); },
-  onClose() { setStatus('err', 'connection closed'); els.input.disabled = true; els.send.disabled = true; },
+  onClose() {
+    if (switching) { scheduleReconnect(); return; }   // model reload in progress
+    setStatus('err', 'connection closed'); els.input.disabled = true; els.send.disabled = true;
+  },
 };
+
+// ---- model picker -------------------------------------------------------
+let switching = false;
+
+function populateModels(list) {
+  // Only offer a picker when the server can actually switch and has options.
+  if (!list || !list.switchable || !Array.isArray(list.data) || list.data.length < 2) {
+    els.modelSelect.hidden = true;
+    return;
+  }
+  els.modelSelect.innerHTML = '';
+  for (const m of list.data) {
+    const o = document.createElement('option');
+    o.value = m.id;
+    const bits = [m.name, m.params, m.quant, m.size].filter(Boolean).join(' · ');
+    o.textContent = bits + (m.supported ? '' : ' (unsupported)');
+    o.disabled = !m.supported;
+    if (m.active) o.selected = true;
+    els.modelSelect.appendChild(o);
+  }
+  els.modelSelect.hidden = false;
+}
+
+function onResp(jsonText) {
+  let r; try { r = JSON.parse(jsonText); } catch { return; }
+  if (Array.isArray(r.data)) { populateModels(r); return; }        // catalog
+  if ('ok' in r) {                                                 // select result
+    if (!r.ok) {
+      switching = false; setStatus('err', r.message || 'model not available');
+      els.input.disabled = false; els.send.disabled = false;
+    } else if (!r.reload) {
+      switching = false; setStatus('live', r.message || 'model selected');
+      els.input.disabled = false; els.send.disabled = false;
+    } // r.reload: server is restarting; onClose -> scheduleReconnect
+  }
+}
+
+function scheduleReconnect() {
+  setStatus('', 'loading model — reconnecting…');
+  let tries = 0;
+  const tick = () => {
+    tries += 1;
+    start().then(() => { switching = false; })
+           .catch(() => { if (tries < 90) setTimeout(tick, 2000);
+                          else setStatus('err', 'reconnect failed'); });
+  };
+  setTimeout(tick, 2500);
+}
 
 function setStatus(kind, text) {
   els.status.textContent = text;
@@ -164,6 +215,9 @@ async function start() {
     if (tag === Tag.Session) {
       els.input.disabled = false; els.send.disabled = false; els.input.focus();
       setStatus('live', 'secured · session ' + dec.decode(body).slice(0, 8));
+      channel.sendText(Tag.Models, '');     // ask what models are available
+    } else if (tag === Tag.Resp) {
+      onResp(dec.decode(body));
     } else if (tag === Tag.Prefill) {
       // thinking dots already shown by beginReply
     } else if (tag === Tag.Token) {
@@ -200,6 +254,15 @@ els.composer.addEventListener('submit', (e) => {
 
 els.operatorView.addEventListener('change', () => {
   document.body.classList.toggle('operator', els.operatorView.checked);
+});
+
+els.modelSelect.addEventListener('change', () => {
+  const id = els.modelSelect.value;
+  if (!id) return;
+  switching = true;
+  setStatus('', 'switching model…');
+  els.input.disabled = true; els.send.disabled = true;
+  channel.sendText(Tag.Select, id);
 });
 
 // ---- view (Demo/Docs) + mobile tab switching ----

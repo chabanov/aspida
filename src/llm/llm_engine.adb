@@ -80,8 +80,9 @@ package body LLM_Engine is
      (E : Engine; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
       Sink : access LLM_Qwen.Token_Sink'Class := null;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy) return String
-   is (E.Impl.Chat (Conversation, Max_New_Tokens, Sink, Params));
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access Gen_Stats := null) return String
+   is (E.Impl.Chat (Conversation, Max_New_Tokens, Sink, Params, Stats));
 
    function Vocab_Size (E : Engine) return Integer is (E.Impl.Vocab_Size);
    function Arch_Name  (E : Engine) return String  is (E.Impl.Arch_Name);

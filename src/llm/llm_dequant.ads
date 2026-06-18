@@ -20,6 +20,11 @@ with LLM_GGUF;
 
 package LLM_Dequant is
 
+   --  Raised when a tensor uses a GGML quantization type this engine does not
+   --  implement. Failing loudly here (rather than silently zero-filling and
+   --  generating garbage) lets the loader reject an unrunnable model up front.
+   Unsupported_Quant : exception;
+
    -- Q8_K: 256-element super-block, 1 f16 scale per 256 el, 1 byte per el (int8 qs)
    procedure Dequant_Q8_K (X : String; Q : out LLM_Tensor.Tensor; N : Natural)
      with Pre => N mod 256 = 0;
@@ -44,6 +49,11 @@ package LLM_Dequant is
 
    -- Get the number of FP32 elements this tensor produces after dequantization
    function Dequant_Num_Elements (Info : LLM_GGUF.Tensor_Info) return Natural;
+
+   --  True iff this engine implements the given GGML quantization type. Lets a
+   --  loader validate every tensor up front and reject an unrunnable model with
+   --  a clear message, instead of discovering it mid-generation.
+   function Is_Supported (Kind : LLM_GGUF.GGML_Type) return Boolean;
 
    -- Streaming quantized matrix-vector: y[out] = W[out,in] . x[in], where W is
    -- the (still-quantized) 2D tensor described by Info and held raw in Raw.
