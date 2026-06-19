@@ -134,6 +134,63 @@ package body LLM_Quant is
       return R;
    end Quantize_Q4_0;
 
+   function Quantize_Q5_0 (X : Tensor) return String is
+      N      : constant Natural := Numel (X);
+      Blocks : constant Natural := N / 32;
+      R      : String (1 .. Blocks * 22);
+      P      : Natural := 1;
+      procedure Put_Byte (Bt : Natural) is
+      begin R (P) := Character'Val (Bt mod 256); P := P + 1; end Put_Byte;
+   begin
+      for Blk in 0 .. Blocks - 1 loop
+         declare
+            Base   : constant Natural := Blk * 32;
+            Amax   : Float := 0.0;
+            Vmax   : Float := 0.0;        -- signed value at the max-abs position
+            D, Id  : Float;
+            Lo, Hi : Character;
+            Q      : array (0 .. 31) of Integer;
+            QH     : Unsigned_32 := 0;    -- 32 high bits (uint32, little-endian)
+         begin
+            for J in 0 .. 31 loop
+               declare V : constant Float := Get_Flat (X, Base + J + 1);
+               begin if abs V > Amax then Amax := abs V; Vmax := V; end if; end;
+            end loop;
+            --  ggml convention: d = vmax / -16, so the max-abs element is exact.
+            D := (if Amax > 0.0 then Vmax / (-16.0) else 0.0);
+            F32_To_F16 (D, Lo, Hi);
+            Put_Byte (Character'Pos (Lo)); Put_Byte (Character'Pos (Hi));
+
+            Id := (if D /= 0.0 then 1.0 / D else 0.0);
+            for J in 0 .. 31 loop
+               declare
+                  QV : Integer :=
+                    Integer (Float'Rounding (Get_Flat (X, Base + J + 1) * Id)) + 16;
+               begin
+                  if QV < 0 then QV := 0; elsif QV > 31 then QV := 31; end if;
+                  Q (J) := QV;
+               end;
+            end loop;
+
+            --  qh: bit i (0..31) = 5th bit of element i.
+            for J in 0 .. 31 loop
+               if (Q (J) / 16) mod 2 = 1 then
+                  QH := QH or Shift_Left (Unsigned_32 (1), J);
+               end if;
+            end loop;
+            for K in 0 .. 3 loop
+               Put_Byte (Natural (Shift_Right (QH, K * 8) and 16#FF#));
+            end loop;
+
+            --  qs: byte J holds lo4(q[J]) (low nibble) + lo4(q[J+16]) (high).
+            for J in 0 .. 15 loop
+               Put_Byte ((Q (J) mod 16) + 16 * (Q (J + 16) mod 16));
+            end loop;
+         end;
+      end loop;
+      return R;
+   end Quantize_Q5_0;
+
    function Quantize_Q4_K (X : Tensor) return String is
       N  : constant Natural := Numel (X);
       SB : constant Natural := N / 256;
@@ -234,6 +291,120 @@ package body LLM_Quant is
       end loop;
       return R;
    end Quantize_Q4_K;
+
+   function Quantize_Q5_K (X : Tensor) return String is
+      N  : constant Natural := Numel (X);
+      SB : constant Natural := N / 256;
+      R  : String (1 .. SB * 176);
+      P  : Natural := 1;
+      procedure Put_Byte (Bt : Natural) is
+      begin R (P) := Character'Val (Bt mod 256); P := P + 1; end Put_Byte;
+   begin
+      for Block in 0 .. SB - 1 loop
+         declare
+            Base : constant Natural := Block * 256;
+            A    : array (0 .. 7) of Float;    -- per-sub effective scale (>=0)
+            NM   : array (0 .. 7) of Float;    -- per-sub effective neg-min (>=0)
+            Sc_C : array (0 .. 7) of Natural := [others => 0];  -- 6-bit scale
+            Mn_C : array (0 .. 7) of Natural := [others => 0];  -- 6-bit min
+            Q    : array (0 .. 255) of Natural := [others => 0]; -- 5-bit (0..31)
+            D, DMin : Float := 0.0;
+            AmaxA, AmaxM : Float := 0.0;
+            Lo, Hi : Character;
+            Sc : array (0 .. 11) of Natural := [others => 0];
+            QH : array (0 .. 31)  of Natural := [others => 0];
+         begin
+            --  Per 32-element sub-block affine fit: out = A*q - NM, q in 0..31.
+            for S in 0 .. 7 loop
+               declare
+                  Mn : Float := Float'Last; Mx : Float := Float'First; Cmin : Float;
+               begin
+                  for L in 0 .. 31 loop
+                     declare V : constant Float := Get_Flat (X, Base + S * 32 + L + 1);
+                     begin
+                        if V < Mn then Mn := V; end if;
+                        if V > Mx then Mx := V; end if;
+                     end;
+                  end loop;
+                  Cmin := Float'Min (Mn, 0.0);
+                  A (S)  := (Mx - Cmin) / 31.0;     -- 5-bit grid
+                  NM (S) := -Cmin;
+               end;
+            end loop;
+
+            for S in 0 .. 7 loop
+               if A (S)  > AmaxA then AmaxA := A (S);  end if;
+               if NM (S) > AmaxM then AmaxM := NM (S); end if;
+            end loop;
+            D    := AmaxA / 63.0;
+            DMin := AmaxM / 63.0;
+
+            for S in 0 .. 7 loop
+               if D    > 0.0 then Sc_C (S) := Natural (Float'Rounding (A (S)  / D));    end if;
+               if DMin > 0.0 then Mn_C (S) := Natural (Float'Rounding (NM (S) / DMin)); end if;
+               if Sc_C (S) > 63 then Sc_C (S) := 63; end if;
+               if Mn_C (S) > 63 then Mn_C (S) := 63; end if;
+            end loop;
+
+            for S in 0 .. 7 loop
+               declare
+                  ES  : constant Float := D    * Float (Sc_C (S));
+                  EM  : constant Float := DMin * Float (Mn_C (S));
+                  Inv : constant Float := (if ES > 0.0 then 1.0 / ES else 0.0);
+               begin
+                  for L in 0 .. 31 loop
+                     declare
+                        X0 : constant Float := Get_Flat (X, Base + S * 32 + L + 1);
+                        Qv : Integer := Integer (Float'Rounding ((X0 + EM) * Inv));
+                     begin
+                        if Qv < 0 then Qv := 0; elsif Qv > 31 then Qv := 31; end if;
+                        Q (S * 32 + L) := Qv;
+                     end;
+                  end loop;
+               end;
+            end loop;
+
+            --  d, dmin (f16), then the 12 packed 6-bit (scale,min) bytes
+            --  (identical packing to Q4_K / get_scale_min_k4).
+            F32_To_F16 (D, Lo, Hi);
+            Put_Byte (Character'Pos (Lo)); Put_Byte (Character'Pos (Hi));
+            F32_To_F16 (DMin, Lo, Hi);
+            Put_Byte (Character'Pos (Lo)); Put_Byte (Character'Pos (Hi));
+
+            for J in 0 .. 3 loop
+               Sc (J)     := Sc_C (J);
+               Sc (J + 4) := Mn_C (J);
+            end loop;
+            for J in 4 .. 7 loop
+               Sc (J + 4) := (Sc_C (J) mod 16) + (Mn_C (J) mod 16) * 16;
+               Sc (J - 4) := Sc (J - 4) + (Sc_C (J) / 16) * 64;
+               Sc (J)     := Sc (J)     + (Mn_C (J) / 16) * 64;
+            end loop;
+            for J in 0 .. 11 loop Put_Byte (Sc (J)); end loop;
+
+            --  qh (32 bytes): QH[L] bit J = 5th bit of element J*32+L.
+            for L in 0 .. 31 loop
+               declare Bt : Natural := 0;
+               begin
+                  for J in 0 .. 7 loop
+                     Bt := Bt + ((Q (J * 32 + L) / 16) mod 2) * (2 ** J);
+                  end loop;
+                  QH (L) := Bt;
+               end;
+            end loop;
+            for L in 0 .. 31 loop Put_Byte (QH (L)); end loop;
+
+            --  qs (128 bytes): byte (G*32+L) = lo4(q[2G*32+L]) | lo4(q[(2G+1)*32+L])<<4.
+            for G in 0 .. 3 loop
+               for L in 0 .. 31 loop
+                  Put_Byte ((Q ((2 * G) * 32 + L) mod 16)
+                            + 16 * (Q ((2 * G + 1) * 32 + L) mod 16));
+               end loop;
+            end loop;
+         end;
+      end loop;
+      return R;
+   end Quantize_Q5_K;
 
    function Quantize_Q6_K (X : Tensor) return String is
       N  : constant Natural := Numel (X);

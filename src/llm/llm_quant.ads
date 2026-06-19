@@ -22,11 +22,26 @@ package LLM_Quant is
    function Quantize_Q4_0 (X : Tensor) return String
      with Pre => Numel (X) mod 32 = 0;
 
+   --  Encode a tensor as ggml Q5_0 raw bytes (legacy 5-bit, symmetric):
+   --  32-element blocks, f16 scale + 4-byte qh (5th bit of each element) + 16
+   --  packed low nibbles. Dequant is x = d*(q-16), q in 0..31. Inverse of
+   --  LLM_Dequant.Dequant_Q5_0.
+   function Quantize_Q5_0 (X : Tensor) return String
+     with Pre => Numel (X) mod 32 = 0;
+
    --  Encode a tensor as ggml Q4_K raw bytes (4-bit K-quant, the common
    --  community format): 256-element super-blocks with per-32 affine
    --  (6-bit scale + 6-bit min) under a shared f16 d/dmin. Inverse of
    --  LLM_Dequant.Dequant_Q4_K. Numel(X) must be a multiple of 256.
    function Quantize_Q4_K (X : Tensor) return String
+     with Pre => Numel (X) mod 256 = 0;
+
+   --  Encode a tensor as ggml Q5_K raw bytes (5-bit K-quant; what Q5_K_M mixes
+   --  use for most weights): like Q4_K (256-elem super-blocks, per-32 affine
+   --  6-bit scale+min under shared f16 d/dmin) but each quant is 5-bit, the
+   --  high bit packed into a 32-byte qh. Inverse of LLM_Dequant.Dequant_Q5_K.
+   --  Numel(X) must be a multiple of 256.
+   function Quantize_Q5_K (X : Tensor) return String
      with Pre => Numel (X) mod 256 = 0;
 
    --  Encode a tensor as ggml Q6_K raw bytes (6-bit K-quant, the high-fidelity

@@ -197,6 +197,144 @@ package body LLM_Dequant is
       end loop;
    end Dequant_Q6_K;
 
+   --  Q3_K super-block (llama.cpp block_q3_K, 110 bytes / 256 elements):
+   --    uint8_t hmask[32]; -- 3rd (high) bit of each 3-bit quant
+   --    uint8_t qs[64];    -- low 2 bits, 4 quants per byte
+   --    uint8_t scales[12];-- 16 signed 6-bit scales, packed (get from kmask1/2)
+   --    ggml_half d;       -- super-block scale
+   --  Value: y = d*(scale[is]-32)*((qs_2bit | hbit<<2) - 4), per 16-element group.
+   --  Reference: llama.cpp dequantize_row_q3_K (m shifts per j across 2 halves).
+   procedure Decode_Q3K_Block (X : String; Pos : Natural; B : out Block256) is
+      function U8 (P : Natural) return Unsigned_32 is
+        (Unsigned_32 (Character'Pos (X (P))));
+      function LE32 (P : Natural) return Unsigned_32 is
+        (U8 (P) or Shift_Left (U8 (P + 1), 8)
+         or Shift_Left (U8 (P + 2), 16) or Shift_Left (U8 (P + 3), 24));
+      HM_Base : constant Natural := Pos;          -- hmask[32]
+      QS_Base : constant Natural := Pos + 32;     -- qs[64]
+      SC_Base : constant Natural := Pos + 96;     -- scales[12]
+      D_All   : constant Float := F16_To_F32
+        (Byte (Character'Pos (X (Pos + 108))),
+         Byte (Character'Pos (X (Pos + 109))));
+      KM1 : constant Unsigned_32 := 16#0303_0303#;   -- low 2 bits per byte
+      KM2 : constant Unsigned_32 := 16#0F0F_0F0F#;   -- low 4 bits per byte
+      A0  : constant Unsigned_32 := LE32 (SC_Base);
+      A1  : constant Unsigned_32 := LE32 (SC_Base + 4);
+      Tmp : constant Unsigned_32 := LE32 (SC_Base + 8);
+      --  16 six-bit scales spread across these four words (4 bytes each):
+      S0  : constant Unsigned_32 :=
+        (A0 and KM2) or Shift_Left (Shift_Right (Tmp, 0) and KM1, 4);
+      S1  : constant Unsigned_32 :=
+        (A1 and KM2) or Shift_Left (Shift_Right (Tmp, 2) and KM1, 4);
+      S2  : constant Unsigned_32 :=
+        (Shift_Right (A0, 4) and KM2) or Shift_Left (Shift_Right (Tmp, 4) and KM1, 4);
+      S3  : constant Unsigned_32 :=
+        (Shift_Right (A1, 4) and KM2) or Shift_Left (Shift_Right (Tmp, 6) and KM1, 4);
+
+      function Scale (Idx : Natural) return Integer is
+         W : Unsigned_32;
+         K : constant Natural := Idx mod 4;
+      begin
+         case Idx / 4 is
+            when 0      => W := S0;
+            when 1      => W := S1;
+            when 2      => W := S2;
+            when others => W := S3;
+         end case;
+         return Integer (Shift_Right (W, 8 * K) and 16#FF#) - 32;
+      end Scale;
+   begin
+      for P in 0 .. 255 loop
+         declare
+            NH   : constant Natural := P / 128;        -- which 128-half
+            Pp   : constant Natural := P mod 128;
+            J    : constant Natural := Pp / 32;        -- 2-bit field (shift 2*J)
+            Rm   : constant Natural := Pp mod 32;
+            G    : constant Natural := Rm / 16;        -- group {0,1} within the 32
+            L    : constant Natural := Rm mod 16;
+            QIdx : constant Natural := QS_Base + NH * 32 + G * 16 + L;
+            HIdx : constant Natural := HM_Base + G * 16 + L;
+            Low2 : constant Integer :=
+              Integer (Shift_Right (U8 (QIdx), 2 * J) and 3);
+            HBit : constant Integer :=
+              (if (U8 (HIdx) and Shift_Left (Unsigned_32 (1), NH * 4 + J)) /= 0
+               then 1 else 0);
+            Sg   : constant Integer := Low2 + 4 * HBit - 4;     -- signed -4..3
+            Iss  : constant Natural := NH * 8 + J * 2 + G;
+         begin
+            B (P + 1) := D_All * Float (Scale (Iss)) * Float (Sg);
+         end;
+      end loop;
+   end Decode_Q3K_Block;
+
+   procedure Dequant_Q3_K (X : String; Q : out Tensor; N : Natural) is
+      Blocks : constant Natural := N / 256;
+      Bk     : Block256;
+      QP     : Natural := 1;
+   begin
+      for Blk in 0 .. Blocks - 1 loop
+         Decode_Q3K_Block (X, X'First + Blk * 110, Bk);
+         for I in 1 .. 256 loop
+            Set_Flat (Q, QP, Bk (I));
+            QP := QP + 1;
+         end loop;
+      end loop;
+   end Dequant_Q3_K;
+
+   --  Q2_K super-block (llama.cpp block_q2_K, 84 bytes / 256 elements):
+   --    uint8_t scales[16]; -- per-16: 4-bit scale (low nibble) + 4-bit min (high)
+   --    uint8_t qs[64];     -- 2-bit quants, 4 per byte
+   --    ggml_half d;        -- super-block scale for the 4-bit scales
+   --    ggml_half dmin;     -- super-block scale for the 4-bit mins
+   --  Value: y = d*(sc & 0xF)*q2 - dmin*(sc >> 4), per 16-element group.
+   --  Reference: llama.cpp dequantize_row_q2_K.
+   procedure Decode_Q2K_Block (X : String; Pos : Natural; B : out Block256) is
+      function U8 (P : Natural) return Unsigned_32 is
+        (Unsigned_32 (Character'Pos (X (P))));
+      SC_Base : constant Natural := Pos;          -- scales[16]
+      QS_Base : constant Natural := Pos + 16;     -- qs[64]
+      D       : constant Float := F16_To_F32
+        (Byte (Character'Pos (X (Pos + 80))),
+         Byte (Character'Pos (X (Pos + 81))));
+      DMin    : constant Float := F16_To_F32
+        (Byte (Character'Pos (X (Pos + 82))),
+         Byte (Character'Pos (X (Pos + 83))));
+   begin
+      for P in 0 .. 255 loop
+         declare
+            NH   : constant Natural := P / 128;
+            Pp   : constant Natural := P mod 128;
+            J    : constant Natural := Pp / 32;        -- 2-bit field (shift 2*J)
+            Rm   : constant Natural := Pp mod 32;
+            G    : constant Natural := Rm / 16;        -- group {0,1}
+            L    : constant Natural := Rm mod 16;
+            QIdx : constant Natural := QS_Base + NH * 32 + G * 16 + L;
+            Iss  : constant Natural := NH * 8 + J * 2 + G;
+            Sc   : constant Unsigned_32 := U8 (SC_Base + Iss);
+            Q2   : constant Float :=
+              Float (Shift_Right (U8 (QIdx), 2 * J) and 3);
+            Dl   : constant Float := D    * Float (Sc and 16#0F#);
+            Ml   : constant Float := DMin * Float (Shift_Right (Sc, 4));
+         begin
+            B (P + 1) := Dl * Q2 - Ml;
+         end;
+      end loop;
+   end Decode_Q2K_Block;
+
+   procedure Dequant_Q2_K (X : String; Q : out Tensor; N : Natural) is
+      Blocks : constant Natural := N / 256;
+      Bk     : Block256;
+      QP     : Natural := 1;
+   begin
+      for Blk in 0 .. Blocks - 1 loop
+         Decode_Q2K_Block (X, X'First + Blk * 84, Bk);
+         for I in 1 .. 256 loop
+            Set_Flat (Q, QP, Bk (I));
+            QP := QP + 1;
+         end loop;
+      end loop;
+   end Dequant_Q2_K;
+
    --------------------------------------------------------------------
    -- Q4_K dequantization
    --
@@ -615,6 +753,8 @@ package body LLM_Dequant is
          when LLM_GGUF.GGML_TYPE_Q8_K => Dequant_Q8_K (Raw, Result, N);
          when LLM_GGUF.GGML_TYPE_Q6_K => Dequant_Q6_K (Raw, Result, N);
          when LLM_GGUF.GGML_TYPE_Q4_K => Dequant_Q4_K (Raw, Result, N);
+         when LLM_GGUF.GGML_TYPE_Q3_K => Dequant_Q3_K (Raw, Result, N);
+         when LLM_GGUF.GGML_TYPE_Q2_K => Dequant_Q2_K (Raw, Result, N);
          when LLM_GGUF.GGML_TYPE_Q8_0 => Dequant_Q8_0 (Raw, Result, N);
          when LLM_GGUF.GGML_TYPE_Q4_0 => Dequant_Q4_0 (Raw, Result, N);
          when LLM_GGUF.GGML_TYPE_Q5_0 => Dequant_Q5_0 (Raw, Result, N);
@@ -626,7 +766,7 @@ package body LLM_Dequant is
             raise Unsupported_Quant with
               "unsupported GGML quantization type "
               & LLM_GGUF.GGML_Type'Image (Info.Kind)
-              & " (e.g. Q2_K/Q3_K/IQ* are not implemented)";
+              & " (e.g. IQ* / ternary types are not implemented)";
       end case;
    end Fill;
 
@@ -638,6 +778,7 @@ package body LLM_Dequant is
         | LLM_GGUF.GGML_TYPE_BF16
         | LLM_GGUF.GGML_TYPE_Q8_0 | LLM_GGUF.GGML_TYPE_Q4_0
         | LLM_GGUF.GGML_TYPE_Q5_0
+        | LLM_GGUF.GGML_TYPE_Q2_K | LLM_GGUF.GGML_TYPE_Q3_K
         | LLM_GGUF.GGML_TYPE_Q4_K | LLM_GGUF.GGML_TYPE_Q5_K
         | LLM_GGUF.GGML_TYPE_Q6_K | LLM_GGUF.GGML_TYPE_Q8_K;
    end Is_Supported;
@@ -671,10 +812,14 @@ package body LLM_Dequant is
       Is_Q5K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q5_K;
       Is_Q6K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q6_K;
       Is_Q4K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q4_K;
-      Fused    : constant Boolean := Is_Q5K or else Is_Q6K or else Is_Q4K;
+      Is_Q3K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q3_K;
+      Is_Q2K   : constant Boolean := Kind = LLM_GGUF.GGML_TYPE_Q2_K;
+      Fused    : constant Boolean :=
+        Is_Q5K or else Is_Q6K or else Is_Q4K or else Is_Q3K or else Is_Q2K;
       N_Blk    : constant Integer := In_Dim / 256;
       Blk_Bytes : constant Integer :=
-        (if Is_Q5K then 176 elsif Is_Q6K then 210 elsif Is_Q4K then 144 else 0);
+        (if Is_Q5K then 176 elsif Is_Q6K then 210 elsif Is_Q4K then 144
+         elsif Is_Q3K then 110 elsif Is_Q2K then 84 else 0);
       Row_Info : LLM_GGUF.Tensor_Info := Info;
       BPR      : Natural;
 
@@ -730,8 +875,12 @@ package body LLM_Dequant is
                               Decode_Q5K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
                            elsif Is_Q4K then
                               Decode_Q4K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
-                           else
+                           elsif Is_Q6K then
                               Decode_Q6K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
+                           elsif Is_Q3K then
+                              Decode_Q3K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
+                           else
+                              Decode_Q2K_Block (Raw, RS + Blk * Blk_Bytes, Bk);
                            end if;
                            declare
                               Base : constant Integer := Blk * 256;

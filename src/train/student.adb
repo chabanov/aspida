@@ -322,9 +322,9 @@ package body Student is
          Ne0     : constant Natural := Dims (Dims'First);
          Aligned : constant Boolean :=
            (case Fmt is
-               when Q_Q4_K | Q_Q6_K => Ne0 mod 256 = 0,
-               when Q_Q8_0 | Q_Q4_0 => Ne0 mod 32 = 0,
-               when Q_None          => False);
+               when Q_Q4_K | Q_Q5_K | Q_Q6_K   => Ne0 mod 256 = 0,
+               when Q_Q8_0 | Q_Q4_0 | Q_Q5_0   => Ne0 mod 32 = 0,
+               when Q_None                     => False);
       begin
          if Aligned then
             declare
@@ -338,8 +338,12 @@ package body Student is
                      Add_Tensor_Q8_0 (B, Name, Dims, LLM_Quant.Quantize_Q8_0 (T));
                   when Q_Q4_0 =>
                      Add_Tensor_Q4_0 (B, Name, Dims, LLM_Quant.Quantize_Q4_0 (T));
+                  when Q_Q5_0 =>
+                     Add_Tensor_Q5_0 (B, Name, Dims, LLM_Quant.Quantize_Q5_0 (T));
                   when Q_Q4_K =>
                      Add_Tensor_Q4_K (B, Name, Dims, LLM_Quant.Quantize_Q4_K (T));
+                  when Q_Q5_K =>
+                     Add_Tensor_Q5_K (B, Name, Dims, LLM_Quant.Quantize_Q5_K (T));
                   when Q_Q6_K =>
                      Add_Tensor_Q6_K (B, Name, Dims, LLM_Quant.Quantize_Q6_K (T));
                   when Q_None => null;

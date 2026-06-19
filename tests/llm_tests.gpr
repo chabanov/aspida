@@ -18,7 +18,8 @@ project LLM_Tests is
                  "test_tokenizer_real.adb", "test_weights_real.adb", "test_qmatvec_real.adb",
                  "test_gemma.adb",
                  "test_qmatvec_q4k.adb", "test_qmatvec_guard.adb",
-                 "test_quant.adb", "test_ctx_window.adb",
+                 "test_quant.adb", "test_q3k_real.adb", "test_q2k_real.adb",
+                 "test_ctx_window.adb",
                  "test_rope_scale.adb", "test_kv_pool.adb",
                  "test_pool.adb");
 

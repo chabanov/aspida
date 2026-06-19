@@ -128,6 +128,47 @@ begin
       end;
    end;
 
+   New_Line; Put_Line ("--- Q5_0 (legacy 5-bit) ---");
+   declare
+      Info50 : constant LLM_GGUF.Tensor_Info :=
+        (Name => Null_Unbounded_String, N_Dims => 2, Dims => [N, 1, 0, 0],
+         Kind => LLM_GGUF.GGML_TYPE_Q5_0, Offset => 0);
+      function RT_Err50 (X : Tensor) return Float is
+        (Deq_Err (X, LLM_Quant.Quantize_Q5_0 (X), Info50));
+   begin
+      --  5-bit symmetric: finer than Q4_0 (32 levels vs 16) but coarser than Q8.
+      declare
+         X : Tensor := New_Tensor ([1, N]);
+      begin
+         for I in 1 .. N loop
+            Set_Flat (X, I, Float (((I * 37) mod 200) - 100) / 110.0);
+         end loop;
+         Check ("Q5_0 varied values within 5-bit bound", RT_Err50 (X) < 0.05);
+      end;
+
+      declare
+         X : Tensor := New_Tensor ([1, N]);
+      begin
+         for I in 1 .. N loop Set_Flat (X, I, 0.0); end loop;
+         Check ("Q5_0 all-zero is exact", RT_Err50 (X) = 0.0);
+      end;
+
+      --  The max-abs element is exact under Q5_0's signed-scale (d = vmax/-16).
+      declare
+         X : Tensor := New_Tensor ([1, N]);
+      begin
+         for I in 1 .. N loop Set_Flat (X, I, 0.05); end loop;
+         Set_Flat (X, 7, -0.9);
+         declare
+            S : constant String := LLM_Quant.Quantize_Q5_0 (X);
+            Q : constant Tensor := LLM_Dequant.Dequantize (Info50, S);
+         begin
+            Check ("Q5_0 max-abs element reproduced exactly",
+                   abs (Get_Flat (Q, 7) - (-0.9)) < 1.0e-3);
+         end;
+      end;
+   end;
+
    New_Line; Put_Line ("--- Q4_K (256-element super-blocks) ---");
    declare
       NK    : constant := 256;
@@ -164,6 +205,42 @@ begin
       end loop;
       Check ("Q4_K mixed positive/spanning sub-blocks within bound",
              ErrK < 0.15);
+   end;
+
+   New_Line; Put_Line ("--- Q5_K (5-bit super-blocks) ---");
+   declare
+      NK    : constant := 256;
+      Info5 : constant LLM_GGUF.Tensor_Info :=
+        (Name => Null_Unbounded_String, N_Dims => 2, Dims => [NK, 1, 0, 0],
+         Kind => LLM_GGUF.GGML_TYPE_Q5_K, Offset => 0);
+      X : Tensor := New_Tensor ([1, NK]);
+      function Err5 return Float is
+         S : constant String := LLM_Quant.Quantize_Q5_K (X);
+         Q : constant Tensor := LLM_Dequant.Dequantize (Info5, S);
+         M : Float := 0.0;
+      begin
+         for I in 1 .. NK loop
+            M := Float'Max (M, abs (Get_Flat (X, I) - Get_Flat (Q, I)));
+         end loop;
+         return M;
+      end Err5;
+   begin
+      --  5-bit affine: tighter than Q4_K (32 levels per sub-block vs 16).
+      for I in 1 .. NK loop
+         Set_Flat (X, I, Float (((I * 37) mod 200) - 100) / 110.0);
+      end loop;
+      Check ("Q5_K varied values within 5-bit bound", Err5 < 0.05);
+
+      for I in 1 .. NK loop Set_Flat (X, I, 0.0); end loop;
+      Check ("Q5_K all-zero is exact", Err5 = 0.0);
+
+      --  All-positive sub-block (exercises the shared neg-min sign path) mixed
+      --  with spanning ones — same as the Q4_K stress case, must round-trip.
+      for I in 1 .. NK loop
+         Set_Flat (X, I, (if I <= 32 then 0.6
+                          else Float (((I * 13) mod 100) - 50) / 60.0));
+      end loop;
+      Check ("Q5_K mixed positive/spanning sub-blocks within bound", Err5 < 0.05);
    end;
 
    New_Line; Put_Line ("--- Q6_K (6-bit super-blocks) ---");
