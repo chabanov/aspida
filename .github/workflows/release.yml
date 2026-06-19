@@ -64,7 +64,7 @@ jobs:
           done
 
       - name: Build test
-        uses: alire-project/setup-alire@v4
+        uses: alire-project/setup-alire@v6
         with:
           toolchain: gnat_native^15 gprbuild
 
