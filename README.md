@@ -199,7 +199,7 @@ make prove
 - [x] Gemma validation (gemma4 E4B — real-model smoke test)
 - [x] Quantization-aware training (fake-quant + STE, demonstrated 2-bit robustness)
 - [x] Full GGML quant coverage — read all standard formats (Q2_K–Q6_K, Q4_0/Q5_0/Q8_0); export six formats from the trainer
-- [ ] GPU kernels for Q2_K/Q3_K (currently CPU-only; Q4_K/Q5_K/Q6_K are on GPU)
+- [x] GPU kernels for Q2_K/Q3_K — CUDA matvec/matmul (kinds 3/4), validated on an NVIDIA GPU vs CPU reference (`gpu/test_matvec.cu`)
 - [ ] SSM selective scan (Mamba) — needs a Mamba GGUF reference
 - [ ] mRoPE positional encoding — only relevant for multimodal (image/video)
 - [ ] Multi-GPU support
