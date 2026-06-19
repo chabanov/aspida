@@ -164,6 +164,42 @@ package body Train is
       end loop;
    end SiLU_Backward;
 
+   procedure Fake_Quant_Forward (X : Matrix; Bits : Positive; Y : out Matrix) is
+      Q_Max : constant Real := Real (2 ** (Bits - 1) - 1);   -- e.g. 127 for 8-bit
+      Amax  : Real := 0.0;
+   begin
+      for I in X'Range (1) loop
+         for J in X'Range (2) loop
+            if abs (X (I, J)) > Amax then Amax := abs (X (I, J)); end if;
+         end loop;
+      end loop;
+      if Amax = 0.0 or else Q_Max = 0.0 then
+         Y := X;                       -- degenerate: nothing to quantize
+         return;
+      end if;
+      declare
+         Scale : constant Real := Amax / Q_Max;     -- per-tensor symmetric step
+      begin
+         for I in X'Range (1) loop
+            for J in X'Range (2) loop
+               --  round-to-nearest onto the grid, clamp, then dequantize
+               declare
+                  Q : Real := Real'Rounding (X (I, J) / Scale);
+               begin
+                  if Q > Q_Max then Q := Q_Max; end if;
+                  if Q < -Q_Max then Q := -Q_Max; end if;
+                  Y (I, J) := Q * Scale;
+               end;
+            end loop;
+         end loop;
+      end;
+   end Fake_Quant_Forward;
+
+   procedure Fake_Quant_Backward (DY : Matrix; DX : out Matrix) is
+   begin
+      DX := DY;   -- straight-through estimator: rounding treated as identity
+   end Fake_Quant_Backward;
+
    --------------------------------------------------------------------
    --  RMSNorm
    --------------------------------------------------------------------

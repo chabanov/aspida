@@ -100,8 +100,69 @@ package body GGUF_Write is
       for E of Data loop
          Append (T.Data, B_F32 (E));
       end loop;
+      T.Kind := 0;   -- F32
       B.Tens.Append (T);
    end Add_Tensor_F32;
+
+   procedure Add_Tensor_Q8_0
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+   is
+      T : Tensor_Rec;
+   begin
+      T.Name   := To_Unbounded_String (Name);
+      T.N_Dims := Dims'Length;
+      for I in 1 .. Dims'Length loop
+         T.Dims (I) := Dims (Dims'First + I - 1);
+      end loop;
+      T.Kind := 8;   -- ggml Q8_0
+      T.Data := To_Unbounded_String (Raw);
+      B.Tens.Append (T);
+   end Add_Tensor_Q8_0;
+
+   procedure Add_Tensor_Q4_0
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+   is
+      T : Tensor_Rec;
+   begin
+      T.Name   := To_Unbounded_String (Name);
+      T.N_Dims := Dims'Length;
+      for I in 1 .. Dims'Length loop
+         T.Dims (I) := Dims (Dims'First + I - 1);
+      end loop;
+      T.Kind := 2;   -- ggml Q4_0
+      T.Data := To_Unbounded_String (Raw);
+      B.Tens.Append (T);
+   end Add_Tensor_Q4_0;
+
+   procedure Add_Tensor_Q4_K
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+   is
+      T : Tensor_Rec;
+   begin
+      T.Name   := To_Unbounded_String (Name);
+      T.N_Dims := Dims'Length;
+      for I in 1 .. Dims'Length loop
+         T.Dims (I) := Dims (Dims'First + I - 1);
+      end loop;
+      T.Kind := 12;   -- ggml Q4_K
+      T.Data := To_Unbounded_String (Raw);
+      B.Tens.Append (T);
+   end Add_Tensor_Q4_K;
+
+   procedure Add_Tensor_Q6_K
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+   is
+      T : Tensor_Rec;
+   begin
+      T.Name   := To_Unbounded_String (Name);
+      T.N_Dims := Dims'Length;
+      for I in 1 .. Dims'Length loop
+         T.Dims (I) := Dims (Dims'First + I - 1);
+      end loop;
+      T.Kind := 14;   -- ggml Q6_K
+      T.Data := To_Unbounded_String (Raw);
+      B.Tens.Append (T);
+   end Add_Tensor_Q6_K;
 
    --------------------------------------------------------------------
    --  Save
@@ -145,7 +206,7 @@ package body GGUF_Write is
          for D in 1 .. T.N_Dims loop
             Append (TI, B_U64 (Unsigned_64 (T.Dims (D))));
          end loop;
-         Append (TI, B_U32 (0));                      -- GGML type 0 = F32
+         Append (TI, B_U32 (Unsigned_32 (T.Kind)));   -- GGML type (0=F32, 8=Q8_0)
          Append (TI, B_U64 (Unsigned_64 (Off)));
          Off := Round_Up (Off + Length (T.Data));
       end loop;

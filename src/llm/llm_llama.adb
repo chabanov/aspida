@@ -1129,7 +1129,18 @@ package body LLM_Llama is
          Active := Active - 1;
       end Retire;
    begin
-      accept Init (Mdl : Llama_Model) do M := Mdl; end Init;
+      --  Wait for the (single-shot) Init, but allow this library-level task to
+      --  terminate when the program ends without ever using the scheduler — the
+      --  Forward_Logits / direct-forward tools never call Sched.Init, so without
+      --  the terminate alternative this task would park here forever and block
+      --  the whole program from exiting (collective termination needs every
+      --  library task at a terminate point). The server always calls Init, so
+      --  it takes the accept and runs the loop below indefinitely as before.
+      select
+         accept Init (Mdl : Llama_Model) do M := Mdl; end Init;
+      or
+         terminate;
+      end select;
       Ctx_Cap := Configured_Ctx (M.Ctx);
       Ada.Text_IO.Put_Line
         ("  context window:" & Ctx_Cap'Image & " tokens (model"
