@@ -17,7 +17,8 @@ package LLM_GPU is
    function Available return Boolean;
 
    --  y[out] = W . x[in], with W the still-quantized bytes at W_Addr (Kind:
-   --  0 = Q4_K, 1 = Q6_K). X/Y point to In_Dim / Out_Dim contiguous C floats.
+   --  0=Q4_K, 1=Q6_K, 2=Q5_K, 3=Q3_K, 4=Q2_K). X/Y point to In_Dim / Out_Dim
+   --  contiguous C floats.
    procedure MatVec
      (W_Addr  : System.Address;
       W_Bytes : Long_Long_Integer;

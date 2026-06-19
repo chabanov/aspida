@@ -18,7 +18,7 @@ src/
 │   ├── llm_gemma.ads/adb        — Gemma 3n E4B backend
 │   ├── llm_sampler.ads/adb      — Unified sampling (temp, top-k, top-p)
 │   ├── llm_gguf.ads/adb         — GGUF parser (metadata + tensors)
-│   ├── llm_dequant.ads/adb      — Q4_K/Q5_K/Q6_K/Q8_K dequantization
+│   ├── llm_dequant.ads/adb      — all GGML dequant + quant (Q2_K–Q6_K, Q*_0)
 │   ├── llm_weight.ads/adb       — Weight abstraction (dense + quantized)
 │   ├── llm_tensor.ads/adb       — Tensor operations
 │   ├── llm_pool.ads/adb         — Persistent thread pool
@@ -67,7 +67,7 @@ src/
 ## GPU Offload
 
 - Runtime dlopen CUDA shim (`libaspidagpu.so`)
-- Q4_K/Q6_K kernels з block-level parallelism
+- Kernels для всіх 5 K-квантів (Q2_K–Q6_K) з block-level parallelism (validated на L40S)
 - Активація: `ASPIDA_GPU=1`
 - Автоматичний fallback на CPU
 
@@ -117,7 +117,7 @@ make llm-clean          # Очистити build artifacts
 | `src/llm/llm_gpu.ads` | CUDA offload dispatch |
 | `src/server/openai_proxy.adb` | OpenAI API server |
 | `src/secure/secure_channel.ads` | Encrypted communication |
-| `gpu/gpu_matvec.cu` | CUDA kernels for Q4_K/Q6_K |
+| `gpu/gpu_matvec.cu` | CUDA kernels for all 5 K-quants (Q2_K–Q6_K) |
 | `Makefile` | Build targets |
 | `server.gpr` | GNAT project file |
 
@@ -154,7 +154,7 @@ make llm-clean          # Очистити build artifacts
 ## Статус реалізації
 
 **Готово:**
-- ✅ GGUF parser (F32/F16/Q4_K/Q5_K/Q6_K/Q8_K)
+- ✅ GGUF parser + dequant: усі стандартні формати (F32/F16/BF16, Q4_0/Q5_0/Q8_0, Q2_K–Q6_K, Q8_K); квантувальник на 6 форматів + requant CLI
 - ✅ BPE tokenizer (SentencePiece support)
 - ✅ ChatML multi-turn conversation
 - ✅ Streaming UI with throughput metrics

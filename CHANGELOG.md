@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gemma 3n E4B backend (validation in progress)
 - Training/distillation infrastructure
 - WebSocket bridge for browser clients
+- Full GGML quant **read** coverage: Q3_K and Q2_K decoders (validated against
+  real Llama-3.2-1B Q3_K and TinyLlama Q2_K) — the engine now dequantizes every
+  standard GGML weight format
+- Quant **write**: from-scratch quantizers for Q5_0, Q4_K, Q5_K, Q6_K (joining
+  Q8_0/Q4_0), all round-trip-tested; the trainer exports six formats
+- Fused decode+dot CPU matvec for all five K-quants (Q2_K–Q6_K)
+- GPU CUDA kernels for Q3_K/Q2_K (matvec + batched matmul), validated on an L40S
+- `requantize` CLI — convert any GGUF between formats, incl. `q4_k_m`/`q5_k_m`
+  mixes (sensitive tensors → Q6_K), metadata preserved byte-exact
+- `test_kquant_synth` — model-free CI test for the Q2_K/Q3_K decoders
 
 ### Changed
 - Refactored backend interface to polymorphic Model_Backend

@@ -1,7 +1,7 @@
 // Stream B — GPU matvec shim for the Ada engine (LLM_GPU dlopen's this).
 // Exposes one C entry point; weights are uploaded to VRAM once (cached by host
-// pointer) and stay resident across tokens. Q4_K + Q6_K, bit-exact vs the CPU
-// engine (build with --fmad=false). Build:
+// pointer) and stay resident across tokens. All five K-quants (Q4_K/Q5_K/Q6_K/
+// Q3_K/Q2_K), bit-exact vs the CPU engine (build with --fmad=false). Build:
 //   nvcc -O3 --fmad=false -arch=native -shared -Xcompiler -fPIC gpu_matvec.cu -o libaspidagpu.so
 #include <cuda_fp16.h>
 #include <unordered_map>
@@ -29,7 +29,30 @@ __device__ void deq_q5k(const uint8_t*b,float*o){ float d=f16(b),dm=f16(b+2); co
     for(int l=0;l<32;++l){unsigned q=qs[32*g+l];int lo=(q&0xF)+(((qh[l]>>(2*g))&1)<<4);int hi=(q>>4)+(((qh[l]>>(2*g+1))&1)<<4);
       o[64*g+l]=d1*lo-mm1; o[64*g+32+l]=d2*hi-mm2;}}}
 
+__device__ __forceinline__ uint32_t ld32(const uint8_t*p){return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
+// Q3_K: 110 B/256. hmask[32] qs[64](2-bit) scales[12](16 signed 6-bit) d(f16).
+// 16 scales unpacked (kmask1=0x03030303, kmask2=0x0f0f0f0f) into sca[is]-32.
+__device__ __forceinline__ void q3k_scales(const uint8_t*sc,int*sca){
+  uint32_t a0=ld32(sc),a1=ld32(sc+4),tmp=ld32(sc+8),KM1=0x03030303u,KM2=0x0f0f0f0fu;
+  uint32_t S0=(a0&KM2)|(((tmp>>0)&KM1)<<4), S1=(a1&KM2)|(((tmp>>2)&KM1)<<4);
+  uint32_t S2=((a0>>4)&KM2)|(((tmp>>4)&KM1)<<4), S3=((a1>>4)&KM2)|(((tmp>>6)&KM1)<<4);
+  for(int k=0;k<4;++k){sca[k]=(int)((S0>>(8*k))&0xFF)-32; sca[4+k]=(int)((S1>>(8*k))&0xFF)-32;
+                       sca[8+k]=(int)((S2>>(8*k))&0xFF)-32; sca[12+k]=(int)((S3>>(8*k))&0xFF)-32;}}
+__device__ void deq_q3k(const uint8_t*b,float*o){
+  const uint8_t*hm=b,*qs=b+32,*sc=b+96; float d=f16(b+108); int sca[16]; q3k_scales(sc,sca);
+  for(int P=0;P<256;++P){int nh=P>>7,pp=P&127,j=pp>>5,rm=pp&31,g=rm>>4,l=rm&15;
+    int low2=(qs[nh*32+g*16+l]>>(2*j))&3, hbit=(hm[g*16+l]>>(nh*4+j))&1, is=nh*8+j*2+g;
+    o[P]=d*sca[is]*(float)(low2+4*hbit-4);}}
+// Q2_K: 84 B/256. scales[16](4-bit scale|4-bit min) qs[64](2-bit) d(f16) dmin(f16).
+__device__ void deq_q2k(const uint8_t*b,float*o){
+  const uint8_t*sc=b,*qs=b+16; float d=f16(b+80),dm=f16(b+82);
+  for(int P=0;P<256;++P){int nh=P>>7,pp=P&127,j=pp>>5,rm=pp&31,g=rm>>4,l=rm&15;
+    int q2=(qs[nh*32+g*16+l]>>(2*j))&3, is=nh*8+j*2+g;
+    o[P]=d*(sc[is]&0xF)*(float)q2 - dm*(sc[is]>>4);}}
+
 __global__ void k_q4k(const uint8_t*w,const float*x,float*y,int in,int out){int o=blockIdx.x*blockDim.x+threadIdx.x;if(o>=out)return;int nb=in/256;size_t bpr=(size_t)nb*144;const uint8_t*r=w+(size_t)o*bpr;float t[256],a=0;for(int b=0;b<nb;++b){deq_q4k(r+(size_t)b*144,t);int bs=b*256;for(int l=0;l<256;++l)a+=t[l]*x[bs+l];}y[o]=a;}
+__global__ void k_q3k(const uint8_t*w,const float*x,float*y,int in,int out){int o=blockIdx.x*blockDim.x+threadIdx.x;if(o>=out)return;int nb=in/256;size_t bpr=(size_t)nb*110;const uint8_t*r=w+(size_t)o*bpr;float t[256],a=0;for(int b=0;b<nb;++b){deq_q3k(r+(size_t)b*110,t);int bs=b*256;for(int l=0;l<256;++l)a+=t[l]*x[bs+l];}y[o]=a;}
+__global__ void k_q2k(const uint8_t*w,const float*x,float*y,int in,int out){int o=blockIdx.x*blockDim.x+threadIdx.x;if(o>=out)return;int nb=in/256;size_t bpr=(size_t)nb*84;const uint8_t*r=w+(size_t)o*bpr;float t[256],a=0;for(int b=0;b<nb;++b){deq_q2k(r+(size_t)b*84,t);int bs=b*256;for(int l=0;l<256;++l)a+=t[l]*x[bs+l];}y[o]=a;}
 __global__ void k_q6k(const uint8_t*w,const float*x,float*y,int in,int out){int o=blockIdx.x*blockDim.x+threadIdx.x;if(o>=out)return;int nb=in/256;size_t bpr=(size_t)nb*210;const uint8_t*r=w+(size_t)o*bpr;float t[256],a=0;for(int b=0;b<nb;++b){deq_q6k(r+(size_t)b*210,t);int bs=b*256;for(int l=0;l<256;++l)a+=t[l]*x[bs+l];}y[o]=a;}
 __global__ void k_q5k(const uint8_t*w,const float*x,float*y,int in,int out){int o=blockIdx.x*blockDim.x+threadIdx.x;if(o>=out)return;int nb=in/256;size_t bpr=(size_t)nb*176;const uint8_t*r=w+(size_t)o*bpr;float t[256],a=0;for(int b=0;b<nb;++b){deq_q5k(r+(size_t)b*176,t);int bs=b*256;for(int l=0;l<256;++l)a+=t[l]*x[bs+l];}y[o]=a;}
 
@@ -205,6 +228,86 @@ __global__ void k_q5k_wb(const uint8_t* __restrict__ w, const float* __restrict_
   for(int b=0;b<B;++b){ float a=warp_reduce(acc[b]); if(lane==0) y[b*out+row]=a; }
 }
 
+// ---- Q3_K / Q2_K warp + batched kernels. lane (0..31) == the qs byte index
+//      within a 128-half (= g*16+l, g=lane/16); each lane decodes its 4 j-fields
+//      (j=0..3) for both halves and accumulates. Coalesced qs/hmask reads. ----
+__global__ void k_q3k_w(const uint8_t* __restrict__ w, const float* __restrict__ x,
+                        float* __restrict__ y, int in, int out){
+  int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
+  if(row>=out) return;
+  int nb=in/256; size_t bpr=(size_t)nb*110; const uint8_t* r=w+(size_t)row*bpr;
+  int g=lane>>4; float acc=0.f;
+  for(int blk=0;blk<nb;++blk){
+    const uint8_t* bl=r+(size_t)blk*110; const uint8_t*hm=bl,*qs=bl+32,*sc=bl+96;
+    float d=f16(bl+108); int sca[16]; q3k_scales(sc,sca);
+    int bs=blk*256; unsigned hb=hm[lane];
+    #pragma unroll
+    for(int nh=0;nh<2;++nh){ unsigned qb=qs[nh*32+lane];
+      #pragma unroll
+      for(int j=0;j<4;++j){ int low2=(qb>>(2*j))&3, hbit=(hb>>(nh*4+j))&1, is=nh*8+j*2+g;
+        acc += d*sca[is]*(float)(low2+4*hbit-4) * x[bs+nh*128+j*32+lane]; }
+    }
+  }
+  acc=warp_reduce(acc); if(lane==0) y[row]=acc;
+}
+__global__ void k_q2k_w(const uint8_t* __restrict__ w, const float* __restrict__ x,
+                        float* __restrict__ y, int in, int out){
+  int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
+  if(row>=out) return;
+  int nb=in/256; size_t bpr=(size_t)nb*84; const uint8_t* r=w+(size_t)row*bpr;
+  int g=lane>>4; float acc=0.f;
+  for(int blk=0;blk<nb;++blk){
+    const uint8_t* bl=r+(size_t)blk*84; const uint8_t*sc=bl,*qs=bl+16;
+    float d=f16(bl+80),dm=f16(bl+82); int bs=blk*256;
+    #pragma unroll
+    for(int nh=0;nh<2;++nh){ unsigned qb=qs[nh*32+lane];
+      #pragma unroll
+      for(int j=0;j<4;++j){ int q2=(qb>>(2*j))&3, is=nh*8+j*2+g;
+        acc += (d*(sc[is]&0xF)*(float)q2 - dm*(sc[is]>>4)) * x[bs+nh*128+j*32+lane]; }
+    }
+  }
+  acc=warp_reduce(acc); if(lane==0) y[row]=acc;
+}
+__global__ void k_q3k_wb(const uint8_t* __restrict__ w, const float* __restrict__ x,
+                         float* __restrict__ y, int in, int out, int B){
+  int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
+  if(row>=out) return;
+  int nb=in/256; size_t bpr=(size_t)nb*110; const uint8_t* r=w+(size_t)row*bpr;
+  int g=lane>>4; float acc[MAXB]; for(int b=0;b<B;++b) acc[b]=0.f;
+  for(int blk=0;blk<nb;++blk){
+    const uint8_t* bl=r+(size_t)blk*110; const uint8_t*hm=bl,*qs=bl+32,*sc=bl+96;
+    float d=f16(bl+108); int sca[16]; q3k_scales(sc,sca);
+    int bs=blk*256; unsigned hb=hm[lane];
+    #pragma unroll
+    for(int nh=0;nh<2;++nh){ unsigned qb=qs[nh*32+lane];
+      #pragma unroll
+      for(int j=0;j<4;++j){ int low2=(qb>>(2*j))&3, hbit=(hb>>(nh*4+j))&1, is=nh*8+j*2+g;
+        float wv=d*sca[is]*(float)(low2+4*hbit-4); int i=bs+nh*128+j*32+lane;
+        for(int b=0;b<B;++b) acc[b]+=wv*x[b*in+i]; }
+    }
+  }
+  for(int b=0;b<B;++b){ float a=warp_reduce(acc[b]); if(lane==0) y[b*out+row]=a; }
+}
+__global__ void k_q2k_wb(const uint8_t* __restrict__ w, const float* __restrict__ x,
+                         float* __restrict__ y, int in, int out, int B){
+  int row=(blockIdx.x*blockDim.x+threadIdx.x)>>5, lane=threadIdx.x&31;
+  if(row>=out) return;
+  int nb=in/256; size_t bpr=(size_t)nb*84; const uint8_t* r=w+(size_t)row*bpr;
+  int g=lane>>4; float acc[MAXB]; for(int b=0;b<B;++b) acc[b]=0.f;
+  for(int blk=0;blk<nb;++blk){
+    const uint8_t* bl=r+(size_t)blk*84; const uint8_t*sc=bl,*qs=bl+16;
+    float d=f16(bl+80),dm=f16(bl+82); int bs=blk*256;
+    #pragma unroll
+    for(int nh=0;nh<2;++nh){ unsigned qb=qs[nh*32+lane];
+      #pragma unroll
+      for(int j=0;j<4;++j){ int q2=(qb>>(2*j))&3, is=nh*8+j*2+g;
+        float wv=d*(sc[is]&0xF)*(float)q2 - dm*(sc[is]>>4); int i=bs+nh*128+j*32+lane;
+        for(int b=0;b<B;++b) acc[b]+=wv*x[b*in+i]; }
+    }
+  }
+  for(int b=0;b<B;++b){ float a=warp_reduce(acc[b]); if(lane==0) y[b*out+row]=a; }
+}
+
 #include <cstdlib>
 
 //  Shared weight VRAM cache: each distinct host weight pointer is uploaded
@@ -231,13 +334,17 @@ extern "C" void aspida_gpu_matvec(const void *w, long wbytes, int kind,
         int g = (out_dim + 127) / 128;
         if (kind == 0)      k_q4k<<<g, 128>>>(dw, dx, dy, in_dim, out_dim);
         else if (kind == 1) k_q6k<<<g, 128>>>(dw, dx, dy, in_dim, out_dim);
-        else                k_q5k<<<g, 128>>>(dw, dx, dy, in_dim, out_dim);
+        else if (kind == 2) k_q5k<<<g, 128>>>(dw, dx, dy, in_dim, out_dim);
+        else if (kind == 3) k_q3k<<<g, 128>>>(dw, dx, dy, in_dim, out_dim);
+        else                k_q2k<<<g, 128>>>(dw, dx, dy, in_dim, out_dim);
     } else {                                 // fast warp-per-row path (default)
         const int TPB = 256, WPB = TPB / 32; // 8 warps (=rows) per block
         int blocks = (out_dim + WPB - 1) / WPB;
         if (kind == 0)      k_q4k_w<<<blocks, TPB>>>(dw, dx, dy, in_dim, out_dim);
         else if (kind == 1) k_q6k_w<<<blocks, TPB>>>(dw, dx, dy, in_dim, out_dim);
-        else                k_q5k_w<<<blocks, TPB>>>(dw, dx, dy, in_dim, out_dim);
+        else if (kind == 2) k_q5k_w<<<blocks, TPB>>>(dw, dx, dy, in_dim, out_dim);
+        else if (kind == 3) k_q3k_w<<<blocks, TPB>>>(dw, dx, dy, in_dim, out_dim);
+        else                k_q2k_w<<<blocks, TPB>>>(dw, dx, dy, in_dim, out_dim);
     }
     // D2H cudaMemcpy on the default stream blocks until the kernel finishes,
     // so the explicit device sync was redundant — dropped (one less stall/call).
@@ -261,6 +368,8 @@ extern "C" void aspida_gpu_matmul(const void *w, long wbytes, int kind,
     int blocks = (out_dim + WPB - 1) / WPB;
     if (kind == 0)      k_q4k_wb<<<blocks, TPB>>>(dw, dxb, dyb, in_dim, out_dim, batch);
     else if (kind == 1) k_q6k_wb<<<blocks, TPB>>>(dw, dxb, dyb, in_dim, out_dim, batch);
-    else                k_q5k_wb<<<blocks, TPB>>>(dw, dxb, dyb, in_dim, out_dim, batch);
+    else if (kind == 2) k_q5k_wb<<<blocks, TPB>>>(dw, dxb, dyb, in_dim, out_dim, batch);
+    else if (kind == 3) k_q3k_wb<<<blocks, TPB>>>(dw, dxb, dyb, in_dim, out_dim, batch);
+    else                k_q2k_wb<<<blocks, TPB>>>(dw, dxb, dyb, in_dim, out_dim, batch);
     cudaMemcpy(y, dyb, (size_t) ny * 4, cudaMemcpyDeviceToHost);
 }
