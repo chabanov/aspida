@@ -33,6 +33,22 @@ package GGUF_Write is
      (B : in out Builder; Name : String; Dims : Dims_Array; Data : Float_Array)
      with Pre => Dims'Length >= 1;
 
+   --  Append an already-quantized tensor (raw ggml bytes, e.g. from
+   --  LLM_Quant.Quantize_*). Dims are the logical ne[] (element counts);
+   --  ne0 must be a multiple of the block size (32).
+   procedure Add_Tensor_Q8_0
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+     with Pre => Dims'Length >= 1;
+   procedure Add_Tensor_Q4_0
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+     with Pre => Dims'Length >= 1;
+   procedure Add_Tensor_Q4_K
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+     with Pre => Dims'Length >= 1;
+   procedure Add_Tensor_Q6_K
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+     with Pre => Dims'Length >= 1;
+
    --  Write the assembled GGUF file.
    procedure Save (B : in out Builder; Path : String);
 
@@ -46,7 +62,8 @@ private
       Name   : Unbounded_String;
       N_Dims : Natural := 0;
       Dims   : Dim4 := [others => 0];
-      Data   : Unbounded_String;   -- raw little-endian F32 bytes
+      Kind   : Natural := 0;        -- GGML type code (0 = F32, 8 = Q8_0)
+      Data   : Unbounded_String;    -- raw little-endian tensor bytes
    end record;
 
    --  growable byte buffers held as Unbounded_String (1 char == 1 byte)

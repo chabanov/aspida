@@ -3,6 +3,8 @@
 ---------------------------------------------------------------------
 
 with Ada.Streams.Stream_IO; use Ada.Streams.Stream_IO;
+with LLM_Quant;
+with LLM_Tensor;
 
 package body Student is
 
@@ -75,6 +77,24 @@ package body Student is
      (M : in out Model; Tokens : Train.Label_Array; Logits : out Logit_Mat)
    is
       Cur, Ao, Mo, Tmp : DMat;
+
+      --  Weight-projection forward. With QAT on, the weight is fake-quantized
+      --  for the forward (STE leaves the backward unchanged, so gradients still
+      --  update the full-precision master weight). Use_QAT is a static generic,
+      --  so the quant branch is compiled out entirely when off (no overhead).
+      procedure Lin (Inp, W : Matrix; Out_M : out Matrix) is
+      begin
+         if Use_QAT then
+            declare
+               Wq : Matrix (W'Range (1), W'Range (2));
+            begin
+               Fake_Quant_Forward (W, QAT_Bits, Wq);
+               Linear_NB_Forward (Inp, Wq, Out_M);
+            end;
+         else
+            Linear_NB_Forward (Inp, W, Out_M);
+         end if;
+      end Lin;
    begin
       for I in 1 .. Seq loop M.Toks (I) := Tokens (Tokens'First + I - 1); end loop;
       Embed_Forward (M.E, M.Toks, M.Xemb);
@@ -87,33 +107,33 @@ package body Student is
       for L in 1 .. Lyr loop
          M.B (L).Inp := Cur;
          RMSNorm_Forward (Cur, M.B (L).G1, M.B (L).Xn1);
-         Linear_NB_Forward (M.B (L).Xn1, M.B (L).Wq, M.B (L).Q);
-         Linear_NB_Forward (M.B (L).Xn1, M.B (L).Wk, M.B (L).K);
-         Linear_NB_Forward (M.B (L).Xn1, M.B (L).Wv, M.B (L).V);
+         Lin (M.B (L).Xn1, M.B (L).Wq, M.B (L).Q);
+         Lin (M.B (L).Xn1, M.B (L).Wk, M.B (L).K);
+         Lin (M.B (L).Xn1, M.B (L).Wv, M.B (L).V);
          if Use_RoPE then
             Tmp := M.B (L).Q; RoPE_Forward (Tmp, Heads, Real (Rope_Base), M.B (L).Q);
             Tmp := M.B (L).K; RoPE_Forward (Tmp, Heads, Real (Rope_Base), M.B (L).K);
          end if;
          MHA_Forward (M.B (L).Q, M.B (L).K, M.B (L).V, Heads, M.B (L).Oa, M.B (L).A);
-         Linear_NB_Forward (M.B (L).Oa, M.B (L).Wo, Ao);
+         Lin (M.B (L).Oa, M.B (L).Wo, Ao);
          for I in 1 .. Seq loop for J in 1 .. Dm loop
             M.B (L).H2 (I, J) := Cur (I, J) + Ao (I, J);
          end loop; end loop;
          RMSNorm_Forward (M.B (L).H2, M.B (L).G2, M.B (L).Xn2);
-         Linear_NB_Forward (M.B (L).Xn2, M.B (L).Wg, M.B (L).Gpre);
+         Lin (M.B (L).Xn2, M.B (L).Wg, M.B (L).Gpre);
          SiLU_Forward (M.B (L).Gpre, M.B (L).Gate);
-         Linear_NB_Forward (M.B (L).Xn2, M.B (L).Wu, M.B (L).Up);
+         Lin (M.B (L).Xn2, M.B (L).Wu, M.B (L).Up);
          for I in 1 .. Seq loop for J in 1 .. Ff loop
             M.B (L).Hid (I, J) := M.B (L).Gate (I, J) * M.B (L).Up (I, J);
          end loop; end loop;
-         Linear_NB_Forward (M.B (L).Hid, M.B (L).Wd, Mo);
+         Lin (M.B (L).Hid, M.B (L).Wd, Mo);
          for I in 1 .. Seq loop for J in 1 .. Dm loop
             Cur (I, J) := M.B (L).H2 (I, J) + Mo (I, J);
          end loop; end loop;
       end loop;
       M.Hf := Cur;
       RMSNorm_Forward (M.Hf, M.Gf, M.Xf);
-      Linear_NB_Forward (M.Xf, M.Wout, M.Logits);
+      Lin (M.Xf, M.Wout, M.Logits);
       Logits := M.Logits;
    end Forward;
 
@@ -282,7 +302,8 @@ package body Student is
 
    procedure Export_GGUF
      (M : Model; Path : String; Tokens : GGUF_Write.Str_List;
-      Bos, Eos : Natural := 0; Ctx : Natural := 256)
+      Bos, Eos : Natural := 0; Ctx : Natural := 256;
+      Fmt : Quant_Format := Q_None)
    is
       use GGUF_Write;
       B  : Builder;
@@ -290,6 +311,44 @@ package body Student is
       function Img (N : Natural) return String is
          S : constant String := Natural'Image (N);
       begin return S (S'First + 1 .. S'Last); end Img;
+
+      --  Weight matrix: quantized per Fmt (when block-aligned), else F32.
+      --  The engine dequantizes per ROW (ne0 elements), so the row length —
+      --  not the total — must be a whole number of blocks: Q4_K uses
+      --  256-element super-blocks, Q8_0/Q4_0 use 32-element blocks. ne0 is the
+      --  fastest-varying GGUF dim, Dims (Dims'First). Rows that don't align
+      --  fall back to F32 (so tiny demo dims still export cleanly).
+      procedure Add_W (Name : String; Dims : Dims_Array; Data : Float_Array) is
+         Ne0     : constant Natural := Dims (Dims'First);
+         Aligned : constant Boolean :=
+           (case Fmt is
+               when Q_Q4_K | Q_Q6_K => Ne0 mod 256 = 0,
+               when Q_Q8_0 | Q_Q4_0 => Ne0 mod 32 = 0,
+               when Q_None          => False);
+      begin
+         if Aligned then
+            declare
+               T : LLM_Tensor.Tensor := LLM_Tensor.New_Tensor ([1, Data'Length]);
+            begin
+               for I in Data'Range loop
+                  LLM_Tensor.Set_Flat (T, I - Data'First + 1, Data (I));
+               end loop;
+               case Fmt is
+                  when Q_Q8_0 =>
+                     Add_Tensor_Q8_0 (B, Name, Dims, LLM_Quant.Quantize_Q8_0 (T));
+                  when Q_Q4_0 =>
+                     Add_Tensor_Q4_0 (B, Name, Dims, LLM_Quant.Quantize_Q4_0 (T));
+                  when Q_Q4_K =>
+                     Add_Tensor_Q4_K (B, Name, Dims, LLM_Quant.Quantize_Q4_K (T));
+                  when Q_Q6_K =>
+                     Add_Tensor_Q6_K (B, Name, Dims, LLM_Quant.Quantize_Q6_K (T));
+                  when Q_None => null;
+               end case;
+            end;
+         else
+            Add_Tensor_F32 (B, Name, Dims, Data);
+         end if;
+      end Add_W;
    begin
       Meta_Str (B, "general.architecture", "llama");
       Meta_Str (B, "general.name", "aspida");
@@ -308,22 +367,22 @@ package body Student is
       Meta_U32 (B, "tokenizer.ggml.unknown_token_id", 0);
       Meta_Str_Array (B, "tokenizer.ggml.tokens", Tokens);
 
-      Add_Tensor_F32 (B, "token_embd.weight",  [Dm, Voc], Emb_Flat (M.E));
+      Add_W (         "token_embd.weight",  [Dm, Voc], Emb_Flat (M.E));
       Add_Tensor_F32 (B, "output_norm.weight", [Dm],      Norm_Flat (M.Gf));
-      Add_Tensor_F32 (B, "output.weight",      [Dm, Voc], To_GGUF (M.Wout));
+      Add_W (         "output.weight",      [Dm, Voc], To_GGUF (M.Wout));
       for L in 1 .. Lyr loop
          declare
             P : constant String := "blk." & Img (L - 1) & ".";
          begin
             Add_Tensor_F32 (B, P & "attn_norm.weight", [Dm], Norm_Flat (M.B (L).G1));
             Add_Tensor_F32 (B, P & "ffn_norm.weight",  [Dm], Norm_Flat (M.B (L).G2));
-            Add_Tensor_F32 (B, P & "attn_q.weight",      [Dm, Dm], To_GGUF (M.B (L).Wq));
-            Add_Tensor_F32 (B, P & "attn_k.weight",      [Dm, Dm], To_GGUF (M.B (L).Wk));
-            Add_Tensor_F32 (B, P & "attn_v.weight",      [Dm, Dm], To_GGUF (M.B (L).Wv));
-            Add_Tensor_F32 (B, P & "attn_output.weight", [Dm, Dm], To_GGUF (M.B (L).Wo));
-            Add_Tensor_F32 (B, P & "ffn_gate.weight", [Dm, Ff], To_GGUF (M.B (L).Wg));
-            Add_Tensor_F32 (B, P & "ffn_up.weight",   [Dm, Ff], To_GGUF (M.B (L).Wu));
-            Add_Tensor_F32 (B, P & "ffn_down.weight", [Ff, Dm], To_GGUF (M.B (L).Wd));
+            Add_W (P & "attn_q.weight",      [Dm, Dm], To_GGUF (M.B (L).Wq));
+            Add_W (P & "attn_k.weight",      [Dm, Dm], To_GGUF (M.B (L).Wk));
+            Add_W (P & "attn_v.weight",      [Dm, Dm], To_GGUF (M.B (L).Wv));
+            Add_W (P & "attn_output.weight", [Dm, Dm], To_GGUF (M.B (L).Wo));
+            Add_W (P & "ffn_gate.weight", [Dm, Ff], To_GGUF (M.B (L).Wg));
+            Add_W (P & "ffn_up.weight",   [Dm, Ff], To_GGUF (M.B (L).Wu));
+            Add_W (P & "ffn_down.weight", [Ff, Dm], To_GGUF (M.B (L).Wd));
          end;
       end loop;
       GGUF_Write.Save (B, Path);

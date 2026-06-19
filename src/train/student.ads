@@ -22,6 +22,8 @@ generic
    Heads : Positive := 1;   -- attention heads (head_dim = Dm/Heads)
    Use_RoPE  : Boolean    := False;     -- RoPE instead of learned positions
    Rope_Base : Long_Float := 10000.0;   -- (Llama-compatible when Use_RoPE)
+   Use_QAT   : Boolean    := False;     -- quantization-aware training: forward
+   QAT_Bits  : Positive   := 8;         --  uses fake-quantized weights (STE)
 package Student is
 
    subtype Logit_Mat is Train.Matrix (1 .. Seq, 1 .. Voc);
@@ -53,9 +55,17 @@ package Student is
    --  Faithful only when Use_RoPE is True (so the engine's RoPE matches what
    --  the model was trained with) and Heads divides Dm evenly. Tokens supplies
    --  the Voc vocabulary strings.
+   --  Weight-matrix quantization for export: Q_None = F32, Q_Q8_0 = ~4x
+   --  smaller, Q_Q4_0/Q_Q4_K = ~8x smaller (Q4_K is the higher-quality
+   --  K-quant: per-32 affine under a shared super-block scale), Q_Q6_K = ~6x
+   --  smaller at ~3% error (per-16 signed scale, for sensitive tensors). The
+   --  K-quants need ne0 a multiple of 256. Norms always stay F32. The engine
+   --  serves the quantized GGUF directly.
+   type Quant_Format is (Q_None, Q_Q8_0, Q_Q4_0, Q_Q4_K, Q_Q6_K);
    procedure Export_GGUF
      (M : Model; Path : String; Tokens : GGUF_Write.Str_List;
-      Bos, Eos : Natural := 0; Ctx : Natural := 256);
+      Bos, Eos : Natural := 0; Ctx : Natural := 256;
+      Fmt : Quant_Format := Q_None);
 
 private
 

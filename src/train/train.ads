@@ -68,6 +68,16 @@ package Train is
    procedure SiLU_Backward (X, DY : Matrix; DX : out Matrix);
 
    --------------------------------------------------------------------
+   --  Fake quantization for quantization-aware training (QAT). Forward
+   --  simulates Bits-bit per-tensor symmetric quantization (round to the grid,
+   --  then dequantize) so the model learns weights robust to later real
+   --  quantization. Backward is the straight-through estimator (the rounding
+   --  is treated as identity), so gradients flow unchanged.
+   --------------------------------------------------------------------
+   procedure Fake_Quant_Forward  (X : Matrix; Bits : Positive; Y : out Matrix);
+   procedure Fake_Quant_Backward (DY : Matrix; DX : out Matrix);
+
+   --------------------------------------------------------------------
    --  RMSNorm with a per-feature gain (Llama-style):
    --     y[r,j] = x[r,j] / sqrt(mean_j(x[r]^2) + Eps) * gamma[j]
    --  Gamma and its gradient DGamma are row vectors [1 x D].

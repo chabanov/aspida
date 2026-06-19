@@ -195,11 +195,11 @@ make prove
 
 ## Roadmap
 
-- [ ] Gemma 3n validation
-- [ ] SSM selective scan (Mamba)
-- [ ] mRoPE positional encoding
+- [x] Gemma validation (gemma4 E4B — real-model smoke test)
+- [x] Quantization-aware training (fake-quant + STE, demonstrated 2-bit robustness)
+- [ ] SSM selective scan (Mamba) — needs a Mamba GGUF reference
+- [ ] mRoPE positional encoding — only relevant for multimodal (image/video)
 - [ ] Multi-GPU support
-- [ ] Quantization-aware training
 
 ## Contributing
 
