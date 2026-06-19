@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `requantize` CLI — convert any GGUF between formats, incl. `q4_k_m`/`q5_k_m`
   mixes (sensitive tensors → Q6_K), metadata preserved byte-exact
 - `test_kquant_synth` — model-free CI test for the Q2_K/Q3_K decoders
+- Min-p sampling (`min_p` API field / `ASPIDA_MIN_P` env) — keep tokens with
+  prob ≥ min_p·p_max; `test_sampler` unit test
 
 ### Changed
 - Refactored backend interface to polymorphic Model_Backend

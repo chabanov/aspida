@@ -22,6 +22,7 @@ project LLM_Tests is
                  "test_q3k_real.adb", "test_q2k_real.adb",
                  "test_ctx_window.adb",
                  "test_rope_scale.adb", "test_kv_pool.adb",
+                 "test_sampler.adb",
                  "test_pool.adb");
 
    package Compiler is

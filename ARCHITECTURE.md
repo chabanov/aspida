@@ -101,7 +101,7 @@ model trained here can be served here in any of those formats.
 
 `LLM_Tokenizer` implements byte-level BPE (GPT-2 byte↔unicode bijection) and
 SentencePiece with `<0xHH>` byte fallback, driven by the GGUF vocab + merges.
-`LLM_Sampler` provides temperature / top-k / top-p / repetition-penalty
+`LLM_Sampler` provides temperature / top-k / top-p / min-p / repetition-penalty
 (greedy at `temp ≤ 0`), seedable.
 
 ### RoPE & long context
@@ -196,7 +196,7 @@ should be read with this scope.
 | `ASPIDA_CLIENT_TOKEN` | Require client auth token |
 | `ASPIDA_BIND` | Restrict the listener address |
 | `ASPIDA_RATE_MAX` / `ASPIDA_RATE_WINDOW` | New-connection rate limit |
-| `ASPIDA_TEMP` / `ASPIDA_TOP_P` / `ASPIDA_TOP_K` / `ASPIDA_REPEAT_PENALTY` / `ASPIDA_SEED` | Sampling |
+| `ASPIDA_TEMP` / `ASPIDA_TOP_P` / `ASPIDA_TOP_K` / `ASPIDA_MIN_P` / `ASPIDA_REPEAT_PENALTY` / `ASPIDA_SEED` | Sampling |
 
 ---
 

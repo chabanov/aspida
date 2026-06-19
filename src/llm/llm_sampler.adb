@@ -100,7 +100,31 @@ package body LLM_Sampler is
             for I in 1 .. N loop L (I) := L (I) / Den; end loop;
          end;
 
-         if S.P.Top_K <= 0 and then S.P.Top_P >= 1.0 then
+         if S.P.Min_P > 0.0 then
+            --  Min-p: keep only tokens with prob >= Min_P * p_max (a peaked
+            --  distribution keeps few tokens, a flat one keeps many), then
+            --  renormalise the survivors and draw. Robust alternative to top-p.
+            declare
+               Pmax : Float := 0.0; Thresh, Den : Float := 0.0;
+               U    : Float; Acc : Float := 0.0;
+            begin
+               for I in 1 .. N loop
+                  if L (I) > Pmax then Pmax := L (I); end if;
+               end loop;
+               Thresh := S.P.Min_P * Pmax;
+               for I in 1 .. N loop
+                  if L (I) < Thresh then L (I) := 0.0; else Den := Den + L (I); end if;
+               end loop;
+               U := Next_Float (S);
+               Result := N - 1;
+               for I in 1 .. N loop
+                  if L (I) > 0.0 then
+                     Acc := Acc + L (I) / Den;
+                     if U <= Acc then Result := I - 1; exit; end if;
+                  end if;
+               end loop;
+            end;
+         elsif S.P.Top_K <= 0 and then S.P.Top_P >= 1.0 then
             --  Pure temperature: draw straight from the full distribution.
             declare
                U : constant Float := Next_Float (S); Acc : Float := 0.0;

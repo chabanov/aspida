@@ -19,6 +19,7 @@ package LLM_Sampler is
       Temperature    : Float    := 0.0;   -- <= 0.0 => greedy argmax
       Top_K          : Integer  := 0;     -- <= 0   => no top-k cut
       Top_P          : Float    := 1.0;   -- 1.0    => no nucleus cut
+      Min_P          : Float    := 0.0;   -- > 0.0  => keep prob >= Min_P*p_max
       Repeat_Penalty : Float    := 1.0;   -- 1.0    => no penalty
       Repeat_Last_N  : Integer  := 64;    -- window of recent tokens penalised
       Seed           : Long_Long_Integer := 0;  -- 0 => fixed default seed
