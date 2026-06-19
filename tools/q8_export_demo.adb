@@ -28,6 +28,7 @@ procedure Q8_Export_Demo is
    F32_Path : constant String := "/tmp/q8demo_f32.gguf";
    Q8_Path  : constant String := "/tmp/q8demo_q8.gguf";
    Q4_Path  : constant String := "/tmp/q8demo_q4.gguf";
+   Q5_Path  : constant String := "/tmp/q8demo_q5.gguf";
 begin
    Put_Line ("=== train -> quantize (Q8_0) -> serve ===");
 
@@ -59,17 +60,20 @@ begin
       S.Export_GGUF (M, F32_Path, Toks_S, Ctx => 64, Fmt => S.Q_None);
       S.Export_GGUF (M, Q8_Path,  Toks_S, Ctx => 64, Fmt => S.Q_Q8_0);
       S.Export_GGUF (M, Q4_Path,  Toks_S, Ctx => 64, Fmt => S.Q_Q4_0);
+      S.Export_GGUF (M, Q5_Path,  Toks_S, Ctx => 64, Fmt => S.Q_Q5_0);
    end;
 
    Put_Line ("  F32  GGUF:" & Ada.Directories.Size (F32_Path)'Image & " bytes");
    Put_Line ("  Q8_0 GGUF:" & Ada.Directories.Size (Q8_Path)'Image & " bytes");
+   Put_Line ("  Q5_0 GGUF:" & Ada.Directories.Size (Q5_Path)'Image & " bytes");
    Put_Line ("  Q4_0 GGUF:" & Ada.Directories.Size (Q4_Path)'Image & " bytes");
 
-   --  Load all three with the real engine and compare predictions.
+   --  Load all four with the real engine and compare predictions.
    declare
       LM_F  : constant LLM_Llama.Llama_Model := LLM_Llama.Load (F32_Path);
       LM_Q8 : constant LLM_Llama.Llama_Model := LLM_Llama.Load (Q8_Path);
       LM_Q4 : constant LLM_Llama.Llama_Model := LLM_Llama.Load (Q4_Path);
+      LM_Q5 : constant LLM_Llama.Llama_Model := LLM_Llama.Load (Q5_Path);
 
       function Pred (LM : LLM_Llama.Llama_Model; T : Integer) return Integer is
          Ids  : constant LLM_Tokenizer.Token_Array (1 .. 3) := [T, 0, 0];
@@ -82,15 +86,16 @@ begin
          return Best;
       end Pred;
 
-      Acc_F, Acc_Q8, Acc_Q4 : Integer := 0;
+      Acc_F, Acc_Q8, Acc_Q4, Acc_Q5 : Integer := 0;
    begin
       for T in 0 .. Voc - 1 loop
          if Pred (LM_F,  T) = (T + 1) mod Voc then Acc_F  := Acc_F  + 1; end if;
          if Pred (LM_Q8, T) = (T + 1) mod Voc then Acc_Q8 := Acc_Q8 + 1; end if;
          if Pred (LM_Q4, T) = (T + 1) mod Voc then Acc_Q4 := Acc_Q4 + 1; end if;
+         if Pred (LM_Q5, T) = (T + 1) mod Voc then Acc_Q5 := Acc_Q5 + 1; end if;
       end loop;
       Put_Line ("  served accuracy  F32:" & Acc_F'Image
-                & "   Q8_0:" & Acc_Q8'Image & "   Q4_0:" & Acc_Q4'Image
-                & "   (/" & Voc'Image & ")");
+                & "   Q8_0:" & Acc_Q8'Image & "   Q5_0:" & Acc_Q5'Image
+                & "   Q4_0:" & Acc_Q4'Image & "   (/" & Voc'Image & ")");
    end;
 end Q8_Export_Demo;

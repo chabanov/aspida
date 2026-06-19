@@ -134,6 +134,21 @@ package body GGUF_Write is
       B.Tens.Append (T);
    end Add_Tensor_Q4_0;
 
+   procedure Add_Tensor_Q5_0
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+   is
+      T : Tensor_Rec;
+   begin
+      T.Name   := To_Unbounded_String (Name);
+      T.N_Dims := Dims'Length;
+      for I in 1 .. Dims'Length loop
+         T.Dims (I) := Dims (Dims'First + I - 1);
+      end loop;
+      T.Kind := 6;   -- ggml Q5_0
+      T.Data := To_Unbounded_String (Raw);
+      B.Tens.Append (T);
+   end Add_Tensor_Q5_0;
+
    procedure Add_Tensor_Q4_K
      (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
    is
@@ -148,6 +163,21 @@ package body GGUF_Write is
       T.Data := To_Unbounded_String (Raw);
       B.Tens.Append (T);
    end Add_Tensor_Q4_K;
+
+   procedure Add_Tensor_Q5_K
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+   is
+      T : Tensor_Rec;
+   begin
+      T.Name   := To_Unbounded_String (Name);
+      T.N_Dims := Dims'Length;
+      for I in 1 .. Dims'Length loop
+         T.Dims (I) := Dims (Dims'First + I - 1);
+      end loop;
+      T.Kind := 13;   -- ggml Q5_K
+      T.Data := To_Unbounded_String (Raw);
+      B.Tens.Append (T);
+   end Add_Tensor_Q5_K;
 
    procedure Add_Tensor_Q6_K
      (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)

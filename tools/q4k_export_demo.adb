@@ -35,9 +35,10 @@ procedure Q4K_Export_Demo is
 
    F32_Path : constant String := "/tmp/q4kdemo_f32.gguf";
    Q4K_Path : constant String := "/tmp/q4kdemo_q4k.gguf";
+   Q5K_Path : constant String := "/tmp/q4kdemo_q5k.gguf";
    Q6K_Path : constant String := "/tmp/q4kdemo_q6k.gguf";
 begin
-   Put_Line ("=== train -> quantize (Q4_K / Q6_K) -> serve ===");
+   Put_Line ("=== train -> quantize (Q4_K / Q5_K / Q6_K) -> serve ===");
 
    --  Train: token t (at position 1) -> successor (t+1) mod Voc.
    S.Init (M, 3.0);
@@ -65,16 +66,19 @@ begin
       end loop;
       S.Export_GGUF (M, F32_Path, Toks_S, Ctx => 64, Fmt => S.Q_None);
       S.Export_GGUF (M, Q4K_Path, Toks_S, Ctx => 64, Fmt => S.Q_Q4_K);
+      S.Export_GGUF (M, Q5K_Path, Toks_S, Ctx => 64, Fmt => S.Q_Q5_K);
       S.Export_GGUF (M, Q6K_Path, Toks_S, Ctx => 64, Fmt => S.Q_Q6_K);
    end;
 
    Put_Line ("  F32  GGUF:" & Ada.Directories.Size (F32_Path)'Image & " bytes");
    Put_Line ("  Q4_K GGUF:" & Ada.Directories.Size (Q4K_Path)'Image & " bytes");
+   Put_Line ("  Q5_K GGUF:" & Ada.Directories.Size (Q5K_Path)'Image & " bytes");
    Put_Line ("  Q6_K GGUF:" & Ada.Directories.Size (Q6K_Path)'Image & " bytes");
 
    declare
       LM_F   : constant LLM_Llama.Llama_Model := LLM_Llama.Load (F32_Path);
       LM_Q4K : constant LLM_Llama.Llama_Model := LLM_Llama.Load (Q4K_Path);
+      LM_Q5K : constant LLM_Llama.Llama_Model := LLM_Llama.Load (Q5K_Path);
       LM_Q6K : constant LLM_Llama.Llama_Model := LLM_Llama.Load (Q6K_Path);
 
       function Pred (LM : LLM_Llama.Llama_Model; T : Integer) return Integer is
@@ -88,15 +92,16 @@ begin
          return Best;
       end Pred;
 
-      Acc_F, Acc_Q4K, Acc_Q6K : Integer := 0;
+      Acc_F, Acc_Q4K, Acc_Q5K, Acc_Q6K : Integer := 0;
    begin
       for T in 0 .. Voc - 1 loop
          if Pred (LM_F,   T) = (T + 1) mod Voc then Acc_F   := Acc_F   + 1; end if;
          if Pred (LM_Q4K, T) = (T + 1) mod Voc then Acc_Q4K := Acc_Q4K + 1; end if;
+         if Pred (LM_Q5K, T) = (T + 1) mod Voc then Acc_Q5K := Acc_Q5K + 1; end if;
          if Pred (LM_Q6K, T) = (T + 1) mod Voc then Acc_Q6K := Acc_Q6K + 1; end if;
       end loop;
       Put_Line ("  served accuracy  F32:" & Acc_F'Image
-                & "   Q4_K:" & Acc_Q4K'Image & "   Q6_K:" & Acc_Q6K'Image
-                & "   (/" & Voc'Image & ")");
+                & "   Q4_K:" & Acc_Q4K'Image & "   Q5_K:" & Acc_Q5K'Image
+                & "   Q6_K:" & Acc_Q6K'Image & "   (/" & Voc'Image & ")");
    end;
 end Q4K_Export_Demo;

@@ -42,7 +42,13 @@ package GGUF_Write is
    procedure Add_Tensor_Q4_0
      (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
      with Pre => Dims'Length >= 1;
+   procedure Add_Tensor_Q5_0
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+     with Pre => Dims'Length >= 1;
    procedure Add_Tensor_Q4_K
+     (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
+     with Pre => Dims'Length >= 1;
+   procedure Add_Tensor_Q5_K
      (B : in out Builder; Name : String; Dims : Dims_Array; Raw : String)
      with Pre => Dims'Length >= 1;
    procedure Add_Tensor_Q6_K
