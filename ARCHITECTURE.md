@@ -83,12 +83,19 @@ changes to the engine internals.
 ### GGUF + quantization
 
 The GGUF loader reads metadata + tensor descriptors and accesses tensor data on
-demand (no full-model copy). Ten dequantization types are implemented to the
-ggml byte layout: **F32, F16, BF16, Q8_0, Q4_0, Q5_0, Q4_K, Q5_K, Q6_K, Q8_K**.
-An unimplemented type is rejected at load time with a clear error (never a
-silent zero-fill). A streaming `QMatVec` computes `y = W·x` one row at a time so
-the full FP32 weight is never materialized; the K-quants (Q4_K/Q5_K/Q6_K) have
-fused decode+dot paths with a multi-lane FP reduction for auto-vectorization.
+demand (no full-model copy). Twelve dequantization types are implemented to the
+ggml byte layout — every standard weight format ggml emits:
+**F32, F16, BF16, Q8_0, Q4_0, Q5_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K**
+(only the IQ*/imatrix and ternary families are unsupported). An unimplemented
+type is rejected at load time with a clear error (never a silent zero-fill). A
+streaming `QMatVec` computes `y = W·x` one row at a time so the full FP32 weight
+is never materialized; all five K-quants (Q2_K–Q6_K) have fused decode+dot paths
+with a multi-lane FP reduction for auto-vectorization.
+
+The training engine's exporter (`src/llm/llm_quant.adb`) is the inverse: it
+**writes** the six weight-quant formats the engine reads — Q8_0, Q4_0, Q5_0,
+Q4_K, Q5_K, Q6_K — each validated by round-trip against the dequantizer. So a
+model trained here can be served here in any of those formats.
 
 ### Tokenizer & sampler
 

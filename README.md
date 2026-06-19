@@ -13,9 +13,9 @@ Aspida is a high-performance LLM inference engine with its own GGUF parser, quan
 - 🚀 **Native Performance** — Written in Ada/SPARK, compiled to native code
 - 🔐 **End-to-End Encryption** — X25519 key exchange + ChaCha20-Poly1305 AEAD
 - 🎯 **OpenAI-Compatible API** — Drop-in replacement for OpenAI SDKs
-- ⚡ **GPU Offload** — CUDA kernels for Q4_K/Q6_K quantization
+- ⚡ **GPU Offload** — CUDA kernels for Q4_K/Q5_K/Q6_K quantization
 - 🧠 **Multiple Backends** — Qwen3.5-MoE+SSM, Llama 3.x, Gemma 3n
-- 📦 **GGUF Support** — Direct loading from quantized GGUF files
+- 📦 **GGUF Support** — Loads every standard ggml quant (Q2_K–Q6_K, Q4_0/Q5_0/Q8_0, F16/BF16); exports trained models to six formats
 - 🔒 **SPARK Proven** — Cryptographic core verified with SPARK contracts
 
 ## Supported Models
@@ -189,14 +189,17 @@ make prove
 ## Performance
 
 - **Streaming matvec** — No full FP32 materialization, quantized weights stay quantized
+- **Fused K-quant kernels** — All five K-quants (Q2_K–Q6_K) decode+dot in one stack-local pass
 - **Thread pool** — Persistent workers avoid spawn/join overhead
-- **GPU kernels** — Block-level parallelism for Q4_K/Q6_K
+- **GPU kernels** — Block-level parallelism for Q4_K/Q5_K/Q6_K
 - **Stack allocation** — Hot-path decode uses stack-allocated blocks
 
 ## Roadmap
 
 - [x] Gemma validation (gemma4 E4B — real-model smoke test)
 - [x] Quantization-aware training (fake-quant + STE, demonstrated 2-bit robustness)
+- [x] Full GGML quant coverage — read all standard formats (Q2_K–Q6_K, Q4_0/Q5_0/Q8_0); export six formats from the trainer
+- [ ] GPU kernels for Q2_K/Q3_K (currently CPU-only; Q4_K/Q5_K/Q6_K are on GPU)
 - [ ] SSM selective scan (Mamba) — needs a Mamba GGUF reference
 - [ ] mRoPE positional encoding — only relevant for multimodal (image/video)
 - [ ] Multi-GPU support
