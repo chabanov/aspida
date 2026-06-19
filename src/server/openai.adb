@@ -42,6 +42,7 @@ package body OpenAI is
          R.Params.Temperature := JSON.As_Float (JSON.Get (V, "temperature"), 1.0);
          R.Params.Top_P       := JSON.As_Float (JSON.Get (V, "top_p"), 1.0);
          R.Params.Top_K       := JSON.As_Int   (JSON.Get (V, "top_k"), 0);
+         R.Params.Min_P       := JSON.As_Float (JSON.Get (V, "min_p"), 0.0);
          R.Params.Seed        :=
            Long_Long_Integer (JSON.As_Int (JSON.Get (V, "seed"), 0));
          if JSON.Exists (JSON.Get (V, "frequency_penalty")) then

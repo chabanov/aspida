@@ -163,6 +163,7 @@ procedure Secure_Server is
       P.Temperature    := FEnv ("ASPIDA_TEMP", 0.0);
       P.Top_P          := FEnv ("ASPIDA_TOP_P", 1.0);
       P.Top_K          := IEnv ("ASPIDA_TOP_K", 0);
+      P.Min_P          := FEnv ("ASPIDA_MIN_P", 0.0);
       P.Repeat_Penalty := FEnv ("ASPIDA_REPEAT_PENALTY", 1.0);
       P.Repeat_Last_N  := IEnv ("ASPIDA_REPEAT_LAST_N", 64);
       P.Seed           := Long_Long_Integer (IEnv ("ASPIDA_SEED", 0));
@@ -595,6 +596,7 @@ procedure Secure_Server is
                         elsif P.Temperature > 2.0 then P.Temperature := 2.0; end if;
                         if P.Top_P <= 0.0 or else P.Top_P > 1.0 then P.Top_P := 1.0; end if;
                         if P.Top_K < 0 then P.Top_K := 0; end if;
+                        if P.Min_P < 0.0 or else P.Min_P > 1.0 then P.Min_P := 0.0; end if;
                         Infer_Lock.Acquire; Locked := True;
                         if Rq.Stream then
                            declare

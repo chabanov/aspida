@@ -156,7 +156,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 | Variable | Description |
 |----------|-------------|
-| `ASPIDA_TEMP` / `ASPIDA_TOP_P` / `ASPIDA_TOP_K` | Temperature / nucleus / top-k |
+| `ASPIDA_TEMP` / `ASPIDA_TOP_P` / `ASPIDA_TOP_K` / `ASPIDA_MIN_P` | Temperature / nucleus / top-k / min-p |
 | `ASPIDA_REPEAT_PENALTY` / `ASPIDA_REPEAT_LAST_N` | Repetition penalty + window |
 | `ASPIDA_SEED` | RNG seed |
 
