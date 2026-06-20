@@ -61,10 +61,10 @@ begin
       --  continuous-batch scheduler and complete (proves server concurrency).
       declare
          Ps : constant array (1 .. 4) of Ada.Strings.Unbounded.Unbounded_String :=
-           (U ("Яка столиця Франції? Одне речення."),
+           [U ("Яка столиця Франції? Одне речення."),
             U ("Скільки буде 2+2? Коротко."),
             U ("Назви колір неба одним словом."),
-            U ("Хто написав ""Кобзар""? Одне речення."));
+            U ("Хто написав ""Кобзар""? Одне речення.")];
          task type W is entry Go (K : Integer); end W;
          task body W is
             KK : Integer;
@@ -72,7 +72,7 @@ begin
             accept Go (K : Integer) do KK := K; end Go;
             declare
                R : constant String := LLM_Llama.Chat
-                 (M, (1 => (LLM_Qwen.Role_User, Ps (KK))), N);
+                 (M, [1 => (LLM_Qwen.Role_User, Ps (KK))], N);
             begin
                Ada.Text_IO.Put_Line ("[seq" & KK'Image & "] " & R);
             end;
@@ -86,7 +86,7 @@ begin
       GNAT.OS_Lib.OS_Exit (0);   --  scheduler task runs forever; force clean exit
    elsif Mode = "chat" then
       Ada.Text_IO.Put_Line ("completion: '" & LLM_Llama.Chat
-        (M, (1 => (LLM_Qwen.Role_User, U (Prompt))), N) & "'");
+        (M, [1 => (LLM_Qwen.Role_User, U (Prompt))], N) & "'");
    elsif Mode = "chat2" then
       Ada.Text_IO.Put_Line ("completion: '" & LLM_Llama.Chat
         (M, (LLM_Qwen.Message'(LLM_Qwen.Role_User, U ("Привіт! Як справи?"))

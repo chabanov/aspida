@@ -19,7 +19,8 @@ with LLM_Dequant;
 with LLM_Tensor;  use LLM_Tensor;
 
 procedure Test_QMatVec_Q4K is
-   use type LLM_GGUF.GGML_Type;
+   --  GGML_Type equality is predefined; `use LLM_GGUF` above already makes the
+   --  type visible, so no `use type` is needed here.
 
    Passed, Failed, Checked : Natural := 0;
    Max_Checks : constant := 4;          -- enough to be convincing, stays fast

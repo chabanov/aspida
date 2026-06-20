@@ -54,8 +54,11 @@ GPR_FLAGS   := -XSDKROOT=$(SDKROOT) -XARCH=$(ARCH) -XOS=$(OS_NAME)
 SPARK_FLAGS := -P $(MAIN_GPR) $(GPR_FLAGS) --mode=flow
 
 # ── Default ──────────────────────────────────────────────────────────
+#  The product is the encrypted inference server (server.gpr); the legacy
+#  HTTP-client-generator CLI (legacy/aspida_cli.gpr) is built via `make build`
+#  but is no longer the default.
 .PHONY: all
-all: build
+all: server
 
 # ══════════════════════════════════════════════════════════════════════
 #  BUILD
@@ -102,13 +105,18 @@ tests: ## Build every test suite (crypto/E2EE + model-free LLM)
 # ══════════════════════════════════════════════════════════════════════
 
 .PHONY: test
-test: test-crypto test-llm ## Run all model-free unit tests (crypto/E2EE + LLM)
+test: test-crypto test-json test-llm ## Run all model-free unit tests (crypto/E2EE + JSON + LLM)
+
+.PHONY: test-json
+test-json: ## Regression: JSON depth cap (Batch 1.2) — deep nesting raises, normal parses
+	$(GPRBUILD) -P tests/test_json.gpr $(GPR_FLAGS)
+	./obj/test_json
 
 .PHONY: check
 check: build test ## Build CLI + run model-free tests (CI target)
 
 .PHONY: train-test
-train-test: ## Build + run the from-scratch training-core self-tests (grad-check + distill + block)
+train-test: ## Build + run the from-scratch training-core self-tests (model-free; grad-check, distill, block, QAT, BPE, ckpt, mha)
 	$(GPRBUILD) -P train.gpr $(GPR_FLAGS)
 	./obj/test_train
 	./obj/test_block
@@ -116,6 +124,12 @@ train-test: ## Build + run the from-scratch training-core self-tests (grad-check
 	./obj/test_distill_train
 	./obj/test_gguf
 	./obj/test_serve
+	./obj/test_mha
+	./obj/test_ckpt
+	./obj/test_bpe
+	./obj/test_bpe_gguf
+	./obj/test_qat
+	./obj/test_qat_train
 	./obj/test_teacher
 	./obj/test_scale
 
@@ -140,6 +154,14 @@ test-llm: ## Build + run all LLM unit tests
 	./obj/test_fullattn
 	./obj/test_block
 	./obj/test_pool
+	./obj/test_quant
+	./obj/test_kquant_synth
+	./obj/test_qmatvec_q4k
+	./obj/test_ctx_window
+	./obj/test_rope_scale
+	./obj/test_kv_pool
+	./obj/test_sampler
+	./obj/test_kv_overflow
 
 .PHONY: test-crypto
 test-crypto: ## Build + run the crypto / E2EE test vectors (no model needed)
@@ -166,9 +188,10 @@ test-weights-real: ## Validate GGUF load + dequant on real tensors (needs model)
 	./obj/test_weights_real
 
 .PHONY: prove
-prove: ## SPARK: full AoRTE+functional proof of crypto root, ChaCha20 & SHA-256; flow for the rest
+prove: ## SPARK: full AoRTE+functional proof of crypto root, ChaCha20, SHA-256, HKDF & PBKDF2; flow for the rest
 	$(GNATPROVE) -P crypto.gpr $(GPR_FLAGS) \
 	  -u crypto.adb -u crypto-chacha20.adb -u crypto-sha256.adb \
+	  -u crypto-hkdf.adb -u crypto-pbkdf2.adb \
 	  --mode=all --level=2 -j0 --report=all
 
 .PHONY: prove-flow

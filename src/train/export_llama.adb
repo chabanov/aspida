@@ -47,7 +47,7 @@ package body Export_Llama is
       Bos, Eos  : Natural := 1;
       Ctx       : Natural := 64;
       Rope_Base : Float   := 10000.0;
-      RMS_Eps   : Float   := 1.0E-5)
+      RMS_Eps   : Float   := 1.0E-6)
    is
       Dim : constant Natural := E'Length (2);
       Vsz : constant Natural := E'Length (1);
@@ -56,6 +56,11 @@ package body Export_Llama is
    begin
       GGUF_Write.Meta_Str (B, "general.architecture", "llama");
       GGUF_Write.Meta_Str (B, "general.name", "aspida-student");
+      --  Emit the data-section alignment explicitly so the reader does not have
+      --  to assume its default matches what the writer used (32 here). Without
+      --  this, a reader that defaults general.alignment to a different value
+      --  would compute wrong tensor offsets and read garbage.
+      GGUF_Write.Meta_U32 (B, "general.alignment", 32);
       GGUF_Write.Meta_U32 (B, "llama.embedding_length", Dim);
       GGUF_Write.Meta_U32 (B, "llama.block_count", 1);
       GGUF_Write.Meta_U32 (B, "llama.attention.head_count", 1);

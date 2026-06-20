@@ -89,6 +89,16 @@ package body LLM_RoPE is
       Sin_Val  : Float;
       X1, X2   : Float;
    begin
+      --  mRoPE / Sections note: Qwen3.5-MoE mRoPE splits the head into 3
+      --  frequency sections (time/height/width, widths 11/11/10 here, stored
+      --  in P.Sections). For TEXT-only inference — the only mode this engine
+      --  supports — every text token uses t = h = w = Pos, so a single position
+      --  applied across all dims is exactly correct and P.Sections needs no
+      --  per-section position routing. Multimodal (vision) inputs would need a
+      --  separate position per section; that path is not wired in (no image
+      --  encoder), so Sections is deliberately a no-op here, not a bug. The
+      --  caller (LLM_FullAttn.Norm_Rope) passes one Pos for all dims by design.
+      --
       --  NeoX / rotate_half convention (Qwen, Gemma): pair dimension i with
       --  i + dim/2 (first half with second half), NOT adjacent (2i, 2i+1).
       --  Llama instead sets P.Interleaved (see below): adjacent pairs (2i, 2i+1).

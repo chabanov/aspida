@@ -11,7 +11,9 @@
 ---------------------------------------------------------------------
 
 with Interfaces;            use Interfaces;
+with Interfaces.C;          use type Interfaces.C.int;
 with Ada.Streams.Stream_IO;
+with Ada.Directories;
 with Crypto.Random;
 with Crypto.PBKDF2;
 with Crypto.AEAD;
@@ -21,6 +23,23 @@ package body At_Rest is
    use Crypto;
    package SIO renames Ada.Streams.Stream_IO;
    use type SIO.Count;
+
+   --  int rename(const char *old, const char *new);
+   --  POSIX rename(2) atomically replaces an existing destination (unlike
+   --  Ada.Directories.Rename, which GNAT raises Use_Error for on macOS when the
+   --  target already exists — that would break repeated session saves).
+   function C_Rename
+     (Oldp, Newp : Interfaces.C.char_array) return Interfaces.C.int
+     with Import, Convention => C, External_Name => "rename";
+
+   --  Atomically replace Dst with Src (both must be on the same filesystem).
+   --  Raises Use_Error on a non-zero rename(2) return.
+   procedure Atomic_Replace (Src, Dst : String) is
+   begin
+      if C_Rename (Interfaces.C.To_C (Src), Interfaces.C.To_C (Dst)) /= 0 then
+         raise Ada.Directories.Use_Error with "atomic rename failed";
+      end if;
+   end Atomic_Replace;
 
    Magic    : constant Byte_Array (0 .. 3) :=
      [Character'Pos ('A'), Character'Pos ('S'),
@@ -48,7 +67,7 @@ package body At_Rest is
      (Path       : String;
       Password   : Crypto.Byte_Array;
       Plaintext  : Crypto.Byte_Array;
-      Iterations : Positive := 200_000)
+      Iterations : Positive := 600_000)
    is
       Header : Byte_Array (0 .. Hdr_Len - 1);
       Salt   : Byte_Array (0 .. 15);
@@ -70,13 +89,34 @@ package body At_Rest is
       Crypto.AEAD.Seal (Key, Nonce, Header, Plaintext, CT, Tag);
       Wipe (Key);
 
-      SIO.Create (F, SIO.Out_File, Path);
-      Byte_Array'Write (SIO.Stream (F), Header);
-      if CT'Length > 0 then
-         Byte_Array'Write (SIO.Stream (F), CT);
-      end if;
-      Byte_Array'Write (SIO.Stream (F), Byte_Array (Tag));
-      SIO.Close (F);
+      --  Write to <path>.tmp then atomically rename, so a crash or exception
+      --  mid-write leaves the previous file intact instead of a truncated one.
+      --  rename(2) is atomic on POSIX (same filesystem).
+      declare
+         Tmp : constant String := Path & ".tmp";
+      begin
+         SIO.Create (F, SIO.Out_File, Tmp);
+         Byte_Array'Write (SIO.Stream (F), Header);
+         if CT'Length > 0 then
+            Byte_Array'Write (SIO.Stream (F), CT);
+         end if;
+         Byte_Array'Write (SIO.Stream (F), Byte_Array (Tag));
+         SIO.Close (F);
+         Atomic_Replace (Tmp, Path);
+      exception
+         when others =>
+            if SIO.Is_Open (F) then
+               SIO.Close (F);
+            end if;
+            begin
+               if Ada.Directories.Exists (Tmp) then
+                  Ada.Directories.Delete_File (Tmp);
+               end if;
+            exception
+               when others => null;
+            end;
+            raise;
+      end;
    end Save;
 
    function Load
@@ -121,6 +161,12 @@ package body At_Rest is
             PT     : Byte_Array (0 .. CT_Len - 1);
             OK     : Boolean;
          begin
+            --  Reject an absurd iteration count before spending CPU in PBKDF2.
+            --  A corrupt or hostile file could otherwise pin a load for minutes
+            --  (DoS). Legitimate range is 1k..5M; our own Save writes 600k.
+            if Iters < 1_000 or else Iters > 5_000_000 then
+               raise Format_Error with "iteration count out of range";
+            end if;
             for I in 0 .. Hdr_Len - 1 loop Header (I) := Buf (I); end loop;
             for I in 0 .. 15 loop Salt (I)  := Buf (Salt_Off + I); end loop;
             for I in 0 .. 11 loop Nonce (I) := Buf (Non_Off + I);  end loop;

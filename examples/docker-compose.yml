@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   aspida:
     build:
@@ -35,6 +33,3 @@ services:
     restart: unless-stopped
     profiles:
       - tls
-
-volumes:
-  models:

@@ -195,6 +195,59 @@ package body Train is
       end;
    end Fake_Quant_Forward;
 
+   procedure Fake_Quant_Forward_Blocked
+     (X : Matrix; Bits : Positive; Block : Positive; Y : out Matrix)
+   is
+      Q_Max : constant Real := Real (2 ** (Bits - 1) - 1);
+      --  Treat the matrix as a flat row-major stream of elements; quantize each
+      --  contiguous Block-window with its own symmetric scale.
+      Rows : constant Integer := X'Length (1);
+      Cols : constant Integer := X'Length (2);
+      N    : constant Natural := Rows * Cols;
+      function Flat (I : Natural) return Real is
+         --  0-based flat index I -> X element (row-major).
+         R : constant Integer := X'First (1) + I / Cols;
+         C : constant Integer := X'First (2) + I mod Cols;
+      begin
+         return X (R, C);
+      end Flat;
+   begin
+      if Block >= N or else Q_Max = 0.0 then
+         Fake_Quant_Forward (X, Bits, Y);     -- degenerate -> per-tensor
+         return;
+      end if;
+      for B0 in 0 .. (N + Block - 1) / Block - 1 loop
+         declare
+            Lo   : constant Natural := B0 * Block;
+            Hi   : constant Natural := Integer'Min (Lo + Block, N) - 1;
+            Amax : Real := 0.0;
+            Scale : Real;
+         begin
+            for I in Lo .. Hi loop
+               if abs Flat (I) > Amax then Amax := abs Flat (I); end if;
+            end loop;
+            if Amax = 0.0 then
+               for I in Lo .. Hi loop
+                  Y (X'First (1) + I / Cols, X'First (2) + I mod Cols) := 0.0;
+               end loop;
+            else
+               Scale := Amax / Q_Max;
+               for I in Lo .. Hi loop
+                  declare
+                     Q : Real := Real'Rounding (Flat (I) / Scale);
+                     R : constant Integer := X'First (1) + I / Cols;
+                     C : constant Integer := X'First (2) + I mod Cols;
+                  begin
+                     if Q > Q_Max then Q := Q_Max; end if;
+                     if Q < -Q_Max then Q := -Q_Max; end if;
+                     Y (R, C) := Q * Scale;
+                  end;
+               end loop;
+            end if;
+         end;
+      end loop;
+   end Fake_Quant_Forward_Blocked;
+
    procedure Fake_Quant_Backward (DY : Matrix; DX : out Matrix) is
    begin
       DX := DY;   -- straight-through estimator: rounding treated as identity
@@ -501,7 +554,12 @@ package body Train is
          for K in 1 .. V loop
             T := Teacher_P (R, K);
             if T > 0.0 then
-               Loss := Loss + T * (Log (T) - Log (P (R, K)));
+               --  P comes from softmax (always > 0 in exact arithmetic), but a
+               --  very peaked distribution can underflow P to 0.0 in float, and
+               --  Log (0.0) = -inf would make the whole loss +inf and stick the
+               --  optimiser. Floor P at a tiny positive value before the log.
+               Loss := Loss + T * (Log (T)
+                 - Log (Real'Max (P (R, K), Real'Small)));
             end if;
          end loop;
       end loop;
@@ -602,6 +660,17 @@ package body Train is
       for I in W'Range (1) loop
          for J in W'Range (2) loop
             Gr := G (I, J);
+            --  Sanitize a NaN/Inf gradient BEFORE it enters the moment
+            --  estimates. Otherwise a single NaN (from a broken backward pass
+            --  or an overflow) makes M/V sticky-NaN for the rest of training
+            --  (B1*M + (1-B1)*NaN = NaN), and the weights go NaN permanently.
+            --  NaN fails 'Valid; +/-Inf fall outside the finite range. Zero
+            --  such entries so the optimiser keeps stepping on the rest.
+            if (not Gr'Valid)
+              or else Gr > Real'Last or else Gr < -Real'Last
+            then
+               Gr := 0.0;
+            end if;
             if Clip > 0.0 then               -- gradient clipping (stabilizer)
                if Gr >  Clip then Gr :=  Clip; end if;
                if Gr < -Clip then Gr := -Clip; end if;

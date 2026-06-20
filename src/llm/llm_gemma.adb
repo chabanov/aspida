@@ -164,8 +164,18 @@ package body LLM_Gemma is
       function LQ (Name : String) return LLM_Weight.Weight is
          Info : constant Tensor_Info := Find_Tensor (G, Name);
          Size : constant Natural := Natural (Tensor_Byte_Size (Info));
-         B    : constant LLM_Weight.Byte_Data := new String (1 .. Size);
+         B    : LLM_Weight.Byte_Data;
       begin
+         --  Reject an unimplemented quantization up front (IQ* / ternary /
+         --  legacy map to GGML_TYPE_UNKNOWN). Without this, a Gemma GGUF
+         --  carrying such a tensor would load and emit garbage at inference
+         --  (the Gemma path, unlike Llama's, had no pre-check).
+         if not LLM_Dequant.Is_Supported (Info.Kind) then
+            raise Model_Load_Error with "weight " & Name
+              & ": unsupported quantization "
+              & LLM_GGUF.GGML_Type'Image (Info.Kind);
+         end if;
+         B := new String (1 .. Size);
          Read_Tensor_Raw (G, Info, B.all'Address, Size);
          return LLM_Weight.From_Quant (Info, B);
       exception
@@ -204,7 +214,7 @@ package body LLM_Gemma is
          raise Model_Load_Error with
            "gemma4 MoE (mixture-of-experts) is not supported by this backend "
            & "(found routed experts); only the dense gemma4 path "
-           & "(E4B / 12B / 27B) is implemented.";
+           & "(E4B / 12B / 26B) is implemented.";
       end if;
 
       M.Dim      := MI ("embedding_length", 2560);

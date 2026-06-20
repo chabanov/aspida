@@ -46,56 +46,43 @@ jobs:
           echo "Dependency vulnerability scanning not yet available for Ada/Alire"
           echo "Manual review of alire.toml recommended"
 
-  codeql-analysis:
-    name: CodeQL Analysis
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+  #  CodeQL is intentionally NOT run: CodeQL has no Ada/SPARK extractor, and the
+  #  only C/C++ in the repo is the CUDA kernels in gpu/*.cu, which require the
+  #  CUDA toolkit to compile (unavailable on the default ubuntu-latest runner).
+  #  A no-op CodeQL job that builds nothing produces empty, misleading results,
+  #  so it is omitted rather than left as cargo-cult security theater. Add it
+  #  back on a CUDA-equipped self-hosted runner if kernel C/C++ analysis is wanted.
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          languages: cpp
-          # Note: Ada is not supported by CodeQL yet, but we can analyze C/C++ parts
-
-      - name: Build project
-        run: |
-          # Build any C/C++ code if present
-          echo "No C/C++ code to analyze"
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
-        with:
-          category: "/language:cpp"
-
-  spart-verification:
-    name: SPARK Verification
+  spark-verification:
+    name: SPARK Flow Verification
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Alire + GNAT toolchain
+      - name: Set up Alire + GNAT/SPARK toolchain
         uses: alire-project/setup-alire@v6
         with:
-          toolchain: gnat_native^15 gprbuild
+          toolchain: gnat_native^15 gprbuild gnatprove
 
-      - name: Run SPARK flow analysis
+      - name: Resolve SPARK tool paths
         run: |
-          # Note: Full SPARK verification requires GNAT Pro
-          # This runs basic flow analysis with GNAT Community
-          echo "SPARK verification requires GNAT Pro"
-          echo "Running basic checks instead..."
-          alr exec -- gnatprove -P crypto_tests.gpr --mode=flow 2>&1 || true
+          #  gnatprove ships with the SPARK crate; expose it on PATH so the
+          #  Makefile's GNATPROVE resolution picks it up.
+          echo "GNAT_BIN=$(dirname $(which gnatprove))" >> "$GITHUB_ENV"
+
+      - name: Run SPARK flow analysis (gating)
+        run: |
+          #  Flow analysis (initialisation, data dependencies, non-aliasing) over
+          #  the whole crypto library. This is the gating bar; `make prove`
+          #  (--mode=all AoRTE+functional on the proven subset) is run locally
+          #  and tracked in README.md / ARCHITECTURE.md but stays advisory in CI
+          #  until the heavier proof is deterministic across toolchain versions.
+          make prove-flow
 
   report:
     name: Security Report
-    needs: [secrets-scan, dependency-check, codeql-analysis]
+    needs: [secrets-scan, dependency-check, spark-verification]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -111,4 +98,4 @@ jobs:
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Secrets Scan | ${{ needs.secrets-scan.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Dependency Check | ${{ needs.dependency-check.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| CodeQL Analysis | ${{ needs.codeql-analysis.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SPARK Flow Verification | ${{ needs.spark-verification.result }} |" >> $GITHUB_STEP_SUMMARY

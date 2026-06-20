@@ -182,8 +182,16 @@ procedure OpenAI_Proxy is
             begin
                while J <= Len and then Data (J) = ' ' loop J := J + 1; end loop;
                if EOL > J then
-                  CLen := Natural'Value (Ada.Strings.Fixed.Trim
-                    (Data (J .. EOL - 1), Ada.Strings.Both));
+                  --  A non-numeric / overflowed Content-Length is a malformed
+                  --  request, not a 500: Natural'Value raises on garbage.
+                  begin
+                     CLen := Natural'Value (Ada.Strings.Fixed.Trim
+                       (Data (J .. EOL - 1), Ada.Strings.Both));
+                  exception
+                     when others =>
+                        Err := 400;
+                        return;
+                  end;
                end if;
             end;
          end if;
@@ -318,20 +326,32 @@ begin
                              & CRLF & CRLF);
                            First := False;
                         elsif Rec (Rec'First) = Protocol.Tag_Done then
-                           if Streaming then
-                              declare
-                                 Trunc  : Boolean;
-                                 PT, CT : Natural;
-                              begin
-                                 Parse_Done (Body_Of (Rec), Trunc, PT, CT);
-                                 Sock_Write (Client, "data: "
-                                   & OpenAI.Chat_Done_Chunk
-                                       (Model_Name, PT, CT,
-                                        (if Trunc then "length" else "stop"))
-                                   & CRLF & CRLF);
-                              end;
-                              Sock_Write (Client, "data: [DONE]" & CRLF & CRLF);
+                           if not Streaming then
+                              --  Empty reply: no Tag_Token was ever emitted, so
+                              --  the SSE headers were never written. Emit them
+                              --  now (plus a terminal [DONE]) so the HTTP client
+                              --  sees a well-formed 200 stream instead of a bare
+                              --  TCP close, which downstream parsers treat as an
+                              --  error/connection-drop.
+                              Sock_Write (Client, "HTTP/1.1 200 OK" & CRLF
+                                & "Content-Type: text/event-stream" & CRLF
+                                & "Cache-Control: no-cache" & CRLF
+                                & "Access-Control-Allow-Origin: *" & CRLF
+                                & "Connection: close" & CRLF & CRLF);
+                              Streaming := True;
                            end if;
+                           declare
+                              Trunc  : Boolean;
+                              PT, CT : Natural;
+                           begin
+                              Parse_Done (Body_Of (Rec), Trunc, PT, CT);
+                              Sock_Write (Client, "data: "
+                                & OpenAI.Chat_Done_Chunk
+                                    (Model_Name, PT, CT,
+                                     (if Trunc then "length" else "stop"))
+                                & CRLF & CRLF);
+                           end;
+                           Sock_Write (Client, "data: [DONE]" & CRLF & CRLF);
                            exit;
                         end if;
                      end;

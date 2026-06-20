@@ -7,6 +7,7 @@ with Crypto.SHA256;
 with Crypto.HKDF;
 with Crypto.AEAD;
 with Crypto.Random;
+with Crypto.Memory;
 
 package body Secure_Channel is
 
@@ -158,8 +159,17 @@ package body Secure_Channel is
                Wipe (ES); Wipe (EE);
                raise Handshake_Error with "degenerate (low-order) DH result";
             end if;
-            Derive (S_Pub, E, F_Pub, ES, EE, K_C2S, K_S2C, Transcript);
-            Wipe (ES); Wipe (EE);
+            --  ES/EE are the DH shared secrets; scrub them even if Derive
+            --  raises mid-way, since the outer exception handler cannot see
+            --  these locals (they live in this declare block).
+            begin
+               Derive (S_Pub, E, F_Pub, ES, EE, K_C2S, K_S2C, Transcript);
+               Wipe (ES); Wipe (EE);
+            exception
+               when others =>
+                  Wipe (ES); Wipe (EE);
+                  raise;
+            end;
 
             --  Key-confirmation: tag over the transcript with K_s2c, nonce 0.
             Crypto.AEAD.Seal (K_S2C, Nonce (0), Byte_Array (Transcript), Empty,
@@ -171,6 +181,16 @@ package body Secure_Channel is
             Ch.N_Recv := 0;
             Ch.Bind := Byte_Array (Transcript);
             Ch.Ready := True;
+            --  Best-effort: pin the live session keys in RAM so they are not
+            --  written to swap. mlock is advisory (may fail under
+            --  RLIMIT_MEMLOCK); the return value is intentionally ignored.
+            Lock_Keys : declare
+               Dummy : Boolean;
+               pragma Unreferenced (Dummy);
+            begin
+               Dummy := Crypto.Memory.Lock (Ch.K_Send'Address, Ch.K_Send'Length);
+               Dummy := Crypto.Memory.Lock (Ch.K_Recv'Address, Ch.K_Recv'Length);
+            end Lock_Keys;
             Wipe (F_Priv); Wipe (K_C2S); Wipe (K_S2C);
          end;
       end;
@@ -211,9 +231,17 @@ package body Secure_Channel is
                   Wipe (ES); Wipe (EE);
                   raise Handshake_Error with "degenerate (low-order) DH result";
                end if;
-               Derive (Server_Public, E_Pub, F_Pub, ES, EE,
-                       K_C2S, K_S2C, Transcript);
-               Wipe (ES); Wipe (EE);
+               --  Scrub the DH shared secrets even if Derive raises; the outer
+               --  handler cannot see these declare-scoped locals.
+               begin
+                  Derive (Server_Public, E_Pub, F_Pub, ES, EE,
+                          K_C2S, K_S2C, Transcript);
+                  Wipe (ES); Wipe (EE);
+               exception
+                  when others =>
+                     Wipe (ES); Wipe (EE);
+                     raise;
+               end;
 
                --  Verify the server's key-confirmation tag.
                declare
@@ -239,6 +267,14 @@ package body Secure_Channel is
                Ch.N_Recv := 1;     -- nonce 0 consumed by the confirmation
                Ch.Bind := Byte_Array (Transcript);
                Ch.Ready := True;
+               --  Best-effort: pin the live session keys in RAM (no swap).
+               Lock_Keys : declare
+                  Dummy : Boolean;
+                  pragma Unreferenced (Dummy);
+               begin
+                  Dummy := Crypto.Memory.Lock (Ch.K_Send'Address, Ch.K_Send'Length);
+                  Dummy := Crypto.Memory.Lock (Ch.K_Recv'Address, Ch.K_Recv'Length);
+               end Lock_Keys;
                Wipe (E_Priv); Wipe (K_C2S); Wipe (K_S2C);
             end;
          end;
@@ -304,6 +340,14 @@ package body Secure_Channel is
 
    procedure Close (Ch : in out Channel) is
    begin
+      --  Release the mlock pins taken at handshake (best-effort), then scrub.
+      Lock_Keys : declare
+         Dummy : Boolean;
+         pragma Unreferenced (Dummy);
+      begin
+         Dummy := Crypto.Memory.Unlock (Ch.K_Send'Address, Ch.K_Send'Length);
+         Dummy := Crypto.Memory.Unlock (Ch.K_Recv'Address, Ch.K_Recv'Length);
+      end Lock_Keys;
       Wipe (Ch.K_Send);
       Wipe (Ch.K_Recv);
       Ch.N_Send := 0;

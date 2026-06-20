@@ -2,8 +2,8 @@
 -- test_qat_train — end-to-end QAT demonstration. Two tiny models learn the
 -- successor function t -> (t+1) mod V:
 --   * FP : trained in full precision,
---   * QAT: trained with 4-bit fake-quantized weights (straight-through).
--- Then both are evaluated under REAL 4-bit quantization. The FP model, quantized
+--   * QAT: trained with 2-bit fake-quantized weights (straight-through).
+-- Then both are evaluated under REAL 2-bit quantization. The FP model, quantized
 -- post-hoc, degrades; the QAT model stays accurate -- which is the point of QAT.
 ------------------------------------------------------------------------
 
@@ -13,10 +13,10 @@ with Student;
 
 procedure Test_QAT_Train is
    Voc   : constant := 8;
-   Bits  : constant := 2;         -- 3 levels: aggressive enough to expose QAT's value
+   Bits  : constant := 2;         -- 4 levels (0, ±amax): aggressive enough to expose QAT's value
    Steps : constant := 10000;
 
-   --  FP forward (master weights), and the same architecture with 4-bit QAT.
+   --  FP forward (master weights), and the same architecture with 2-bit QAT.
    package S_FP  is new Student (Voc => Voc, Dm => 16, Ff => 32, Seq => 3, Lyr => 1,
                                  Heads => 2);
    package S_QAT is new Student (Voc => Voc, Dm => 16, Ff => 32, Seq => 3, Lyr => 1,

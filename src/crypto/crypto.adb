@@ -34,10 +34,19 @@ package body Crypto with SPARK_Mode => On is
          A (I) := 0;
       end loop;
       --  Force the stores to be observable so the optimiser cannot elide the
-      --  wipe of a buffer that is never read again (the branch is never taken).
-      if A'Length > 0 and then A (A'First) /= 0 then
-         raise Program_Error;
-      end if;
+      --  wipe of a buffer that is never read again. Fold the whole array (not
+      --  just A'First) so every byte is read post-wipe; the branch is never
+      --  taken unless a wipe was skipped, which is a bug.
+      declare
+         Diff : U8 := 0;
+      begin
+         for I in A'Range loop
+            Diff := Diff or A (I);
+         end loop;
+         if Diff /= 0 then
+            raise Program_Error;
+         end if;
+      end;
    end Wipe;
 
    function Load_LE32 (A : Byte_Array; Offset : Natural) return U32 is

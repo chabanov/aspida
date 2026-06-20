@@ -9,7 +9,7 @@ project Genref is
    for Main use ("gen_ref.adb");
 
    package Compiler is
-      for Default_Switches ("Ada") use ("-gnatwn", "-gnatX", "-O2", "-march=native");
+      for Default_Switches ("Ada") use Shared.Ada_O2;
    end Compiler;
 
    package Linker is

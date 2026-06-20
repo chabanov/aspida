@@ -30,6 +30,7 @@ with Crypto;                  use Crypto;
 with Crypto.X25519;
 with Crypto.Random;
 with Crypto.Memory;
+with Crypto.SHA256;
 with Secure_Channel;
 with Socket_Transport;
 with Session_Store;
@@ -40,6 +41,7 @@ with LLM_Engine;
 with LLM_Catalog;
 with LLM_Sampler;
 with OpenAI;
+with JSON;
 
 procedure Secure_Server is
 
@@ -53,7 +55,7 @@ procedure Secure_Server is
    Max_Clients  : constant := 8;     -- concurrent handler tasks
    Max_Queue    : constant := 64;    -- pending-connection backlog
 
-   --  Generation cap per turn. Default 256; override with ASPIDA_MAX_TOKENS
+   --  Generation cap per turn. Default 2048; override with ASPIDA_MAX_TOKENS
    --  (e.g. a small value keeps a CPU demo snappy by bounding worst-case
    --  latency — short answers still stop early on EOS).
    function Max_Reply_Tokens return Integer is
@@ -84,6 +86,24 @@ procedure Secure_Server is
       end if;
       return 600.0;
    end Idle_Timeout;
+
+   --  Shorter deadline for the cryptographic handshake only: a slowloris peer
+   --  that opens a socket then never sends its client hello must be dropped in
+   --  seconds, not held for the full idle timeout (8 such stalls would exhaust
+   --  the handler pool). Reset to Idle_Timeout once the handshake completes.
+   --  Override with ASPIDA_HANDSHAKE_TIMEOUT (seconds).
+   function Handshake_Timeout return Duration is
+   begin
+      if Ada.Environment_Variables.Exists ("ASPIDA_HANDSHAKE_TIMEOUT") then
+         begin
+            return Duration'Value
+              (Ada.Environment_Variables.Value ("ASPIDA_HANDSHAKE_TIMEOUT"));
+         exception
+            when others => null;
+         end;
+      end if;
+      return 10.0;
+   end Handshake_Timeout;
 
    function Env_Int (Name : String; D : Integer) return Integer is
    begin
@@ -240,7 +260,10 @@ procedure Secure_Server is
    end Write_Selected;
 
    --  Resolve the active model: explicit env wins (deployments pin it), then a
-   --  persisted runtime selection, then a built-in default.
+   --  persisted runtime selection. No built-in default: a developer's personal
+   --  model path must never be baked into product source (it would leak a
+   --  username / third-party model name into the binary and break every other
+   --  host). An empty result is reported clearly at load time (see main body).
    function Model_Path return String is
    begin
       if Ada.Environment_Variables.Exists ("QWEN_MODEL_PATH") then
@@ -253,9 +276,7 @@ procedure Secure_Server is
             return Sel;
          end if;
       end;
-      return "/Users/ceo/.lmstudio/models/HauhauCS/"
-        & "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive/"
-        & "Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive-Q5_K_M.gguf";
+      return "";   -- nothing configured; the load guard below fails loudly
    end Model_Path;
 
    --  Assigned in the main body (guarded), NOT at elaboration: a bad/corrupt/
@@ -415,7 +436,17 @@ procedure Secure_Server is
                   for I in Tok'Range loop
                      Tok (I) := First (First'First + I);
                   end loop;
-                  if not Crypto.Const_Time_Equal (Tok, Token_Bytes) then
+                  --  Hash-then-compare rather than Const_Time_Equal on the raw
+                  --  token: the raw compare short-circuits on a length mismatch
+                  --  (leaking the configured token length) and a naive zero-pad
+                  --  could false-positive on a token that ends in NUL bytes.
+                  --  Both sides are hashed (fixed 32-byte digest, constant work
+                  --  independent of length) and the digests compared in constant
+                  --  time. The channel is encrypted, so this is defense-in-depth.
+                  if not Crypto.Const_Time_Equal
+                       (Byte_Array (Crypto.SHA256.Hash (Tok)),
+                        Byte_Array (Crypto.SHA256.Hash (Token_Bytes)))
+                  then
                      Reject ("authentication failed");
                      raise Auth_Failed;
                   end if;
@@ -441,6 +472,11 @@ procedure Secure_Server is
          Want  : Unbounded_String;
          Ok    : Boolean;
       begin
+         --  Handshake + first record are in: lift the short slowloris deadline
+         --  back to the normal idle timeout for the rest of the session.
+         Set_Socket_Option (Conn, Socket_Level, (Receive_Timeout, Idle_Timeout));
+         Set_Socket_Option (Conn, Socket_Level, (Send_Timeout, Idle_Timeout));
+
          if Hello'Length >= 1 and then Hello (Hello'First) = Protocol.Tag_Session then
             for I in Hello'First + 1 .. Hello'Last loop
                Append (Want, Character'Val (Integer (Hello (I))));
@@ -640,10 +676,18 @@ procedure Secure_Server is
                      end if;
                   end;
                exception
-                  when others =>
+                  when JSON.Parse_Error =>
+                     --  Malformed request body: client fault -> 400-style error.
                      if Locked then Infer_Lock.Release; end if;
                      Send_Tagged (Protocol.Tag_Resp,
-                       OpenAI.Error_Response ("bad request"));
+                       OpenAI.Error_Response ("bad request", "bad_request"));
+                  when others =>
+                     --  Anything else (inference/engine failure): server fault
+                     --  -> 500-style error. Don't mislabel a crash as "bad
+                     --  request", which hides engine bugs from the client.
+                     if Locked then Infer_Lock.Release; end if;
+                     Send_Tagged (Protocol.Tag_Resp,
+                       OpenAI.Error_Response ("internal error", "internal_error"));
                end;
 
             else
@@ -722,11 +766,18 @@ begin
    --  Load the model first, with a guard: fail fast and clearly on a bad,
    --  corrupt or unsupported-quantization model rather than crashing before
    --  the server is even up.
+   declare
+      Path : constant String := Model_Path;
    begin
-      Model := LLM_Engine.Load (Model_Path);
+      if Path'Length = 0 then
+         Put_Line ("fatal: no model configured. Set QWEN_MODEL_PATH=<gguf>"
+                   & " (or select one via the catalog / active_model).");
+         GNAT.OS_Lib.OS_Exit (1);
+      end if;
+      Model := LLM_Engine.Load (Path);
    exception
       when E : others =>
-         Put_Line ("fatal: cannot load model """ & Model_Path & """: "
+         Put_Line ("fatal: cannot load model """ & Path & """: "
                    & Exception_Message (E));
          GNAT.OS_Lib.OS_Exit (1);
    end;
@@ -812,10 +863,18 @@ begin
                --  cannot exhaust the queue/handler pool.
                begin Close_Socket (Conn); exception when others => null; end;
             else
-               --  Reclaim the slot from a silent peer: a read that stalls past
-               --  the idle timeout raises in the handler, which then cleans up.
+               --  Reclaim the slot from a silent peer. Start with the short
+               --  handshake deadline so a slowloris connection that never sends
+               --  its client hello is dropped in seconds; Handle_Connection
+               --  lifts this back to Idle_Timeout once the handshake completes.
                Set_Socket_Option
-                 (Conn, Socket_Level, (Receive_Timeout, Idle_Timeout));
+                 (Conn, Socket_Level, (Receive_Timeout, Handshake_Timeout));
+               --  Symmetric send timeout: a streaming client that stops reading
+               --  (TCP window closed) must not pin a handler on send() forever —
+               --  the receive timeout never fires while the handler is stuck in
+               --  Emit/Send_Message. 8 such connections would exhaust the pool.
+               Set_Socket_Option
+                 (Conn, Socket_Level, (Send_Timeout, Idle_Timeout));
                Conn_Queue.Put (Conn);     -- a free handler will pick it up
             end if;
          end;

@@ -22,15 +22,20 @@ package body Crypto.X25519 with SPARK_Mode => On is
 
    C121665 : constant GF := [0 => 16#DB41#, 1 => 1, others => 0];
 
-   --  Arithmetic shift right by 16 = floor(X / 2^16) (C's signed >> 16).
+   --  Arithmetic shift right by 16 = floor(X / 2^16) (C's signed >> 16),
+   --  expressed BRANCH-FREE. X is a secret field limb reached during scalar
+   --  multiplication, so the old `if X < 0 and then Q*65536 /= X` was a
+   --  secret-dependent branch (a timing side-channel on the ladder). Emulate
+   --  the signed shift with an unsigned logical shift + sign fill:
+   --    sign = 0 - (U >> 63)   -- all-ones when X < 0, else 0 (no branch)
+   --    fill = sign << 48      -- sign bit replicated into the top 16 bits
+   --    result = (U >> 16) or fill
    function Asr16 (X : I64) return I64 is
-      Q : constant I64 := X / 65536;
+      U    : constant U64 := To_U (X);
+      Sign : constant U64 := 0 - Shift_Right (U, 63);
+      Fill : constant U64 := Shift_Left (Sign, 48);
    begin
-      if X < 0 and then Q * 65536 /= X then
-         return Q - 1;
-      else
-         return Q;
-      end if;
+      return To_I (Shift_Right (U, 16) or Fill);
    end Asr16;
 
    procedure Car (O : in out GF) is
@@ -48,9 +53,27 @@ package body Crypto.X25519 with SPARK_Mode => On is
       end loop;
    end Car;
 
+   --  Constant-time mask: all-ones when B /= 0, zero when B = 0. Built by
+   --  ARITHMETIC (sign-extension of the low bit), not an `if B /= 0` branch —
+   --  B is a bit of the clamped private scalar (always 0 or 1, see the ladder
+   --  loop), so a branch on it is a Montgomery-ladder timing leak that can
+   --  recover the ephemeral scalar and break forward secrecy / server auth.
+   function CT_Mask (B : I64) return U64 is
+     (0 - (To_U (B) and 1));
+
+   --  Branchless borrow bit: 1 iff X < 0 (the sign bit of the two's-complement
+   --  limb), pulled out with a logical shift — NOT an `if X < 0` branch. In
+   --  Pack, X is a secret-derived limb (the shared secret being encoded), so
+   --  the borrow that drives the conditional-reduce + Sel must stay
+   --  constant-time; an `if X < 0 then 1 else 0` happens to lower to a
+   --  branchless csetm/csel on this toolchain but is fragile under other
+   --  optimisation levels, so the shift form is used deliberately.
+   function Sign_Bit (X : I64) return I64 is
+     (I64 (Shift_Right (To_U (X), 63)));
+
    --  Constant-time conditional swap of P and Q when B = 1.
    procedure Sel (P, Q : in out GF; B : I64) is
-      Mask : constant U64 := (if B /= 0 then 16#FFFFFFFFFFFFFFFF# else 0);
+      Mask : constant U64 := CT_Mask (B);
       T    : I64;
    begin
       for I in 0 .. 15 loop
@@ -128,11 +151,11 @@ package body Crypto.X25519 with SPARK_Mode => On is
       for J in 0 .. 1 loop
          M (0) := T (0) - 16#FFED#;
          for I in 1 .. 14 loop
-            M (I) := T (I) - 16#FFFF# - (if M (I - 1) < 0 then 1 else 0);
+            M (I) := T (I) - 16#FFFF# - Sign_Bit (M (I - 1));
             M (I - 1) := M (I - 1) mod 16#10000#;    -- & 0xffff
          end loop;
-         M (15) := T (15) - 16#7FFF# - (if M (14) < 0 then 1 else 0);
-         B := (if M (15) < 0 then 1 else 0);
+         M (15) := T (15) - 16#7FFF# - Sign_Bit (M (14));
+         B := Sign_Bit (M (15));
          M (14) := M (14) mod 16#10000#;
          Sel (T, M, 1 - B);
       end loop;

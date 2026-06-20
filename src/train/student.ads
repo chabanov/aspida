@@ -24,6 +24,8 @@ generic
    Rope_Base : Long_Float := 10000.0;   -- (Llama-compatible when Use_RoPE)
    Use_QAT   : Boolean    := False;     -- quantization-aware training: forward
    QAT_Bits  : Positive   := 8;         --  uses fake-quantized weights (STE)
+   QAT_Block : Natural    := 0;         --  0 = per-tensor fake-quant; >0 = per-block
+                                        --  (e.g. 256) matching the K-quant export layout
 package Student is
 
    subtype Logit_Mat is Train.Matrix (1 .. Seq, 1 .. Voc);

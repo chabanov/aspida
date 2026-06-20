@@ -342,6 +342,51 @@ procedure WS_Bridge is
    ------------------------------------------------------------------
    -- One client connection (its own task so static + WS coexist).
    ------------------------------------------------------------------
+   --  Cap on concurrently live relay tasks. Without it a connection flood
+   --  spawns an unbounded number of Conn tasks (each holding a socket + a
+   --  server-side socket), exhausting file descriptors and memory. The accept
+   --  loop refuses new connections past the cap; each Conn task decrements on
+   --  exit. Override with ASPIDA_WS_MAX_CONN.
+   function Max_Live return Natural is
+   begin
+      if Ada.Environment_Variables.Exists ("ASPIDA_WS_MAX_CONN") then
+         begin
+            return Natural'Value
+              (Ada.Environment_Variables.Value ("ASPIDA_WS_MAX_CONN"));
+         exception
+            when others => null;
+         end;
+      end if;
+      return 64;
+   end Max_Live;
+
+   protected Live is
+      procedure Try_Inc (Accepted : out Boolean);  -- True iff under cap (and incremented)
+      procedure Dec;
+   private
+      N : Natural := 0;
+   end Live;
+
+   protected body Live is
+      procedure Try_Inc (Accepted : out Boolean) is
+      begin
+         if N >= Max_Live then
+            Accepted := False;
+         else
+            N := N + 1;
+            Accepted := True;
+         end if;
+      end Try_Inc;
+
+      procedure Dec is
+      begin
+         if N > 0 then
+            N := N - 1;
+         end if;
+      end Dec;
+   end Live;
+
+   ------------------------------------------------------------------
    task type Conn is
       entry Start (S : Socket_Type);
    end Conn;
@@ -425,7 +470,19 @@ procedure WS_Bridge is
                            MOff  : constant Natural := HLen;
                            DOff  : constant Natural := HLen + MLen;
                         begin
-                           exit when PLen > WBuf'Length;       -- frame too big to ever fit
+                           if PLen > WBuf'Length then
+                              --  Frame can never fit the accumulator. A bare
+                              --  `exit` would leave it stuck in WBuf and stall
+                              --  the connection forever (every later Pump_Frames
+                              --  re-exits here). Instead send a WS close frame
+                              --  with status 1009 (Message Too Big) and tear the
+                              --  socket down cleanly. Server->client close is
+                              --  not masked.
+                              Send_All (Client,
+                                [16#88#, 16#02#, 16#03#, 16#E9#]);
+                              Done := True;
+                              exit;
+                           end if;
                            exit when WLen < Total;             -- wait for more bytes
                            if (Op = 1 or else Op = 2) and then PLen > 0 then
                               declare
@@ -515,6 +572,7 @@ procedure WS_Bridge is
          when others =>
             begin Close_Socket (Client); exception when others => null; end;
       end;
+      Live.Dec;   -- release the slot reserved by the accept loop
    end Conn;
 
    Listener, Client : Socket_Type;
@@ -547,9 +605,28 @@ begin
    loop
       Accept_Socket (Listener, Client, Addr);
       declare
-         H : constant Conn_Access := new Conn;
+         Accepted : Boolean;
       begin
-         H.Start (Client);
+         Live.Try_Inc (Accepted);
+         if not Accepted then
+            --  Over the live-connection cap: refuse with 503 and drop the
+            --  socket instead of spawning another task that would exhaust
+            --  FDs/memory.
+            begin
+               Send_Str (Client, "HTTP/1.1 503 Service Unavailable" & ASCII.CR & ASCII.LF
+                 & "Connection: close" & ASCII.CR & ASCII.LF
+                 & "Content-Length: 0" & ASCII.CR & ASCII.LF & ASCII.CR & ASCII.LF);
+            exception
+               when others => null;
+            end;
+            begin Close_Socket (Client); exception when others => null; end;
+         else
+            declare
+               H : constant Conn_Access := new Conn;
+            begin
+               H.Start (Client);
+            end;
+         end if;
       end;
    end loop;
 end WS_Bridge;

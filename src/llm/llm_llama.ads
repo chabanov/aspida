@@ -65,6 +65,25 @@ package LLM_Llama is
    --  prompt fitting and honest reporting.
    function Effective_Context (M : Llama_Model) return Integer;
 
+   --  Pure (model-free) KV-cache prompt trim: the slice of Prompt that
+   --  Run_Request would actually prefill, given a KV cache of Ctx_Cap slots
+   --  and a requested Max generation budget. Two cases, BOS always pinned:
+   --    * HARD: Prompt'Length > max(1, Ctx_Cap-1) -> clip to the cap, keeping
+   --      the first token (BOS) + the most recent (cap-1) tokens. Without this
+   --      the prefill loop writes past Tensor_Array (1 .. Ctx_Cap) and crashes
+   --      the scheduler (Batch 1.4 regression: prompt longer than the cache).
+   --    * SOFT: Prompt'Length > Ctx_Cap - max(1,Max) - 2 (>1) -> keep the first
+   --      token + the most recent (Room-1) tokens so the generation budget
+   --      still fits alongside the prompt.
+   --    * otherwise -> the prompt unchanged.
+   --  Returned length is always <= max(1, Ctx_Cap-1). Exposed for unit testing
+   --  (test_kv_overflow) since Run_Request itself needs a loaded model.
+   function KV_Prompt_Trim
+     (Prompt  : LLM_Tokenizer.Token_Array;
+      Ctx_Cap : Natural;
+      Max     : Integer) return LLM_Tokenizer.Token_Array
+     with Pre => Ctx_Cap >= 1;
+
    --  Validate the batched forward (continuous-batching primitive): runs two
    --  equal-length sequences both single-step and batched, returns the max
    --  abs logit difference. ~0 (FP noise) means Forward_Batch is correct.

@@ -74,6 +74,12 @@ jobs:
             ./obj/$t
           done
 
+      - name: JSON depth-cap regression (Batch 1.2)
+        run: |
+          set -e
+          alr exec -- gprbuild -P tests/test_json.gpr -XSDKROOT="${SDKROOT:-/}"
+          ./obj/test_json
+
       - name: Build LLM unit tests
         run: alr exec -- gprbuild -P tests/llm_tests.gpr -XSDKROOT="${SDKROOT:-/}"
 
@@ -82,7 +88,28 @@ jobs:
           set -e
           for t in test_rmsnorm test_moe test_tokenizer test_tensor \
                    test_deltanet test_deltanet_blk test_fullattn test_block test_pool \
-                   test_gemma test_qmatvec_guard; do
+                   test_gemma test_qmatvec_guard \
+                   test_quant test_kquant_synth test_qmatvec_q4k \
+                   test_ctx_window test_rope_scale test_kv_pool test_sampler \
+                   test_kv_overflow; do
+            echo "── $t"
+            if [ -f "./obj/$t" ]; then
+              ./obj/$t
+            else
+              echo "  (skipped, binary not found)"
+            fi
+          done
+
+      - name: Build + run model-free training tests
+        run: |
+          set -e
+          alr exec -- gprbuild -P train.gpr -XSDKROOT="${SDKROOT:-/}"
+          #  Model-free subset: synthetic grad-check / distill / block / QAT / BPE /
+          #  ckpt / mha / serve / teacher / scale. GPU (test_train_gpu) and the export
+          #  demos (q8_export_demo, q4k_export_demo, train_aspida) are excluded.
+          for t in test_train test_block test_distill test_distill_train \
+                   test_gguf test_serve test_mha test_ckpt test_bpe test_bpe_gguf \
+                   test_qat test_qat_train test_teacher test_scale; do
             echo "── $t"
             if [ -f "./obj/$t" ]; then
               ./obj/$t

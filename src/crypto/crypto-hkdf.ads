@@ -19,10 +19,16 @@ package Crypto.HKDF with SPARK_Mode => On is
      with Global => null;
 
    --  Fill Output with OKM = T(1) | T(2) | ... (RFC 5869 §2.3). Output'Length
-   --  must be <= 255 * 32.
+   --  must be <= 255 * 32, and Info must be small (a context label; callers
+   --  pass a few bytes) so the per-block input buffer 32 + Info'Length + 1
+   --  stays well within a Natural index. Max_Info_Len is generous for any
+   --  sane context string and keeps the buffer bound trivially provable.
+   Max_Info_Len : constant := 1024;
+
    procedure Expand
      (PRK : Crypto.SHA256.Digest; Info : Byte_Array; Output : out Byte_Array)
      with Global => null,
-          Pre    => Output'Length <= 255 * 32;
+          Pre    => Output'Length <= 255 * 32
+                    and then Info'Length <= Max_Info_Len;
 
 end Crypto.HKDF;

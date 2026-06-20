@@ -14,9 +14,9 @@ Aspida is a high-performance LLM inference engine with its own GGUF parser, quan
 - 🔐 **End-to-End Encryption** — X25519 key exchange + ChaCha20-Poly1305 AEAD
 - 🎯 **OpenAI-Compatible API** — Drop-in replacement for OpenAI SDKs
 - ⚡ **GPU Offload** — CUDA kernels for Q4_K/Q5_K/Q6_K quantization
-- 🧠 **Multiple Backends** — Qwen3.5-MoE+SSM, Llama 3.x, Gemma 3n
+- 🧠 **Multiple Backends** — Qwen3.5-MoE+SSM, Llama 3.x, Gemma 4 (dense)
 - 📦 **GGUF Support** — Loads every standard ggml quant (Q2_K–Q6_K, Q4_0/Q5_0/Q8_0, F16/BF16); exports trained models to six formats
-- 🔒 **SPARK Proven** — Cryptographic core verified with SPARK contracts
+- 🔒 **SPARK-Verified Core** — ChaCha20, SHA-256, HKDF & PBKDF2 proved to AoRTE + functional contracts (`make prove`); flow analysis (init / data deps / non-aliasing) across the rest of the crypto library (`make prove-flow`). X25519, Poly1305 & AEAD remain on flow analysis pending field-arithmetic annotations.
 
 ## Supported Models
 
@@ -24,7 +24,7 @@ Aspida is a high-performance LLM inference engine with its own GGUF parser, quan
 |--------------|--------|--------------|--------|
 | **Qwen3.5-MoE+SSM** | Qwen3.5-35B-A3B | Q5_K, Q8_K | ✅ Production |
 | **Llama 3.x** | Llama 3.1/3.2, Mistral | Q4_K, Q6_K | ✅ Production |
-| **Gemma 4 (dense)** | E4B, 12B, 27B | Q4_0, Q4_K, Q5_K | ✅ Validated¹ |
+| **Gemma 4 (dense)** | E4B, 12B, 26B | Q4_0, Q4_K, Q5_K | ✅ Validated¹ |
 
 ¹ Dense gemma4 (PLE *and* non-PLE/MQA paths) is greedy-decode bit-identical to llama.cpp on real E4B + 12B models. **MoE gemma4** (e.g. supergemma-26B, 128 routed experts) is **not supported** and is rejected at load with a clear error.
 

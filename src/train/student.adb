@@ -88,7 +88,14 @@ package body Student is
             declare
                Wq : Matrix (W'Range (1), W'Range (2));
             begin
-               Fake_Quant_Forward (W, QAT_Bits, Wq);
+               if QAT_Block > 0 then
+                  --  Per-block fake-quant: matches the K-quant super-block
+                  --  layout the export quantizer applies, so QAT trains against
+                  --  the same block-local scaling the deployed model sees.
+                  Fake_Quant_Forward_Blocked (W, QAT_Bits, QAT_Block, Wq);
+               else
+                  Fake_Quant_Forward (W, QAT_Bits, Wq);
+               end if;
                Linear_NB_Forward (Inp, Wq, Out_M);
             end;
          else

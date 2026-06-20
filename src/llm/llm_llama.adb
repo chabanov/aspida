@@ -1275,6 +1275,33 @@ package body LLM_Llama is
       end loop;
    end Sched;
 
+   ---------------------------------------------------------------------
+   -- KV_Prompt_Trim: pure prompt-clamp for the KV cache (Batch 1.4).
+   ---------------------------------------------------------------------
+   function KV_Prompt_Trim
+     (Prompt  : LLM_Tokenizer.Token_Array;
+      Ctx_Cap : Natural;
+      Max     : Integer) return LLM_Tokenizer.Token_Array
+   is
+      use type LLM_Tokenizer.Token_Array;   --  make "&" on Token_Array visible
+      Room           : constant Integer := Ctx_Cap - Integer'Max (1, Max) - 2;
+      Cap_For_Prompt : constant Integer := Integer'Max (1, Ctx_Cap - 1);
+   begin
+      if Prompt'Length = 0 then
+         return [];                            -- nothing to trim
+      elsif Prompt'Length > Cap_For_Prompt then
+         --  HARD: keep BOS + the most recent (Cap_For_Prompt-1) tokens.
+         return Prompt (Prompt'First .. Prompt'First)
+            & Prompt (Prompt'Last - (Cap_For_Prompt - 1) + 1 .. Prompt'Last);
+      elsif Room > 1 and then Prompt'Length > Room then
+         --  SOFT: keep BOS + the most recent (Room-1) tokens so Max still fits.
+         return Prompt (Prompt'First .. Prompt'First)
+            & Prompt (Prompt'Last - (Room - 1) + 1 .. Prompt'Last);
+      else
+         return Prompt;
+      end if;
+   end KV_Prompt_Trim;
+
    function Run_Request
      (M : Llama_Model; Prompt : LLM_Tokenizer.Token_Array;
       Max, Stop_A, Stop_B : Integer;
@@ -1282,7 +1309,6 @@ package body LLM_Llama is
       Params : LLM_Sampler.Params;
       Stats : access LLM_Qwen.Gen_Stats := null) return String
    is
-      use type LLM_Tokenizer.Token_Array;
       procedure Free_R is new Ada.Unchecked_Deallocation (Request, Request_Acc);
       procedure Free_T is
         new Ada.Unchecked_Deallocation (LLM_Tokenizer.Token_Array, Sched_Tok_Ptr);
@@ -1291,23 +1317,22 @@ package body LLM_Llama is
    begin
       Init_Guard.Claim (Do_It);
       if Do_It then Sched.Init (M); end if;
-      --  Clamp so prompt + generation fit the slot's KV cache (a long
-      --  multi-turn prompt would otherwise overflow). Keep the most recent
-      --  context but PIN the first token (BOS / start-of-sequence) so the
-      --  model never loses its sequence start when older turns are dropped.
+      --  Clamp so the prompt fits the slot's KV cache (see KV_Prompt_Trim for
+      --  the two-case rationale: HARD clip to Ctx_Cap, SOFT trim to the
+      --  generation window; BOS always pinned). The trim math is factored into
+      --  a pure model-free function so test_kv_overflow can exercise the
+      --  Prompt'Length > Ctx_Cap overflow path without a loaded model.
       declare
-         Room : constant Integer := Ctx_Cap - Integer'Max (1, Max) - 2;
+         Trimmed : constant LLM_Tokenizer.Token_Array :=
+           KV_Prompt_Trim (Prompt, Ctx_Cap, Max);
       begin
-         if Prompt'Length > Room and then Room > 1 then
-            R.Prompt := new LLM_Tokenizer.Token_Array'
-              (Prompt (Prompt'First .. Prompt'First)
-               & Prompt (Prompt'Last - (Room - 1) + 1 .. Prompt'Last));
+         if Trimmed'Length < Prompt'Length then
             Ada.Text_IO.Put_Line
-              ("  [ctx] prompt" & Prompt'Length'Image & " > window" & Room'Image
-               & "; trimmed oldest turns (BOS pinned)");
-         else
-            R.Prompt := new LLM_Tokenizer.Token_Array'(Prompt);
+              ("  [ctx] prompt" & Prompt'Length'Image & " ->"
+               & Trimmed'Length'Image & " (KV cap" & Ctx_Cap'Image
+               & ", BOS pinned)");
          end if;
+         R.Prompt := new LLM_Tokenizer.Token_Array'(Trimmed);
       end;
       R.Max := Max; R.Stop_A := Stop_A; R.Stop_B := Stop_B;
       R.Params := Params;

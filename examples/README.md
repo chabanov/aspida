@@ -16,11 +16,6 @@ This directory contains example code and configurations for using Aspida.
 - `nginx.conf` — Nginx reverse proxy with TLS
 - `systemd/` — Systemd service files
 
-### Models
-
-- `download_qwen.sh` — Download Qwen3.5 model
-- `download_llama.sh` — Download Llama 3.1 model
-
 ## Quick Start
 
 ### 1. Start the Server

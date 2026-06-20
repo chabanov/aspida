@@ -1,0 +1,53 @@
+# Keep the Docker build context lean and free of secrets / large local artifacts.
+# The runtime stage only needs source + GPR files; everything listed here would
+# otherwise be COPY'd into the build stage and cached in the GHA build cache.
+
+# Secrets (never in the image, even transiently)
+.env
+*.key
+*_key.bin
+*_pub.hex
+server_key.bin
+server_pub.hex
+
+# Local model weights / trained artifacts (~14 MB)
+*.gguf
+*.model
+models/
+
+# Local runtime state
+sessions/
+.platform-state/
+
+# Build artifacts (rebuilt inside the image)
+obj/
+lib/
+alire/
+.alire/
+*.o
+*.ali
+*.stdout
+*.stderr
+*.log
+
+# VCS / metadata
+.git/
+.gitignore
+.github/
+.claude/
+
+# Docs / notes not needed to build
+docs/
+blog/
+*.md
+!README.md
+!ARCHITECTURE.md
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.gpr.user
+*.cgpr
+
+# Legacy / probes not part of the server image
+legacy/

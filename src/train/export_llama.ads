@@ -19,6 +19,6 @@ package Export_Llama is
       Bos, Eos  : Natural := 1;
       Ctx       : Natural := 64;
       Rope_Base : Float   := 10000.0;
-      RMS_Eps   : Float   := 1.0E-5);
+      RMS_Eps   : Float   := 1.0E-6);
 
 end Export_Llama;

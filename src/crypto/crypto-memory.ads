@@ -10,6 +10,12 @@ with System;
 
 package Crypto.Memory is
 
+   --  Pin a buffer in RAM (mlock). Advisory hardening, not a guarantee.
    function Lock (First : System.Address; Length : Natural) return Boolean;
+
+   --  Release a pin established by Lock (munlock). Symmetric counterpart so a
+   --  caller that mlocks session keys on handshake can release them on Close.
+   --  Best-effort: returns True on success, False if the OS declines.
+   function Unlock (First : System.Address; Length : Natural) return Boolean;
 
 end Crypto.Memory;
