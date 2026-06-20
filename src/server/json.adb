@@ -231,6 +231,13 @@ package body JSON is
    ----------------------------------------------------------------
    function Parse (S : String) return Value_Ref is
       Pos : Natural := S'First;
+      --  Recursion depth guard: a deeply-nested "[[[[…]]]]" / "{{…}}" payload
+      --  (bounded in size by the channel's 1 MiB frame cap, but NOT in depth)
+      --  would otherwise overflow the handler task stack and kill the whole
+      --  server process with a SIGSEGV no `when others` can catch. 512 is far
+      --  above any legitimate OpenAI request and well under the stack budget.
+      Max_Depth : constant Natural := 512;
+      Depth     : Natural := 0;
 
       procedure Skip_WS is
       begin
@@ -315,7 +322,10 @@ package body JSON is
                         Skip_WS;
                         if Pos > S'Last or else S (Pos) /= ':' then raise Parse_Error; end if;
                         Pos := Pos + 1;
+                        Depth := Depth + 1;
+                        if Depth > Max_Depth then raise Parse_Error; end if;
                         Set (O, K, Parse_Value);
+                        Depth := Depth - 1;
                      end;
                      Skip_WS;
                      exit when Pos > S'Last or else S (Pos) = '}';
@@ -333,7 +343,10 @@ package body JSON is
                   Pos := Pos + 1; Skip_WS;
                   if Pos <= S'Last and then S (Pos) = ']' then Pos := Pos + 1; return A; end if;
                   loop
+                     Depth := Depth + 1;
+                     if Depth > Max_Depth then raise Parse_Error; end if;
                      Append (A, Parse_Value);
+                     Depth := Depth - 1;
                      Skip_WS;
                      exit when Pos > S'Last or else S (Pos) = ']';
                      if S (Pos) /= ',' then raise Parse_Error; end if;

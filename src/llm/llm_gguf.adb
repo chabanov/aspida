@@ -29,6 +29,15 @@ package body LLM_GGUF is
    SEEK_SET : constant C_Int := 0;
    SEEK_CUR : constant C_Int := 1;
 
+   --  Sanity caps on GGUF metadata sizes. A hostile or truncated file could
+   --  otherwise advertise a multi-gigabyte string / millions of tensors and
+   --  either OOM the loader or pin it in a long read loop (DoS). Real GGUFs
+   --  stay well under these (vocab ≤ 256k, tensors ≤ ~1k, merges ≤ ~150k).
+   Max_String_Len   : constant U64 := 1_048_576;   -- 1 MiB per metadata string
+   Max_Meta_Count   : constant U64 := 16_384;      -- key/value pairs
+   Max_Tensor_Count : constant U64 := 16_384;      -- tensor descriptors
+   Max_Array_Len    : constant U64 := 1_048_576;   -- metadata array elements
+
    --  Explicitly discard the return code of a side-effecting POSIX call
    --  (close/lseek) whose result we intentionally ignore.
    procedure Ignore (Unused : C_Int)  is null;
@@ -103,12 +112,18 @@ package body LLM_GGUF is
 
    function Read_String (FD : C_Int) return String is
       Len : constant U64 := Read_U64 (FD);
-      S   : String (1 .. Natural (Len));
    begin
-      if Len > 0 then
-         Read_Exact (FD, S'Address, Natural (Len));
+      if Len > Max_String_Len then
+         raise Constraint_Error with "GGUF string length out of range";
       end if;
-      return S;
+      declare
+         S : String (1 .. Natural (Len));
+      begin
+         if Len > 0 then
+            Read_Exact (FD, S'Address, Natural (Len));
+         end if;
+         return S;
+      end;
    end Read_String;
 
    --------------------------------------------------------------------
@@ -168,6 +183,9 @@ package body LLM_GGUF is
                Arr_Type : constant GGUF_Value_Type := GGUF_Value_Type'Val (Read_U32 (FD));
                Arr_Len  : constant U64 := Read_U64 (FD);
             begin
+               if Arr_Len > Max_Array_Len then
+                  raise Constraint_Error with "GGUF array length out of range";
+               end if;
                V_Str := To_Unbounded_String ("[");
                for I in 1 .. Natural (Arr_Len) loop
                   if I > 1 then Append (V_Str, ", "); end if;
@@ -204,7 +222,12 @@ package body LLM_GGUF is
          when 14     => return GGML_TYPE_Q6_K;
          when 15     => return GGML_TYPE_Q8_K;
          when 30     => return GGML_TYPE_BF16;
-         when others => return GGML_TYPE_F32;  -- legacy/IQ types: unsupported
+         when others => return GGML_TYPE_UNKNOWN;
+           --  IQ* / ternary / legacy types are NOT F32. Mapping them to F32
+           --  used to defeat Is_Supported (which then returned True), so IQ
+           --  tensors loaded and produced garbage at inference. UNKNOWN keeps
+           --  them out of every decode path; Is_Supported returns False and
+           --  the loaders reject the file with a clear message.
       end case;
    end To_GGML_Type;
 
@@ -247,6 +270,17 @@ package body LLM_GGUF is
       N_Tensors := Read_U64 (FD);
       N_Meta    := Read_U64 (FD);
 
+      --  Reject an absurd count before allocating / looping. A hostile header
+      --  could otherwise force a multi-million-iteration parse (DoS).
+      if N_Tensors > Max_Tensor_Count or else N_Meta > Max_Meta_Count then
+         Ada.Text_IO.Put_Line
+           ("ERROR: GGUF header reports" & U64'Image (N_Tensors)
+            & " tensors /" & U64'Image (N_Meta)
+            & " metadata (exceeds sanity cap)");
+         Ignore (C_Close (FD));
+         return;
+      end if;
+
       File.Is_Open := True;
       File.Path := To_Unbounded_String (Path);
       File.Version := Version;
@@ -276,6 +310,10 @@ package body LLM_GGUF is
                     GGUF_Value_Type'Val (Read_U32 (FD));
                   Arr_Len  : constant U64 := Read_U64 (FD);
                begin
+                  if Arr_Len > Max_Array_Len then
+                     raise Constraint_Error
+                       with "tokenizer array length out of range";
+                  end if;
                   for J in 1 .. Natural (Arr_Len) loop
                      declare
                         S : constant String := Read_Metadata_Value (FD, Arr_Type);
@@ -466,15 +504,19 @@ package body LLM_GGUF is
          when GGML_TYPE_Q4_0 => return ((N_Elements + 31) / 32) * 18;
          when GGML_TYPE_Q5_0 => return ((N_Elements + 31) / 32) * 22;
          when GGML_TYPE_Q5_1 => return ((N_Elements + 31) / 32) * 24;
-         --  K-quant super-block sizes (bytes per 256 elements), per llama.cpp:
-         when GGML_TYPE_Q2_K => return (N_Elements / 256) * 84;
-         when GGML_TYPE_Q3_K => return (N_Elements / 256) * 110;
-         when GGML_TYPE_Q4_K => return (N_Elements / 256) * 144;
-         when GGML_TYPE_Q5_K => return (N_Elements / 256) * 176;
-         when GGML_TYPE_Q6_K => return (N_Elements / 256) * 210;
-         when GGML_TYPE_Q8_K => return (N_Elements / 256) * 292;
+         --  K-quant super-block sizes (bytes per 256 elements), per llama.cpp.
+         --  Ceiling division: a non-256-multiple tail still occupies a full
+         --  super-block on disk, so floor division would under-read it. Real
+         --  GGUFs are 256-aligned, so this is a no-op for valid files and only
+         --  matters for malformed ones (avoids silent short reads).
+         when GGML_TYPE_Q2_K => return ((N_Elements + 255) / 256) * 84;
+         when GGML_TYPE_Q3_K => return ((N_Elements + 255) / 256) * 110;
+         when GGML_TYPE_Q4_K => return ((N_Elements + 255) / 256) * 144;
+         when GGML_TYPE_Q5_K => return ((N_Elements + 255) / 256) * 176;
+         when GGML_TYPE_Q6_K => return ((N_Elements + 255) / 256) * 210;
+         when GGML_TYPE_Q8_K => return ((N_Elements + 255) / 256) * 292;
          --  Q8_0: 32-element block = f16 scale (2) + 32 int8 = 34 bytes.
-         when GGML_TYPE_Q8_0 => return (N_Elements / 32) * 34;
+         when GGML_TYPE_Q8_0 => return ((N_Elements + 31) / 32) * 34;
          when others => return N_Elements * 4;
       end case;
    end Tensor_Byte_Size;
@@ -508,7 +550,10 @@ package body LLM_GGUF is
       FD : C_Int;
       Magic : String (1 .. 4);
    begin
-      FD := C_Open (Path, O_RDONLY, 0);
+      --  C's open() needs a NUL-terminated string; an Ada String is not, so
+      --  append the terminator explicitly (see Open above for the same fix —
+      --  passing a bare Ada String read past the boundary until a random 0).
+      FD := C_Open (Path & Character'Val (0), O_RDONLY, 0);
       if FD < 0 then
          return False;
       end if;

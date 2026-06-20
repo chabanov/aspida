@@ -9,6 +9,7 @@ obj/
 lib/
 *.o
 *.ali
+b~*        # GNAT binder temp files (b~main.adb/ads/ali/o)
 *.stdout
 *.stderr
 .env

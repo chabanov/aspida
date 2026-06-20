@@ -53,12 +53,20 @@ package body Ctx_Window is
       --  the freshest context is preserved and the oldest is dropped. When
       --  there is no system prompt the oldest message (Lo) is a normal turn and
       --  must remain eligible, so the range starts at Lo in that case.
+      --
+      --  Best-fit: we keep walking older turns after a miss rather than
+      --  stopping, so a small older turn can still be reclaimed when a larger
+      --  recent one did not fit. Newer turns are still preferred (reverse
+      --  iteration order), so this only ever adds context that the old
+      --  stop-on-first-miss loop would have dropped.
       if Forced_OK then
          declare
             Mid_Lo : constant Positive := (if System_First then Lo + 1 else Lo);
+            Dummy  : Boolean;
+            pragma Unreferenced (Dummy);
          begin
             for I in reverse Mid_Lo .. Hi - 1 loop
-               exit when not Take (I);
+               Dummy := Take (I);
             end loop;
          end;
       end if;

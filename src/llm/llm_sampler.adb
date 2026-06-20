@@ -87,25 +87,53 @@ package body LLM_Sampler is
          end;
       else
          --  Temperature scale + numerically stable softmax, in place on L.
+         --  A NaN/Inf logit from a broken forward pass would otherwise make
+         --  the softmax denominator non-finite and every downstream draw a
+         --  0/0 (or pick the wrong fallback token). Guard: precompute a greedy
+         --  argmax over the VALID raw logits and fall back to it whenever the
+         --  softmax is unusable.
          declare
-            Mx  : Float := L (1);
-            Den : Float := 0.0;
+            Mx     : Float := L (1);
+            Den    : Float := 0.0;
+            OK     : Boolean := True;
+            Greedy : Integer := 0;
+            Bv     : Float := Float'First;
          begin
-            for I in 1 .. N loop L (I) := L (I) / S.P.Temperature; end loop;
-            for I in 2 .. N loop if L (I) > Mx then Mx := L (I); end if; end loop;
             for I in 1 .. N loop
-               L (I) := Exp (L (I) - Mx);
-               Den := Den + L (I);
+               if L (I)'Valid and then L (I) > Bv then
+                  Bv := L (I); Greedy := I;
+               end if;
             end loop;
-            for I in 1 .. N loop L (I) := L (I) / Den; end loop;
-         end;
+            if Greedy = 0 then
+               Greedy := 1;        -- all logits invalid: emit token 0
+            end if;
 
-         if S.P.Min_P > 0.0 then
+            for I in 1 .. N loop L (I) := L (I) / S.P.Temperature; end loop;
+            for I in 2 .. N loop
+               if L (I)'Valid and then L (I) > Mx then Mx := L (I); end if;
+            end loop;
+            if not Mx'Valid then
+               OK := False;
+            else
+               for I in 1 .. N loop
+                  L (I) := Exp (L (I) - Mx);
+                  Den := Den + L (I);
+               end loop;
+               if (not Den'Valid) or else Den <= 0.0 then
+                  OK := False;
+               else
+                  for I in 1 .. N loop L (I) := L (I) / Den; end loop;
+               end if;
+            end if;
+
+            if not OK then
+               Result := Greedy - 1;
+            elsif S.P.Min_P > 0.0 then
             --  Min-p: keep only tokens with prob >= Min_P * p_max (a peaked
             --  distribution keeps few tokens, a flat one keeps many), then
             --  renormalise the survivors and draw. Robust alternative to top-p.
             declare
-               Pmax : Float := 0.0; Thresh, Den : Float := 0.0;
+               Pmax : Float := 0.0; Thresh, MDen : Float := 0.0;
                U    : Float; Acc : Float := 0.0;
             begin
                for I in 1 .. N loop
@@ -113,13 +141,14 @@ package body LLM_Sampler is
                end loop;
                Thresh := S.P.Min_P * Pmax;
                for I in 1 .. N loop
-                  if L (I) < Thresh then L (I) := 0.0; else Den := Den + L (I); end if;
+                  if L (I) < Thresh then L (I) := 0.0;
+                  else MDen := MDen + L (I); end if;
                end loop;
                U := Next_Float (S);
                Result := N - 1;
                for I in 1 .. N loop
                   if L (I) > 0.0 then
-                     Acc := Acc + L (I) / Den;
+                     Acc := Acc + L (I) / MDen;
                      if U <= Acc then Result := I - 1; exit; end if;
                   end if;
                end loop;
@@ -185,6 +214,7 @@ package body LLM_Sampler is
                Free (Used);
             end;
          end if;
+         end;
       end if;
 
       Free (L);

@@ -77,6 +77,16 @@ package Train is
    procedure Fake_Quant_Forward  (X : Matrix; Bits : Positive; Y : out Matrix);
    procedure Fake_Quant_Backward (DY : Matrix; DX : out Matrix);
 
+   --  Per-block variant of Fake_Quant_Forward: the matrix is traversed in
+   --  row-major order and quantized in contiguous blocks of `Block` elements
+   --  (each block gets its own symmetric scale), matching the K-quant
+   --  super-block layout the export quantizer uses (e.g. Block => 256). This is
+   --  higher-fidelity QAT than per-tensor: the model sees the same block-local
+   --  scaling it will get at export. Backward is still STE (use Fake_Quant_Backward).
+   --  When Block >= the element count this degenerates to per-tensor.
+   procedure Fake_Quant_Forward_Blocked
+     (X : Matrix; Bits : Positive; Block : Positive; Y : out Matrix);
+
    --------------------------------------------------------------------
    --  RMSNorm with a per-feature gain (Llama-style):
    --     y[r,j] = x[r,j] / sqrt(mean_j(x[r]^2) + Eps) * gamma[j]

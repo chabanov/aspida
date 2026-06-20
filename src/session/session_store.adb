@@ -19,7 +19,7 @@ package body Session_Store is
 
    Var      : constant String := "ASPIDA_STORE_PASSWORD";
    Dir      : constant String := "sessions";
-   PBKDF_It : constant := 200_000;
+   PBKDF_It : constant := 600_000;
    LF       : constant Character := Character'Val (10);
 
    type Turn_Rec is record

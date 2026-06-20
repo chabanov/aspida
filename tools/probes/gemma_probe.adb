@@ -31,8 +31,8 @@ begin
       declare
          use type LLM_Qwen.Message_Array;
          U : constant LLM_Qwen.Message_Array :=
-           (1 => (Role => LLM_Qwen.Role_User,
-                  Text => Ada.Strings.Unbounded.To_Unbounded_String (Prompt)));
+           [1 => (Role => LLM_Qwen.Role_User,
+                  Text => Ada.Strings.Unbounded.To_Unbounded_String (Prompt))];
          Conv : constant LLM_Qwen.Message_Array :=
            (if Sys = "" then U
             else LLM_Qwen.Message_Array'

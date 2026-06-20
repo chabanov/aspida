@@ -37,14 +37,14 @@ We take security vulnerabilities seriously. If you discover a security vulnerabi
 Aspida implements several security features:
 
 - **End-to-End Encryption**: X25519 key exchange + ChaCha20-Poly1305 AEAD
-- **SPARK Verification**: Cryptographic core verified for absence of runtime errors
+- **SPARK Verification**: ChaCha20, SHA-256, HKDF & PBKDF2 proved to absence-of-runtime-errors + functional contracts (`make prove`); the rest of the crypto library is SPARK flow-analysed (`make prove-flow`). X25519/Poly1305/AEAD field-arithmetic proofs are tracked as future work.
 - **Constant-Time Operations**: Timing-safe comparisons, secure memory wiping
 - **Forward Secrecy**: Ephemeral key exchange per session
 - **No Third-Party Crypto**: All cryptographic primitives implemented from scratch
 
 ### Known Security Considerations
 
-1. **Model Files**: GGUF files are not encrypted at rest by default. Use `ASPIDA_ENCRYPT_MODELS=1` for at-rest encryption.
+1. **Model Files**: GGUF weights are not encrypted at rest. Set `ASPIDA_STORE_PASSWORD` to enable PBKDF2/ChaCha20-Poly1305 encryption of persisted *session history* (not weights); rely on host disk encryption (LUKS/FileVault) for weight confidentiality.
 
 2. **Client Tokens**: `ASPIDA_CLIENT_TOKEN` should be kept secret. Do not commit to version control.
 

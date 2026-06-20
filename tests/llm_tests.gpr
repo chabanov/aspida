@@ -23,10 +23,14 @@ project LLM_Tests is
                  "test_ctx_window.adb",
                  "test_rope_scale.adb", "test_kv_pool.adb",
                  "test_sampler.adb",
+                 "test_kv_overflow.adb",
                  "test_pool.adb");
 
    package Compiler is
-      for Default_Switches ("Ada") use ("-gnatwn", "-gnatX", "-O3", "-march=native");
+      --  Use the shared strict (warnings-as-errors) switch set so the test
+      --  build can never drift from production, and respect -XARCH=portable
+      --  (drop -march=native) for reproducible/Docker test builds.
+      for Default_Switches ("Ada") use Shared.Ada_O3;
    end Compiler;
 
    package Linker is

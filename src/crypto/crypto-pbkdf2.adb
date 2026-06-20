@@ -20,6 +20,7 @@ package body Crypto.PBKDF2 with SPARK_Mode => On is
    begin
       DK := [others => 0];   -- fully initialised for flow; filled below
       for I in 1 .. N_Blocks loop
+         pragma Loop_Invariant (Pos <= DK'Length);
          declare
             --  U_1 = HMAC(P, Salt || INT_BE32(i))
             Msg  : Byte_Array (0 .. Salt'Length + 4 - 1) := [others => 0];
@@ -27,6 +28,8 @@ package body Crypto.PBKDF2 with SPARK_Mode => On is
             U_Nx : Digest := [others => 0];   -- may stay unset if Iterations = 1
             T    : Digest;
          begin
+            --  Salt copy: J ranges over Salt'Range, so (J - Salt'First) stays
+            --  within 0 .. Salt'Length-1, well inside Msg (0 .. Salt'Length+3).
             for J in Salt'Range loop
                Msg (J - Salt'First) := Salt (J);
             end loop;
@@ -48,8 +51,10 @@ package body Crypto.PBKDF2 with SPARK_Mode => On is
             declare
                Take : constant Natural := Natural'Min (H_Len, DK'Length - Pos);
             begin
+               pragma Assert (Pos + Take <= DK'Length);
                for K in 0 .. Take - 1 loop
                   DK (DK'First + Pos + K) := T (K);
+                  pragma Loop_Invariant (Pos + K + 1 <= DK'Length);
                end loop;
                Pos := Pos + Take;
             end;

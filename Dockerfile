@@ -15,7 +15,7 @@ FROM ubuntu:24.04 AS build
 ARG ALR_VERSION=2.0.2
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates curl unzip git pkg-config \
+      build-essential ca-certificates curl unzip pkg-config \
  && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL -o /tmp/alr.zip \
       "https://github.com/alire-project/alire/releases/download/v${ALR_VERSION}/alr-${ALR_VERSION}-bin-x86_64-linux.zip" \

@@ -38,51 +38,69 @@ package body LLM_GPU is
 
    Fn        : MatVec_Fn := null;
    MM_Fn     : MatMul_Fn := null;
-   Init_Done : Boolean := False;
 
-   procedure Init is
-      H : System.Address;
-   begin
-      if Init_Done then
-         return;
-      end if;
-      Init_Done := True;
-      if not Ada.Environment_Variables.Exists ("ASPIDA_GPU") then
-         return;
-      end if;
-      declare
-         Lib : constant String :=
-           (if Ada.Environment_Variables.Exists ("ASPIDA_GPU_LIB")
-            then Ada.Environment_Variables.Value ("ASPIDA_GPU_LIB")
-            else "./libaspidagpu.so");
-         CL  : chars_ptr := New_String (Lib);
+   --  The lazy dlopen must run exactly once even when several handler tasks
+   --  call Available()/Init concurrently at startup. A bare Boolean flag had a
+   --  check-then-act race (two tasks could both see False and both dlopen).
+   --  The protected procedure serialises the first call; later callers take
+   --  the early-out under the lock. Fn/MM_Fn stay as package-level access
+   --  values so the hot MatVec/MatMul paths read them without locking.
+   protected Init_Guard is
+      procedure Run;
+   private
+      Done : Boolean := False;
+   end Init_Guard;
+
+   protected body Init_Guard is
+      procedure Run is
+         H : System.Address;
       begin
-         H := C_dlopen (CL, RTLD_NOW);
-         Free (CL);
-         if H = System.Null_Address then
+         if Done then
+            return;
+         end if;
+         Done := True;
+         if not Ada.Environment_Variables.Exists ("ASPIDA_GPU") then
             return;
          end if;
          declare
-            CS : chars_ptr := New_String ("aspida_gpu_matvec");
-            A  : System.Address;
+            Lib : constant String :=
+              (if Ada.Environment_Variables.Exists ("ASPIDA_GPU_LIB")
+               then Ada.Environment_Variables.Value ("ASPIDA_GPU_LIB")
+               else "./libaspidagpu.so");
+            CL  : chars_ptr := New_String (Lib);
          begin
-            A := C_dlsym (H, CS);
-            Free (CS);
-            if A /= System.Null_Address then
-               Fn := To_Fn (A);
+            H := C_dlopen (CL, RTLD_NOW);
+            Free (CL);
+            if H = System.Null_Address then
+               return;
             end if;
+            declare
+               CS : chars_ptr := New_String ("aspida_gpu_matvec");
+               A  : System.Address;
+            begin
+               A := C_dlsym (H, CS);
+               Free (CS);
+               if A /= System.Null_Address then
+                  Fn := To_Fn (A);
+               end if;
+            end;
+            declare
+               CS : chars_ptr := New_String ("aspida_gpu_matmul");
+               A  : System.Address;
+            begin
+               A := C_dlsym (H, CS);
+               Free (CS);
+               if A /= System.Null_Address then
+                  MM_Fn := To_MM (A);
+               end if;
+            end;
          end;
-         declare
-            CS : chars_ptr := New_String ("aspida_gpu_matmul");
-            A  : System.Address;
-         begin
-            A := C_dlsym (H, CS);
-            Free (CS);
-            if A /= System.Null_Address then
-               MM_Fn := To_MM (A);
-            end if;
-         end;
-      end;
+      end Run;
+   end Init_Guard;
+
+   procedure Init is
+   begin
+      Init_Guard.Run;
    end Init;
 
    function Available return Boolean is

@@ -84,6 +84,37 @@ begin
       Check ("all-zero input handled", YZ (1, 1) = 0.0 and then YZ (1, 2) = 0.0);
    end;
 
+   --  Per-block fake-quant: with Block >= N it equals per-tensor; with a small
+   --  block each window gets its own scale, so values still land on a grid and
+   --  the error stays within half a (block-local) step.
+   declare
+      YB  : Matrix (1 .. 2, 1 .. 3);
+      YS  : Matrix (1 .. 2, 1 .. 3);
+      On_Grid : Boolean := True;
+   begin
+      Fake_Quant_Forward_Blocked (X, 8, Block => 256, Y => YB);
+      Check ("blocked (block>=N) matches per-tensor", Max_Err (YB, Y8) = 0.0);
+
+      --  Block => 2: three windows [0.5,-0.3],[0.1,0.9],[-0.7,0.2], each its own
+      --  scale. Every output is 0 or +/- its window's Amax (2-bit => 3 levels).
+      Fake_Quant_Forward_Blocked (X, 2, Block => 2, Y => YS);
+      Check ("blocked outputs within window range",
+             (for all I in YS'Range (1) =>
+                (for all J in YS'Range (2) => abs YS (I, J) <= 0.9 + 1.0e-12)));
+      for I in YS'Range (1) loop
+         for J in YS'Range (2) loop
+            if YS (I, J) /= 0.0
+              and then abs YS (I, J) /= 0.5 and then abs YS (I, J) /= 0.3
+              and then abs YS (I, J) /= 0.9 and then abs YS (I, J) /= 0.1
+              and then abs YS (I, J) /= 0.7 and then abs YS (I, J) /= 0.2
+            then
+               On_Grid := False;
+            end if;
+         end loop;
+      end loop;
+      Check ("blocked 2-bit values are 0 or a window Amax", On_Grid);
+   end;
+
    New_Line;
    if Pass then Put_Line ("RESULT: PASS"); else Put_Line ("RESULT: FAIL"); end if;
 end Test_QAT;

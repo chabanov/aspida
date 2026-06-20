@@ -65,6 +65,11 @@ procedure Requantize is
          when GGML_TYPE_Q4_K => return 12;  when GGML_TYPE_Q5_K => return 13;
          when GGML_TYPE_Q6_K => return 14;  when GGML_TYPE_Q8_K => return 15;
          when GGML_TYPE_BF16 => return 30;
+         when GGML_TYPE_UNKNOWN =>
+            --  Read-side sentinel for an unsupported type; a writer never
+            --  serializes it.
+            raise Program_Error
+              with "cannot requantize an unknown/unsupported ggml type";
       end case;
    end Code_Of;
 

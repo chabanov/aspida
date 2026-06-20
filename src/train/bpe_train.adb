@@ -58,9 +58,16 @@ package body BPE_Train is
    end record;
 
    ------------------------------------------------------------------
-   --  Pre-tokenization: split into words; a space starts a new word, so the
-   --  concatenation of all words is exactly the input (lossless) and merges
-   --  never span a space.
+   --  Pre-tokenization (GPT-2 / LLaMA byte-level convention): a space starts a
+   --  new word AND is kept as that word's leading byte, so "the cat" splits as
+   --  ["the", " cat"] — every word after the first carries a leading space
+   --  (the raw 0x20 byte; this engine stores pieces as literal bytes, not the
+   --  GPT-2 Ġ unicode remap, which the inference tokenizer applies separately).
+   --  The first word gets NO leading space: adding one would make Decode emit a
+   --  phantom leading space and break the lossless Encode∘Decode = identity
+   --  round-trip (the hard constraint). Merges never span a space because each
+   --  space begins a fresh word. Encode (below) uses this same split, so Train
+   --  and Encode stay consistent.
    ------------------------------------------------------------------
    procedure Pretokenize (Text : String; Freq : out Freq_Maps.Map) is
       Cur : Unbounded_String;
@@ -146,9 +153,10 @@ package body BPE_Train is
       --  Greedily merge the most frequent adjacent pair until Target is hit.
       while Natural (T.Pieces.Length) < Target loop
          declare
-            Counts   : Count_Maps.Map;
+            Counts    : Count_Maps.Map;
             Best_Code : Unsigned_64 := 0;
             Best_Cnt  : Natural := 0;
+            Best_Pair : Unbounded_String;   -- lexicographic tie-break key
             Found     : Boolean := False;
          begin
             for W of Words loop
@@ -171,12 +179,31 @@ package body BPE_Train is
                end if;
             end loop;
 
+            --  Pick the most frequent pair. On a tie, choose the
+            --  lexicographically-smaller pair (by concatenated piece bytes)
+            --  rather than whichever the hash-map iterator visits first —
+            --  hash iteration order is container/compiler-dependent, so an
+            --  unqualified tie-break would make the learned vocab differ across
+            --  builds for the same corpus. This makes training reproducible.
             for C in Counts.Iterate loop
-               if Count_Maps.Element (C) > Best_Cnt then
-                  Best_Cnt  := Count_Maps.Element (C);
-                  Best_Code := Count_Maps.Key (C);
-                  Found     := True;
-               end if;
+               declare
+                  Cnt  : constant Natural   := Count_Maps.Element (C);
+                  K    : constant Unsigned_64 := Count_Maps.Key (C);
+                  A    : constant Natural   := Natural (Shift_Right (K, 32));
+                  B    : constant Natural   := Natural (K and 16#FFFF_FFFF#);
+                  Cand : constant String    :=
+                    To_String (T.Pieces (A)) & To_String (T.Pieces (B));
+               begin
+                  if Cnt > Best_Cnt
+                    or else (Cnt = Best_Cnt and then Found
+                             and then Cand < To_String (Best_Pair))
+                  then
+                     Best_Cnt  := Cnt;
+                     Best_Code := K;
+                     Best_Pair := To_Unbounded_String (Cand);
+                     Found     := True;
+                  end if;
+               end;
             end loop;
 
             exit when not Found or else Best_Cnt = 0;

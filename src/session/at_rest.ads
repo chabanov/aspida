@@ -18,7 +18,7 @@ package At_Rest is
      (Path       : String;
       Password   : Crypto.Byte_Array;
       Plaintext  : Crypto.Byte_Array;
-      Iterations : Positive := 200_000);
+      Iterations : Positive := 600_000);
 
    function Load
      (Path : String; Password : Crypto.Byte_Array) return Crypto.Byte_Array;

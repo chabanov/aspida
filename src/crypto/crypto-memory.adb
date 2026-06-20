@@ -11,6 +11,11 @@ package body Crypto.Memory is
      (Addr : System.Address; Len : Interfaces.C.size_t) return Interfaces.C.int
      with Import, Convention => C, External_Name => "mlock";
 
+   --  int munlock(const void *addr, size_t len);
+   function C_Munlock
+     (Addr : System.Address; Len : Interfaces.C.size_t) return Interfaces.C.int
+     with Import, Convention => C, External_Name => "munlock";
+
    function Lock (First : System.Address; Length : Natural) return Boolean is
       use type Interfaces.C.int;
    begin
@@ -19,5 +24,14 @@ package body Crypto.Memory is
       end if;
       return C_Mlock (First, Interfaces.C.size_t (Length)) = 0;
    end Lock;
+
+   function Unlock (First : System.Address; Length : Natural) return Boolean is
+      use type Interfaces.C.int;
+   begin
+      if Length = 0 then
+         return True;
+      end if;
+      return C_Munlock (First, Interfaces.C.size_t (Length)) = 0;
+   end Unlock;
 
 end Crypto.Memory;
