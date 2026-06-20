@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `test_kquant_synth` — model-free CI test for the Q2_K/Q3_K decoders
 - Min-p sampling (`min_p` API field / `ASPIDA_MIN_P` env) — keep tokens with
   prob ≥ min_p·p_max; `test_sampler` unit test
+- gemma4 dense forward validated to greedy bit-parity with llama.cpp on real
+  E4B (PLE) and 12B (non-PLE/MQA) models
+- gemma4 loader now rejects MoE variants (routed experts, e.g. supergemma-26B)
+  with a clear error instead of silently running them dense and emitting garbage
 
 ### Changed
 - Refactored backend interface to polymorphic Model_Backend
