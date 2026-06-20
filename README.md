@@ -24,7 +24,9 @@ Aspida is a high-performance LLM inference engine with its own GGUF parser, quan
 |--------------|--------|--------------|--------|
 | **Qwen3.5-MoE+SSM** | Qwen3.5-35B-A3B | Q5_K, Q8_K | ✅ Production |
 | **Llama 3.x** | Llama 3.1/3.2, Mistral | Q4_K, Q6_K | ✅ Production |
-| **Gemma 3n** | Gemma 3n E4B | Q4_K, Q5_K | ⚠️ Validation |
+| **Gemma 4 (dense)** | E4B, 12B, 27B | Q4_0, Q4_K, Q5_K | ✅ Validated¹ |
+
+¹ Dense gemma4 (PLE *and* non-PLE/MQA paths) is greedy-decode bit-identical to llama.cpp on real E4B + 12B models. **MoE gemma4** (e.g. supergemma-26B, 128 routed experts) is **not supported** and is rejected at load with a clear error.
 
 ## Quick Start
 

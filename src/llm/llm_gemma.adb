@@ -192,6 +192,21 @@ package body LLM_Gemma is
          raise Model_Load_Error with "cannot open GGUF file: " & Path;
       end if;
 
+      --  MoE gemma4 (e.g. supergemma-26B: 128 routed experts + a shared dense
+      --  FFN) is a different forward than the dense path this backend
+      --  implements. Running it dense silently ignores every expert and emits
+      --  garbage, so reject it loudly rather than mislead the caller. Detected
+      --  by the router tensor / expert metadata.
+      if MI ("expert_used_count", 0) > 0
+        or else MI ("expert_count", 0) > 0
+        or else Has ("blk.0.ffn_gate_inp.weight")
+      then
+         raise Model_Load_Error with
+           "gemma4 MoE (mixture-of-experts) is not supported by this backend "
+           & "(found routed experts); only the dense gemma4 path "
+           & "(E4B / 12B / 27B) is implemented.";
+      end if;
+
       M.Dim      := MI ("embedding_length", 2560);
       M.N_Blocks := MI ("block_count", 42);
       M.N_Heads  := MI ("attention.head_count", 8);
