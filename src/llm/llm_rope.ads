@@ -82,4 +82,46 @@ package LLM_RoPE is
    -- Returns: rotated tensor [1, head_dim]
    function Apply (P : RoPE_Params; X : Tensor; Pos : Integer) return Tensor;
 
+   --------------------------------------------------------------------
+   --  Per-section RoPE (multimodal mRoPE)
+   --
+   --  Qwen3.5-MoE's mRoPE splits the rotary dim into 3 frequency
+   --  sections (time / height / width, widths 11/11/10 in the head_dim=64
+   --  case, stored in P.Sections). For text-only inference — the only
+   --  mode this engine currently supports — every token uses t = h = w
+   --  = Pos, so the per-section path degenerates to the single-Pos case
+   --  and Apply (P, X, Pos) above is exactly correct.
+   --
+   --  Apply_Sections is the per-section path: it walks P.Sections to
+   --  map each dimension pair to its owning section, then picks the
+   --  position from Sec (4 entries, indexed 0..3 = time/height/width/
+   --  reserved). For text-only, callers pass Sec = Uniform_Positions
+   --  (Pos) and the output is bit-identical to Apply (P, X, Pos). For
+   --  multimodal, a vision encoder would supply different t/h/w per
+   --  token; this function is the wiring point that path will use.
+   --------------------------------------------------------------------
+
+   --  4-element position vector, one per mRoPE section. Index 0 is the
+   --  first section (time), 1 the second (height), 2 the third (width),
+   --  3 reserved for future use. For text-only, all four hold the same
+   --  Pos; for the empty 4th section (width 0), the value is ignored.
+   type Section_Positions is array (0 .. 3) of Integer;
+
+   --  Helper for the text-only / single-Pos case: build a 4-vector
+   --  with the same value in every slot. Delegates Apply (P, X, Pos)
+   --  to Apply_Sections (P, X, Sec) with Sec = Uniform_Positions (Pos).
+   function Uniform_Positions (Pos : Integer) return Section_Positions
+     is ([0 => Pos, 1 => Pos, 2 => Pos, 3 => Pos]);
+
+   --  Per-section RoPE rotation. Pair I in [0, P.Dim/2) belongs to the
+   --  first non-empty section whose cumulative width covers it; if I
+   --  lies beyond all sections, the position falls back to 0 (i.e.
+   --  theta = 0, identity rotation for that pair). With
+   --  Sec = Uniform_Positions (Pos), the output is bit-identical to
+   --  Apply (P, X, Pos) for any P.Sections whose widths sum to P.Dim/2.
+   function Apply_Sections
+     (P   : RoPE_Params;
+      X   : Tensor;
+      Sec : Section_Positions) return Tensor;
+
 end LLM_RoPE;
