@@ -51,4 +51,23 @@ package LLM_FullAttn is
    function Step (L : Full_Attn_Layer; St : in out Attn_State; X : LLM_Tensor.Tensor)
       return LLM_Tensor.Tensor;
 
+   --------------------------------------------------------------------
+   -- RMSNorm a head vector then apply RoPE to its first rope_dim dims.
+   -- Exposed for integration tests so they can exercise Norm_Rope
+   -- directly (Forward calls it internally and discards the result
+   -- inside Q/K projections, so a test that only calls Forward can
+   -- only observe a softened / attenuated effect through the O-proj).
+   --
+   -- The Section_Positions parameter feeds the per-section RoPE path
+   -- in LLM_RoPE.Apply_Sections; the default is uniform ([Pos, Pos,
+   -- Pos, Pos]) which reproduces the legacy text-only rotation exactly.
+   --------------------------------------------------------------------
+   function Norm_Rope
+     (V : LLM_Tensor.Tensor;
+      Norm_W : LLM_Tensor.Tensor;
+      RoPE : LLM_RoPE.RoPE_Params;
+      Pos : Integer;
+      Sec : LLM_RoPE.Section_Positions := [others => 0])
+      return LLM_Tensor.Tensor;
+
 end LLM_FullAttn;

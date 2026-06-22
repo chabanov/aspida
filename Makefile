@@ -159,6 +159,7 @@ test-llm: ## Build + run all LLM unit tests
 	./obj/test_qmatvec_q4k
 	./obj/test_ctx_window
 	./obj/test_rope_scale
+	./obj/test_mrope_sections
 	./obj/test_kv_pool
 	./obj/test_sampler
 	./obj/test_kv_overflow

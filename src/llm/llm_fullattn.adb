@@ -7,6 +7,7 @@ use Ada.Numerics.Elementary_Functions;
 with LLM_Tensor; use LLM_Tensor;
 with LLM_RMSNorm;
 with LLM_Weight; use LLM_Weight;
+with LLM_RoPE;   use LLM_RoPE;
 
 package body LLM_FullAttn is
 
@@ -35,19 +36,28 @@ package body LLM_FullAttn is
 
    --  RMSNorm a head vector, then rotate its first rope_dim dims (partial RoPE).
    function Norm_Rope
-     (V : Tensor; Norm_W : Tensor; RoPE : LLM_RoPE.RoPE_Params; Pos : Integer)
+     (V : Tensor; Norm_W : Tensor; RoPE : LLM_RoPE.RoPE_Params; Pos : Integer;
+      Sec : LLM_RoPE.Section_Positions := [others => 0])
       return Tensor
    is
       HD     : constant Integer := Numel (V);
       RD     : constant Integer := RoPE.Dim;
       Normed : constant Tensor := LLM_RMSNorm.Forward (V, Norm_W);
       Sub    : Tensor := New_Tensor ([1, RD]);
+      --  When the caller didn't pass Sec (default = [0,0,0,0]), we
+      --  reproduce the legacy text-only rotation: every section uses
+      --  the same Pos. The sentinel works because legitimate
+      --  Section_Positions are non-zero on at least the time axis.
+      Eff_Sec : constant LLM_RoPE.Section_Positions :=
+        (if Sec = LLM_RoPE.Section_Positions'(others => 0)
+         then LLM_RoPE.Uniform_Positions (Pos)
+         else Sec);
    begin
       for I in 1 .. RD loop
          Set_Flat (Sub, I, Get_Flat (Normed, I));
       end loop;
       declare
-         Rot : constant Tensor := LLM_RoPE.Apply (RoPE, Sub, Pos);
+         Rot : constant Tensor := LLM_RoPE.Apply_Sections (RoPE, Sub, Eff_Sec);
       begin
          return R : Tensor := New_Tensor ([1, HD]) do
             for I in 1 .. RD loop

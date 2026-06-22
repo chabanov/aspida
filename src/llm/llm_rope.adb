@@ -81,40 +81,81 @@ package body LLM_RoPE is
       P.Yarn_On   := True;
    end Set_Yarn_Scale;
 
-   function Apply (P : RoPE_Params; X : Tensor; Pos : Integer) return Tensor is
+   function Apply_Sections
+     (P   : RoPE_Params;
+      X   : Tensor;
+      Sec : Section_Positions) return Tensor
+   is
       Half_Dim : constant Integer := P.Dim / 2;  -- 32 for Qwen
       Result   : Tensor := New_Tensor ([1, P.Dim]);
       Theta    : Float;
       Cos_Val  : Float;
       Sin_Val  : Float;
       X1, X2   : Float;
+
+      --  Map a dimension pair index I in [0, Half_Dim) to its owning
+      --  mRoPE section. Walks P.Sections (4 widths, in pairs) and
+      --  returns the first section id whose cumulative width covers I.
+      --  Returns -1 if I lies beyond every non-empty section (i.e. a
+      --  "leftover" pair that no section owns). Pairs that fall in
+      --  empty sections (width 0) are skipped during the walk.
+      function Section_Of (I : Integer) return Integer is
+         Cum : Integer := 0;
+      begin
+         for S in 0 .. 3 loop
+            declare
+               W : constant Integer := Integer (Get_Flat (P.Sections, S + 1));
+            begin
+               if W <= 0 then
+                  null;                       -- empty section: skip
+               elsif I < Cum + W then
+                  return S;
+               else
+                  Cum := Cum + W;
+               end if;
+            end;
+         end loop;
+         return -1;                           -- beyond all sections
+      end Section_Of;
    begin
       --  mRoPE / Sections note: Qwen3.5-MoE mRoPE splits the head into 3
-      --  frequency sections (time/height/width, widths 11/11/10 here, stored
-      --  in P.Sections). For TEXT-only inference — the only mode this engine
-      --  supports — every text token uses t = h = w = Pos, so a single position
-      --  applied across all dims is exactly correct and P.Sections needs no
-      --  per-section position routing. Multimodal (vision) inputs would need a
-      --  separate position per section; that path is not wired in (no image
-      --  encoder), so Sections is deliberately a no-op here, not a bug. The
-      --  caller (LLM_FullAttn.Norm_Rope) passes one Pos for all dims by design.
+      --  frequency sections (time/height/width, widths 11/11/10 here,
+      --  stored in P.Sections). For TEXT-only inference the single-Pos
+      --  Apply (P, X, Pos) above is used, which is bit-identical to
+      --  Apply_Sections (P, X, Uniform_Positions (Pos)). This body
+      --  implements the per-section path: pair I picks the position
+      --  from Sec (Section_Of I) instead of always using a scalar Pos.
+      --  Multimodal (vision) inputs would supply distinct t/h/w per
+      --  token via Sec; that path is not wired in callers (no image
+      --  encoder) but the API is ready.
       --
-      --  NeoX / rotate_half convention (Qwen, Gemma): pair dimension i with
-      --  i + dim/2 (first half with second half), NOT adjacent (2i, 2i+1).
-      --  Llama instead sets P.Interleaved (see below): adjacent pairs (2i, 2i+1).
-      --    theta_i = pos / freq_base^(2i/dim)
+      --  NeoX / rotate_half convention (Qwen, Gemma): pair dimension i
+      --  with i + dim/2 (first half with second half), NOT adjacent
+      --  (2i, 2i+1). Llama instead sets P.Interleaved (see below):
+      --  adjacent pairs (2i, 2i+1).
+      --    theta_i = eff_pos / freq_base^(2i/dim)
       --    out[i]          = x[i]*cos - x[i+d/2]*sin
       --    out[i+d/2]      = x[i+d/2]*cos + x[i]*sin
       for I in 0 .. Half_Dim - 1 loop
          declare
-            --  theta_extrap = pos / base^(2i/dim) (raw / extrapolation).
+            --  Per-section position: pick the section this pair
+            --  belongs to (Section_Of), then take Sec(s). A return of
+            --  -1 (pair beyond all sections) maps to 0, which makes
+            --  theta = 0 and the rotation an identity for that pair
+            --  — the right behaviour for an unowned pair.
+            S            : constant Integer := Section_Of (I);
+            Eff_Pos      : constant Integer :=
+              (if S in 0 .. 3 then Sec (S) else 0);
+
+            --  theta_extrap = eff_pos / base^(2i/dim) (raw / extrapolation).
             Extrap : constant Float :=
-              Float (Pos) / (P.Freq_Base ** (Float (2 * I) / Float (P.Dim)));
+              Float (Eff_Pos)
+              / (P.Freq_Base ** (Float (2 * I) / Float (P.Dim)));
          begin
             if P.Yarn_On then
-               --  Blend interpolation (Freq_Scale*extrap) and extrapolation by
-               --  the correction-dim ramp: high-freq dims extrapolate, low-freq
-               --  interpolate (llama.cpp rope_yarn).
+               --  Blend interpolation (Freq_Scale*extrap) and extrapolation
+               --  by the correction-dim ramp: high-freq dims extrapolate,
+               --  low-freq interpolate (llama.cpp rope_yarn).
                declare
                   Interp : constant Float := P.Freq_Scale * Extrap;
                   Y      : constant Float :=
@@ -156,6 +197,9 @@ package body LLM_RoPE is
       end loop;
 
       return Result;
-   end Apply;
+   end Apply_Sections;
+
+   function Apply (P : RoPE_Params; X : Tensor; Pos : Integer) return Tensor
+     is (Apply_Sections (P, X, Uniform_Positions (Pos)));
 
 end LLM_RoPE;

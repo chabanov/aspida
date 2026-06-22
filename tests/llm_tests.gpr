@@ -21,7 +21,8 @@ project LLM_Tests is
                  "test_quant.adb", "test_kquant_synth.adb",
                  "test_q3k_real.adb", "test_q2k_real.adb",
                  "test_ctx_window.adb",
-                 "test_rope_scale.adb", "test_kv_pool.adb",
+                 "test_rope_scale.adb", "test_mrope_sections.adb", "test_mrope_integration.adb",
+                 "test_kv_pool.adb",
                  "test_sampler.adb",
                  "test_kv_overflow.adb",
                  "test_pool.adb");
