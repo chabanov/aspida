@@ -38,6 +38,11 @@ models/
 *.gpr.user
 *.cgpr
 
+# Dev-only project files (not part of the build)
+CLAUDE.md
+debug.gpr
+tests/mrope_only.gpr
+
 # OS
 .DS_Store
 Thumbs.db
