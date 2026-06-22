@@ -33,7 +33,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Alire + GNAT toolchain
         uses: alire-project/setup-alire@v6
@@ -136,7 +136,7 @@ jobs:
   #   name: GPU Build (CUDA)
   #   runs-on: [ self-hosted, cuda ]
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v7
   #     - name: Build CUDA kernels
   #       run: make gpu
   #     - name: Run GPU tests
@@ -149,7 +149,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
