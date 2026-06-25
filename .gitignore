@@ -31,6 +31,27 @@ models/
 *.gguf
 *.model
 
+# CUDA build artifacts (the .cu sources are tracked; built binaries/libs are not)
+*.so
+gpu/train_mlp
+gpu/train_resident
+gpu/train_shim
+gpu/test_matvec
+gpu/art_test
+gpu/test_rmsnorm_gpu
+gpu/test_swiglu_gpu
+gpu/test_rope_gpu
+gpu/test_attention_gpu
+gpu/test_attention_mh_gpu
+gpu/test_celoss_gpu
+gpu/student_resident
+gpu/test_gemm_tiled
+gpu/test_dataparallel
+gpu/dp_node
+gpu/test_gemm_wmma
+gpu/test_celoss_soft
+gpu/test_distill_gpu
+
 # Platform local state
 .platform-state/
 
@@ -46,3 +67,6 @@ tests/mrope_only.gpr
 # OS
 .DS_Store
 Thumbs.db
+
+# P4 SVG run artifacts (dataset/targets/gguf/logs)
+svgdata/

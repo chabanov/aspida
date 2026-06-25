@@ -24,6 +24,13 @@ with System;       -- for System.Address
 
 package LLM_GGUF is
 
+   --  Raised when an untrusted GGUF file is structurally invalid: a tensor
+   --  whose declared size overflows or runs past the end of the file, an
+   --  out-of-range value-type / dimension count, a bad alignment, etc.
+   --  Failing loudly here (rather than reading out of bounds or dividing by
+   --  zero) keeps a hostile model from corrupting the loader.
+   Malformed_GGUF : exception;
+
    --------------------------------------------------------------------
    -- Types
    --------------------------------------------------------------------
@@ -61,6 +68,11 @@ package LLM_GGUF is
       Dims       : Dim_Array;
       Kind       : GGML_Type;
       Offset     : U64;  -- byte offset from file start (absolute within file)
+      --  Validated, overflow-checked size in bytes of this tensor's data,
+      --  computed once in Open from the (untrusted) dims + type and bounded
+      --  against the file length. The single source of truth consumed by the
+      --  decode loop count and every allocation; see Tensor_Byte_Size.
+      Byte_Size  : U64 := 0;
    end record;
 
    package Tensor_Info_Vectors is new Ada.Containers.Vectors
@@ -110,6 +122,11 @@ package LLM_GGUF is
 
    -- Find tensor by name. Raises Constraint_Error if not found.
    function Find_Tensor (File : GGUF_File; Name : String) return Tensor_Info;
+
+   -- True iff a tensor with this exact name exists. Lets callers probe for
+   -- optional tensors (e.g. a shared expert that some MoE variants omit)
+   -- without the Constraint_Error that Find_Tensor raises on a miss.
+   function Has_Tensor (File : GGUF_File; Name : String) return Boolean;
 
    -- Read raw tensor data from file into byte array.
    -- Caller provides buffer large enough for the tensor.
@@ -178,6 +195,7 @@ private
       Merges        : Str_Vectors.Vector;  -- tokenizer.ggml.merges
       Alignment_Val : U64 := 32;  -- default alignment
       Data_Start    : U64 := 0;   -- byte offset where tensor data begins
+      File_Size     : U64 := 0;   -- total file length in bytes (from lseek)
       FD            : Integer := -1;  -- POSIX file descriptor (via C import)
    end record;
 

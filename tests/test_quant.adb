@@ -25,15 +25,17 @@ procedure Test_Quant is
      (Name   => Null_Unbounded_String,
       N_Dims => 2,
       Dims   => [N, 1, 0, 0],
-      Kind   => LLM_GGUF.GGML_TYPE_Q8_0,
-      Offset => 0);
+      Kind      => LLM_GGUF.GGML_TYPE_Q8_0,
+      Offset    => 0,
+      Byte_Size => 0);
 
    function Info4 return LLM_GGUF.Tensor_Info is
      (Name   => Null_Unbounded_String,
       N_Dims => 2,
       Dims   => [N, 1, 0, 0],
-      Kind   => LLM_GGUF.GGML_TYPE_Q4_0,
-      Offset => 0);
+      Kind      => LLM_GGUF.GGML_TYPE_Q4_0,
+      Offset    => 0,
+      Byte_Size => 0);
 
    --  Max round-trip error of S (already-quantized bytes) vs X via the engine.
    function Deq_Err (X : Tensor; S : String; I : LLM_GGUF.Tensor_Info)
@@ -132,7 +134,7 @@ begin
    declare
       Info50 : constant LLM_GGUF.Tensor_Info :=
         (Name => Null_Unbounded_String, N_Dims => 2, Dims => [N, 1, 0, 0],
-         Kind => LLM_GGUF.GGML_TYPE_Q5_0, Offset => 0);
+         Kind => LLM_GGUF.GGML_TYPE_Q5_0, Offset => 0, Byte_Size => 0);
       function RT_Err50 (X : Tensor) return Float is
         (Deq_Err (X, LLM_Quant.Quantize_Q5_0 (X), Info50));
    begin
@@ -174,7 +176,7 @@ begin
       NK    : constant := 256;
       InfoK : constant LLM_GGUF.Tensor_Info :=
         (Name => Null_Unbounded_String, N_Dims => 2, Dims => [NK, 1, 0, 0],
-         Kind => LLM_GGUF.GGML_TYPE_Q4_K, Offset => 0);
+         Kind => LLM_GGUF.GGML_TYPE_Q4_K, Offset => 0, Byte_Size => 0);
       X : Tensor := New_Tensor ([1, NK]);
       function ErrK return Float is
          S : constant String := LLM_Quant.Quantize_Q4_K (X);
@@ -212,7 +214,7 @@ begin
       NK    : constant := 256;
       Info5 : constant LLM_GGUF.Tensor_Info :=
         (Name => Null_Unbounded_String, N_Dims => 2, Dims => [NK, 1, 0, 0],
-         Kind => LLM_GGUF.GGML_TYPE_Q5_K, Offset => 0);
+         Kind => LLM_GGUF.GGML_TYPE_Q5_K, Offset => 0, Byte_Size => 0);
       X : Tensor := New_Tensor ([1, NK]);
       function Err5 return Float is
          S : constant String := LLM_Quant.Quantize_Q5_K (X);
@@ -248,7 +250,7 @@ begin
       NK    : constant := 256;
       Info6 : constant LLM_GGUF.Tensor_Info :=
         (Name => Null_Unbounded_String, N_Dims => 2, Dims => [NK, 1, 0, 0],
-         Kind => LLM_GGUF.GGML_TYPE_Q6_K, Offset => 0);
+         Kind => LLM_GGUF.GGML_TYPE_Q6_K, Offset => 0, Byte_Size => 0);
       X : Tensor := New_Tensor ([1, NK]);
       --  RELATIVE error (max abs error / max |x|): the right metric for Q6_K,
       --  whose shared f16 d makes the absolute error scale with magnitude. The

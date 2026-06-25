@@ -7,6 +7,7 @@
 ---------------------------------------------------------------------
 
 with Interfaces;             use Interfaces;
+with Interfaces.C;           use type Interfaces.C.int;
 with Ada.Strings.Unbounded;  use Ada.Strings.Unbounded;
 with Ada.Containers.Vectors;
 with Ada.Environment_Variables;
@@ -21,6 +22,69 @@ package body Session_Store is
    Dir      : constant String := "sessions";
    PBKDF_It : constant := 600_000;
    LF       : constant Character := Character'Val (10);
+
+   --  int unsetenv(const char *name);  POSIX unsetenv(2). Removes the variable
+   --  from the process environment so it no longer appears in /proc/<pid>/environ
+   --  and is not inherited by child processes.
+   function C_Unsetenv
+     (Name : Interfaces.C.char_array) return Interfaces.C.int
+     with Import, Convention => C, External_Name => "unsetenv";
+
+   --  int chmod(const char *path, mode_t mode);  POSIX chmod(2). Used to lock
+   --  the sessions directory to owner-only so other local users cannot read the
+   --  (encrypted-at-rest) session files.
+   function C_Chmod
+     (Pathp : Interfaces.C.char_array; Mode : Interfaces.C.int)
+      return Interfaces.C.int
+     with Import, Convention => C, External_Name => "chmod";
+
+   --  The master password is captured from ASPIDA_STORE_PASSWORD into this
+   --  cached buffer and the variable is then scrubbed from the environment so a
+   --  child process can never observe it. Whenever the variable is found set
+   --  again (e.g. an operator rotates the password), the cache is refreshed
+   --  from the new value and the variable scrubbed again — so the live value
+   --  always wins, but never lingers in the environment. Pw_Loaded records that
+   --  at least one capture attempt has happened; Pw_Set records whether a
+   --  non-empty password is currently held (an unset/empty password disables
+   --  persistence — see Enabled).
+   type Byte_Array_Access is access Byte_Array;
+   procedure Free_Pw is
+     new Ada.Unchecked_Deallocation (Byte_Array, Byte_Array_Access);
+   Pw_Loaded : Boolean := False;
+   Pw_Set    : Boolean := False;
+   Pw_Cache  : Byte_Array_Access := null;
+
+   procedure Load_Password is
+      V : constant String := Ada.Environment_Variables.Value (Var, "");
+   begin
+      if V'Length > 0 then
+         --  Variable is currently set: (re)load the cache from it — this also
+         --  honors a password rotation between the cached value and now.
+         if Pw_Cache /= null then
+            Wipe (Pw_Cache.all);
+            Free_Pw (Pw_Cache);
+         end if;
+         Pw_Cache := new Byte_Array (0 .. V'Length - 1);
+         for I in V'Range loop
+            Pw_Cache (I - V'First) := U8 (Character'Pos (V (I)));
+         end loop;
+         Pw_Set := True;
+         --  Scrub the variable so a child process can never observe it. The
+         --  return value is intentionally ignored.
+         declare
+            Dummy : Interfaces.C.int;
+            pragma Unreferenced (Dummy);
+         begin
+            Dummy := C_Unsetenv (Interfaces.C.To_C (Var));
+         end;
+      elsif not Pw_Loaded then
+         --  First call and the variable was never set: persistence is disabled.
+         Pw_Set := False;
+      end if;
+      --  Otherwise the variable is empty but a password was captured earlier;
+      --  keep the cache (the variable was already scrubbed on that call).
+      Pw_Loaded := True;
+   end Load_Password;
 
    type Turn_Rec is record
       U : Unbounded_String;
@@ -37,8 +101,10 @@ package body Session_Store is
    procedure Free is new Ada.Unchecked_Deallocation (Store_Rec, Store);
 
    function Enabled return Boolean is
-     (Ada.Environment_Variables.Exists (Var)
-      and then Ada.Environment_Variables.Value (Var) /= "");
+   begin
+      Load_Password;
+      return Pw_Set;
+   end Enabled;
 
    function Valid_Id (Id : String) return Boolean is
    begin
@@ -54,14 +120,21 @@ package body Session_Store is
       return True;
    end Valid_Id;
 
+   --  Return a copy of the cached master password (empty if unset). The caller
+   --  owns the copy and must Wipe it; the cache itself stays resident for the
+   --  process lifetime. Reads from the one-time cache, never the environment.
    function Password_Bytes return Byte_Array is
-      V : constant String := Ada.Environment_Variables.Value (Var, "");
-      R : Byte_Array (0 .. Integer'Max (0, V'Length) - 1);
    begin
-      for I in V'Range loop
-         R (I - V'First) := U8 (Character'Pos (V (I)));
-      end loop;
-      return R;
+      Load_Password;
+      if Pw_Set and then Pw_Cache /= null then
+         return R : Byte_Array (Pw_Cache'Range) do
+            R := Pw_Cache.all;
+         end return;
+      else
+         return R : Byte_Array (1 .. 0) do
+            null;
+         end return;
+      end if;
    end Password_Bytes;
 
    function Path (S : Store) return String is
@@ -155,6 +228,12 @@ package body Session_Store is
    begin
       if not Ada.Directories.Exists (Dir) then
          Ada.Directories.Create_Path (Dir);
+         --  Lock the sessions directory to owner-only (rwx) right after
+         --  creation so other local users cannot enumerate or read the
+         --  encrypted-at-rest session files.
+         if C_Chmod (Interfaces.C.To_C (Dir), 8#700#) /= 0 then
+            raise Ada.Directories.Use_Error with "chmod of sessions dir failed";
+         end if;
       end if;
       At_Rest.Save (Path (S), Pw, Bytes, Iterations => PBKDF_It);
       Wipe (Bytes);

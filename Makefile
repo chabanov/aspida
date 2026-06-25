@@ -131,7 +131,24 @@ train-test: ## Build + run the from-scratch training-core self-tests (model-free
 	./obj/test_qat
 	./obj/test_qat_train
 	./obj/test_teacher
+	./obj/test_multi_teacher
 	./obj/test_scale
+	./obj/test_platform
+	./obj/test_eval
+	./obj/test_data_pipeline
+	./obj/test_job_store
+	./obj/train_resident_probe
+	./obj/student_gpu_probe
+	./obj/test_turnkey
+
+.PHONY: distill-demos
+distill-demos: ## Verifier-driven distillation demos (model-free): student >= teacher
+	$(GPRBUILD) -P train.gpr $(GPR_FLAGS)
+	./obj/code_distill      # verifier-filtered distillation: filtered student > noisy teacher
+	./obj/code_iterate      # verifier-bootstrapped self-improvement (no teacher) -> full coverage
+	./obj/exec_distill      # Track 2: a REAL interpreter (python3) verifies real code
+	./obj/turnkey_demo     # MVP turnkey loop end-to-end: admit->train->gate->charge
+	./obj/turnkey_serve_demo # delivery glue: train -> Delivered -> export GGUF -> engine-load -> endpoint
 
 # ══════════════════════════════════════════════════════════════════════
 #  SPARK (formal verification)

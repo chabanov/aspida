@@ -155,7 +155,42 @@ checkpointing**, logit-level **knowledge distillation** (teacher → student), a
 generic multi-layer transformer `Student`, a **BPE tokenizer trainer**, and a
 GGUF exporter — so a model trained from scratch (with its own learned
 vocabulary) loads and runs in this same engine. CUDA training kernels are
-reachable via a C-ABI shim (`ASPIDA_TRAIN_GPU`).
+reachable via a C-ABI shim (`ASPIDA_TRAIN_GPU`). GPU-resident *training* (Stage 1)
+is proven by `gpu/train_mlp.cu` — weights + AdamW + data resident on the device,
+loss collapses, validated on an NVIDIA GPU; multi-GPU/distributed training is the
+documented roadmap in `gpu/README.md`.
+
+**Distillation teachers.** `Distill.Teacher` is a small interface (`Vocab` +
+`Forward → per-position logits`); any served model implements it via a thin
+adapter — `Teacher_Llama`, `Teacher_Qwen`, `Teacher_Gemma` — backed by each
+backend's `Forward_Logits`. So an existing Llama / Qwen-MoE / Gemma model
+teaches a new student through the very engine that serves it.
+
+**Multi-teacher (ensemble) distillation.** `Distill.Capture_Ensemble` lets
+several models teach one student at once: it averages each teacher's
+temperature-scaled softmax in *probability* space (optionally weighted) and
+keeps the top-K of that blend. Combining in probability space is the only sound
+merge — a union of per-teacher top-K sets is lossy/unbounded and averaging raw
+logits across models is meaningless. Because the result is an ordinary `Sample`,
+the KL-training loop and on-disk dataset are unchanged. All teachers must share
+the student's tokenizer/vocabulary (`Vocab_Mismatch` otherwise). Note that
+per-teacher weighted KL is *mathematically identical* to a single KL against the
+ensemble target (same gradient), so the ensemble path subsumes it.
+
+**Exceeding the teacher (verifier-driven).** Pure imitation is bounded by the
+teacher; to do better the student needs a signal the teacher's distribution
+lacks. An **executable verifier** is exactly that. `Code_DSL` is a tiny
+program-synthesis task whose `Verify` *runs* a candidate program on test inputs
+(functional correctness). Two engines build on it: **verifier-filtered
+distillation** (`code_distill`) trains the student only on a noisy teacher's
+verified-correct outputs — it reaches 100% where the teacher sits at 40% and
+naive imitation collapses to 20% (it learns the teacher's systematic error);
+**verifier-bootstrapped self-improvement** (`code_iterate`, STaR-style) removes
+the teacher entirely — the model proposes (grammar-constrained sampling), the
+verifier filters, correct programs accumulate, a fresh student retrains and
+becomes the next proposer (keep-best across rounds), climbing from a random
+proposer to full coverage. The student's ceiling is the verifier's quality.
+`make distill-demos` runs both; both are model-free.
 
 ---
 

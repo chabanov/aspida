@@ -70,7 +70,9 @@ begin
              & "   loaded: " & Boolean'Image (Is_Loaded (Tok)));
    New_Line;
 
-   Assert ("loaded a real vocab (>200k tokens)", Vocab_Size (Tok) > 200_000);
+   --  A real LLM vocab is tens of thousands of tokens (Llama 128k, Qwen 152k–
+   --  248k, Gemma 262k) — far above the 256 byte-fallback of a synthetic one.
+   Assert ("loaded a real vocab (>10k tokens)", Vocab_Size (Tok) > 10_000);
 
    Round_Trip ("Hello, world!");
    Round_Trip ("The quick brown fox jumps over the lazy dog.");

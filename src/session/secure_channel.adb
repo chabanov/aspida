@@ -47,25 +47,37 @@ package body Secure_Channel is
       end if;
    end Write_Frame;
 
-   function Read_Frame (T : access Byte_Transport'Class) return Byte_Array is
+   function Read_Frame
+     (T : access Byte_Transport'Class; Max : Natural := Max_Frame)
+      return Byte_Array
+   is
       Hdr : Byte_Array (0 .. 3);
    begin
       Read (T.all, Hdr);
       declare
-         L : constant Natural :=
-           Natural (Shift_Left (U32 (Hdr (0)), 24)
-                    or Shift_Left (U32 (Hdr (1)), 16)
-                    or Shift_Left (U32 (Hdr (2)), 8)
-                    or U32 (Hdr (3)));
+         --  Stay in the U32 domain for the bounds check: a length with the high
+         --  bit set (>= 2^31) would make U32->Natural raise Constraint_Error,
+         --  which is not one of this channel's declared exceptions. Reject
+         --  oversize on the header (before the body read) and only convert the
+         --  now-bounded value to Natural.
+         L_U32 : constant U32 :=
+           Shift_Left (U32 (Hdr (0)), 24)
+           or Shift_Left (U32 (Hdr (1)), 16)
+           or Shift_Left (U32 (Hdr (2)), 8)
+           or U32 (Hdr (3));
       begin
-         if L > Max_Frame then
+         if L_U32 > U32 (Max) then
             raise Handshake_Error with "frame too large";
          end if;
-         return R : Byte_Array (0 .. L - 1) do
-            if L > 0 then
-               Read (T.all, R);
-            end if;
-         end return;
+         declare
+            L : constant Natural := Natural (L_U32);
+         begin
+            return R : Byte_Array (0 .. L - 1) do
+               if L > 0 then
+                  Read (T.all, R);
+               end if;
+            end return;
+         end;
       end;
    end Read_Frame;
 
@@ -138,7 +150,7 @@ package body Secure_Channel is
    begin
       Crypto.Random.Fill (F_Priv);
       declare
-         E_Pub  : constant Byte_Array := Read_Frame (T);            -- client e
+         E_Pub  : constant Byte_Array := Read_Frame (T, 32);        -- client e
          F_Pub  : constant Key32 := Crypto.X25519.Public_Key (F_Priv);
       begin
          if E_Pub'Length /= 32 then
@@ -216,7 +228,7 @@ package body Secure_Channel is
       begin
          Write_Frame (T, E_Pub);                                    -- client e
          declare
-            F_Frame : constant Byte_Array := Read_Frame (T);        -- server f
+            F_Frame : constant Byte_Array := Read_Frame (T, 32);    -- server f
             F_Pub   : Key32;
          begin
             if F_Frame'Length /= 32 then
@@ -245,7 +257,7 @@ package body Secure_Channel is
 
                --  Verify the server's key-confirmation tag.
                declare
-                  Tag_Frame : constant Byte_Array := Read_Frame (T);
+                  Tag_Frame : constant Byte_Array := Read_Frame (T, 16);
                   Tag : Crypto.AEAD.Tag_128;
                   Got : Byte_Array (1 .. 0);
                begin

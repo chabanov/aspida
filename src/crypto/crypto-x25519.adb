@@ -116,6 +116,50 @@ package body Crypto.X25519 with SPARK_Mode => On is
 
    function Sqr (A : GF) return GF is (Mul (A, A));
 
+   --  Best-effort scrub of a GF field-element holding secret Montgomery state /
+   --  the shared secret. The declaration is in SPARK (callable from SPARK
+   --  code); the body steps outside SPARK for the anti-dead-store-elimination
+   --  trick, exactly as Crypto.Wipe does for byte arrays.
+   procedure Wipe_GF (G : in out GF)
+     with Global            => null,
+          Always_Terminates => True,
+          Post              => (for all I in G'Range => G (I) = 0);
+
+   --  Mirror Crypto.Wipe: overwrite every limb with zero, then fold the limbs
+   --  and raise if any survived, so the optimiser cannot prove the post-wipe
+   --  read dead and elide the stores on a local never read again. The branch
+   --  is on the fold accumulator (always 0 unless a wipe was skipped, a bug) —
+   --  it is NOT a branch on the secret value, so constant time is preserved.
+   --  Best-effort scrub of a secret scalar limb (the live scalar bit). The
+   --  `in out` parameter references the variable (so the caller's wipe is not a
+   --  useless assignment under -gnatwa/-gnatwe) and the body reads the
+   --  post-zero value to defeat dead-store elimination. Branch is on the
+   --  just-zeroed value, never on live secret data.
+   procedure Scrub (X : in out I64)
+     with Global => null, Always_Terminates => True, Post => X = 0;
+
+   procedure Scrub (X : in out I64) with SPARK_Mode => Off is
+      --  Overlay as bytes and reuse Crypto.Wipe; its post-wipe fold-and-read
+      --  defeats DSE without tripping -gnatwc on a statically-known compare.
+      B : Byte_Array (0 .. 7) with Import, Address => X'Address;
+   begin
+      Wipe (B);
+   end Scrub;
+
+   procedure Wipe_GF (G : in out GF) with SPARK_Mode => Off is
+      Diff : U64 := 0;
+   begin
+      for I in G'Range loop
+         G (I) := 0;
+      end loop;
+      for I in G'Range loop
+         Diff := Diff or To_U (G (I));   -- I64 has no "or"; fold via U64
+      end loop;
+      if Diff /= 0 then
+         raise Program_Error;
+      end if;
+   end Wipe_GF;
+
    --  i^(p-2) = i^-1 (mod p), via the fixed 255-step addition chain.
    function Inv (Inp : GF) return GF is
       C : GF := Inp;
@@ -216,7 +260,19 @@ package body Crypto.X25519 with SPARK_Mode => On is
       C := Inv (C);
       A := Mul (A, C);
       Pack (Result, A);
-      Wipe (Z);   -- scrub the clamped private scalar before returning
+      --  Scrub every secret left in registers/stack before returning: the
+      --  clamped private scalar Z, the secret scalar bit R, and all GF
+      --  field-element temporaries (X holds the input point, A/C hold the
+      --  recovered shared secret, B/D/E/F the Montgomery-ladder state).
+      Wipe (Z);
+      Scrub (R);
+      Wipe_GF (X);
+      Wipe_GF (A);
+      Wipe_GF (B);
+      Wipe_GF (C);
+      Wipe_GF (D);
+      Wipe_GF (E);
+      Wipe_GF (F);
       return Result;
    end Scalar_Mult;
 

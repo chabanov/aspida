@@ -3,6 +3,7 @@
 ---------------------------------------------------------------------
 
 with JSON;
+with Ada.Directories;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with LLM_Catalog;
 
@@ -159,9 +160,14 @@ package body OpenAI is
             declare
                M    : constant JSON.Value_Ref := JSON.New_Object;
                Path : constant String := To_String (E.Path);
+               --  Opaque, client-facing id: the file basename, never the
+               --  absolute path (which would leak the server's username /
+               --  directory layout). Selection accepts the basename or the
+               --  full path server-side.
+               Id   : constant String := Ada.Directories.Simple_Name (Path);
                MiB  : constant Long_Long_Integer := 1024 * 1024;
             begin
-               JSON.Set (M, "id", JSON.Str (Path));
+               JSON.Set (M, "id", JSON.Str (Id));
                JSON.Set (M, "object", JSON.Str ("model"));
                JSON.Set (M, "created", JSON.Int (0));
                JSON.Set (M, "owned_by", JSON.Str ("aspida"));

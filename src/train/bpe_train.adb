@@ -313,7 +313,14 @@ package body BPE_Train is
    function Decode (T : Trainer; Ids : Id_Array) return String is
       R : Unbounded_String;
    begin
-      for Id of Ids loop Append (R, T.Pieces (Id)); end loop;
+      for Id of Ids loop
+         --  Fail loud on an out-of-range id rather than letting the container
+         --  index raise a raw Constraint_Error.
+         if Id >= Vocab_Size (T) then
+            raise Bad_Id with "token id out of range in Decode";
+         end if;
+         Append (R, T.Pieces (Id));
+      end loop;
       return To_String (R);
    end Decode;
 

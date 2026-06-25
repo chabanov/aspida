@@ -95,8 +95,18 @@ begin
    end if;
    New_Line;
 
-   Check ("blk.0.ffn_gate_shexp.weight");   -- Q5_K, in=2048 out=512
-   Check ("blk.0.ffn_down_shexp.weight");   -- Q6_K, in=512  out=2048
+   --  Validate streaming QMatVec on real quantized tensors. Prefer the shared
+   --  expert (Q5_K/Q6_K) where present; some Qwen-MoE variants omit it, so fall
+   --  back to an attention / router tensor that always exists.
+   if Has_Tensor (G, "blk.0.ffn_gate_shexp.weight") then
+      Check ("blk.0.ffn_gate_shexp.weight");   -- Q5_K, in=2048 out=512
+      Check ("blk.0.ffn_down_shexp.weight");   -- Q6_K, in=512  out=2048
+   elsif Has_Tensor (G, "blk.0.attn_qkv.weight") then
+      Put_Line ("  (no shared expert; validating QMatVec on attn_qkv)");
+      Check ("blk.0.attn_qkv.weight");
+   else
+      Check ("blk.0.ffn_gate_inp.weight");
+   end if;
 
    Close (G);
 

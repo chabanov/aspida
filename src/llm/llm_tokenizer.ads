@@ -19,6 +19,16 @@ package LLM_Tokenizer is
 
    type Tokenizer is private;
 
+   --  Raised by Encode when the input text exceeds Max_Encode_Len. Greedy BPE
+   --  is ~O(N^2..N^3) on adversarial input, so an un-capped prompt could pin a
+   --  CPU before the context-length clamp runs (DoS). The cap is far above any
+   --  real context window, so legitimate input never trips it.
+   Input_Too_Long : exception;
+
+   --  Generous upper bound on Encode input length (bytes), well above any
+   --  served context window.
+   Max_Encode_Len : constant := 1_048_576;  -- 1 MiB
+
    -- Empty tokenizer (byte-level fallback until a vocab is added).
    function Create return Tokenizer;
 

@@ -64,9 +64,53 @@ package Distill is
      with Pre => Row in 1 .. S.N;
 
    --------------------------------------------------------------------
+   --  Multi-teacher (ensemble) distillation: several existing models jointly
+   --  teach one student. Teachers are combined in PROBABILITY space — each
+   --  teacher's per-position softmax (at Temp) is averaged (optionally
+   --  weighted), and the top-K of that *averaged* distribution is kept. This
+   --  is the only sound way to merge teachers: a union of per-teacher top-K
+   --  sets would be lossy and unbounded, and averaging raw logits is not
+   --  meaningful across models. The merged result is an ordinary Sample, so
+   --  the whole downstream pipeline (Teacher_Prob, KL training, the on-disk
+   --  dataset) is unchanged.
+   --
+   --  All teachers MUST share the student's vocabulary/tokenizer for the
+   --  distributions to align; a differing Vocab raises Vocab_Mismatch.
+   --------------------------------------------------------------------
+   type Teacher_Ptr   is access all Teacher'Class;
+   type Teacher_Array is array (Positive range <>) of Teacher_Ptr;
+   type Weight_Array  is array (Positive range <>) of Long_Float;
+
+   Vocab_Mismatch : exception;
+
+   --  Capture the ensemble's top-K next-token distribution at each position.
+   --  Weights (default: all equal) scale each teacher's contribution; they are
+   --  normalized internally and need not sum to 1. Temp is the softmax
+   --  temperature applied to every teacher before averaging.
+   function Capture_Ensemble
+     (Teachers : Teacher_Array;
+      Tokens   : Token_Array;
+      K        : Positive;
+      Weights  : Weight_Array := [];
+      Temp     : Long_Float   := 1.0)
+      return Sample
+     with Pre => Teachers'Length >= 1
+                 and then Tokens'Length >= 1
+                 and then K <= Vocab (Teachers (Teachers'First).all)
+                 and then (Weights'Length = 0
+                           or else Weights'Length = Teachers'Length);
+
+   --------------------------------------------------------------------
    --  On-disk dataset (local training cache). Binary; round-trips on the
    --  host. (At-rest sealing can wrap this with the existing At_Rest layer.)
    --------------------------------------------------------------------
+   --  Raised by Read when the on-disk dataset is malformed: bad magic, or a
+   --  count (sample count / N / K) that is out of range or larger than the
+   --  remaining file could possibly hold. Untrusted input fails loud here
+   --  rather than driving a multi-billion-iteration loop or a raw
+   --  Constraint_Error.
+   Bad_Dataset : exception;
+
    procedure Write (Path : String; Data : Dataset);
    function  Read  (Path : String) return Dataset;
 

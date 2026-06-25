@@ -119,29 +119,49 @@ begin
    Check ("blk.0.attn_norm.weight", Expect_Neg => False);
    Check ("blk.0.ffn_gate_inp.weight", Expect_Neg => True);
 
-   --  Q5_K tensors (the dominant quant type).
-   Check ("blk.0.ffn_gate_shexp.weight", Expect_Neg => True);
-   Check ("blk.0.attn_gate.weight", Expect_Neg => True);
+   --  Q5_K / Q6_K shared-expert tensors. The shared expert is OPTIONAL — some
+   --  Qwen-MoE variants (e.g. Qwen3-Coder) drop it — so probe before asserting
+   --  rather than crashing with "Tensor not found".
+   if Has_Tensor (G, "blk.0.ffn_gate_shexp.weight") then
+      Check ("blk.0.ffn_gate_shexp.weight", Expect_Neg => True);
+      Check ("blk.0.ffn_down_shexp.weight", Expect_Neg => True);
+   else
+      Put_Line ("  SKIP: shared-expert tensors (this MoE variant has none)");
+   end if;
+   --  Gated attention / fused QKV are also variant-specific.
+   if Has_Tensor (G, "blk.0.attn_gate.weight") then
+      Check ("blk.0.attn_gate.weight", Expect_Neg => True);
+   else
+      Put_Line ("  SKIP: blk.0.attn_gate.weight (not a gated-attention variant)");
+   end if;
+   if Has_Tensor (G, "blk.0.attn_qkv.weight") then
+      Check ("blk.0.attn_qkv.weight", Expect_Neg => True);
+   else
+      Put_Line ("  SKIP: blk.0.attn_qkv.weight (split q/k/v variant)");
+   end if;
 
-   --  Q6_K tensors.
-   Check ("blk.0.ffn_down_shexp.weight", Expect_Neg => True);
-   Check ("blk.0.attn_qkv.weight", Expect_Neg => True);
-
-   --  Shapes are the GGUF dims reversed (row-major logical order).
+   --  Shapes are the GGUF dims reversed (row-major logical order). These are
+   --  the reference qwen35moe dimensions (256 experts, 512 shared-expert ffn);
+   --  only assert them on that structure, skip cleanly on other MoE variants.
    New_Line;
-   Check_Shape ("blk.0.ffn_gate_inp.weight", 256, 2048);    -- GGUF [2048,256]
-   Check_Shape ("blk.0.ffn_down_shexp.weight", 2048, 512);  -- GGUF [512,2048]
+   if Has_Tensor (G, "blk.0.ffn_down_shexp.weight") then
+      Check_Shape ("blk.0.ffn_gate_inp.weight", 256, 2048);    -- GGUF [2048,256]
+      Check_Shape ("blk.0.ffn_down_shexp.weight", 2048, 512);  -- GGUF [512,2048]
 
-   --  3D expert tensor: validate the GGUF dims it will be reversed from.
-   declare
-      Info : constant Tensor_Info := Find_Tensor (G, "blk.0.ffn_up_exps.weight");
-   begin
-      Assert ("ffn_up_exps is 3D [dim,ffn,expert] GGUF",
-        Natural (Info.N_Dims) = 3
-        and then Info.Dims (1) = 2048   -- dim
-        and then Info.Dims (2) = 512    -- ffn
-        and then Info.Dims (3) = 256);  -- expert
-   end;
+      --  3D expert tensor: validate the GGUF dims it will be reversed from.
+      declare
+         Info : constant Tensor_Info :=
+           Find_Tensor (G, "blk.0.ffn_up_exps.weight");
+      begin
+         Assert ("ffn_up_exps is 3D [dim,ffn,expert] GGUF",
+           Natural (Info.N_Dims) = 3
+           and then Info.Dims (1) = 2048   -- dim
+           and then Info.Dims (2) = 512    -- ffn
+           and then Info.Dims (3) = 256);  -- expert
+      end;
+   else
+      Put_Line ("  SKIP: reference shape checks (non-reference MoE structure)");
+   end if;
 
    Close (G);
 

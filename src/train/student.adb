@@ -3,6 +3,7 @@
 ---------------------------------------------------------------------
 
 with Ada.Streams.Stream_IO; use Ada.Streams.Stream_IO;
+with Ada.IO_Exceptions;
 with LLM_Quant;
 with LLM_Tensor;
 
@@ -21,7 +22,18 @@ package body Student is
    procedure Rd (S : Stream_Access; Mx : out Matrix) is
    begin
       for I in Mx'Range (1) loop
-         for J in Mx'Range (2) loop Real'Read (S, Mx (I, J)); end loop;
+         for J in Mx'Range (2) loop
+            Real'Read (S, Mx (I, J));
+            --  Screen the loaded weight for NaN/Inf the same way Adam_Step
+            --  screens gradients: a poisoned checkpoint must fail loud, never
+            --  load silently and produce garbage. NaN fails 'Valid; +/-Inf
+            --  fall outside the finite range.
+            if (not Mx (I, J)'Valid)
+              or else Mx (I, J) > Real'Last or else Mx (I, J) < -Real'Last
+            then
+               raise Bad_Checkpoint;
+            end if;
+         end loop;
       end loop;
    end Rd;
 
@@ -253,6 +265,9 @@ package body Student is
       Open (F, In_File, Path);
       S := Stream (F);
       --  Accept both v1 (weights only) and v2 (weights + optimizer state).
+      --  A truncated/corrupt checkpoint raises End_Error/Data_Error from a
+      --  Read; map those (and any NaN/Inf the Rd screen catches) to the
+      --  documented Bad_Checkpoint, and always release the file descriptor.
       Integer'Read (S, V);
       if V = Magic_V2 then Has_Opt := True;
       elsif V /= Magic then Close (F); raise Bad_Checkpoint;
@@ -272,6 +287,13 @@ package body Student is
       end loop;
       if Has_Opt then Rd_Opt (S, M); end if;   -- restore Adam moments / step
       Close (F);
+   exception
+      when Bad_Checkpoint =>
+         if Is_Open (F) then Close (F); end if;
+         raise;
+      when Ada.IO_Exceptions.End_Error | Ada.IO_Exceptions.Data_Error =>
+         if Is_Open (F) then Close (F); end if;
+         raise Bad_Checkpoint;
    end Load;
 
    --------------------------------------------------------------------

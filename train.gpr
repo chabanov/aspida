@@ -13,11 +13,21 @@ project Train is
    for Exec_Dir use "obj";
    for Main use ("test_train.adb", "test_block.adb", "test_distill.adb",
                  "test_distill_train.adb", "test_gguf.adb", "test_serve.adb",
-                 "test_teacher.adb", "test_scale.adb", "test_train_gpu.adb",
+                 "test_teacher.adb", "test_multi_teacher.adb",
+                 "test_scale.adb", "test_train_gpu.adb",
                  "test_mha.adb", "test_ckpt.adb", "test_bpe.adb",
                  "test_bpe_gguf.adb", "test_qat.adb", "test_qat_train.adb",
                  "q8_export_demo.adb", "q4k_export_demo.adb",
-                 "train_aspida.adb");
+                 "train_aspida.adb", "teacher_probe.adb",
+                 "cyber_train.adb", "code_distill.adb",
+                 "code_iterate.adb", "exec_distill.adb",
+                 "gen_verify.adb", "test_platform.adb",
+                 "test_eval.adb", "train_resident_probe.adb",
+                 "student_gpu_probe.adb", "test_turnkey.adb",
+                 "turnkey_demo.adb", "turnkey_serve_demo.adb",
+                 "test_data_pipeline.adb", "train_svg.adb",
+                 "test_job_store.adb", "platform_auth_probe.adb",
+                 "train_worker.adb");
 
    package Compiler is
       for Default_Switches ("Ada") use Shared.Ada_O2;

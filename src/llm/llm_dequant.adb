@@ -571,13 +571,19 @@ package body LLM_Dequant is
    -- Generic dequantize dispatcher
    --------------------------------------------------------------------
 
+   --  Element count consumed by the decode loop count and the result-tensor
+   --  allocation. This MUST agree with the parser's validated, overflow-checked
+   --  size (a divergent count here vs. the byte size read off disk is an OOB
+   --  read/write). So we take the parser's checked Tensor_Num_Elements as the
+   --  single source of truth and compute under ENABLED checks (the unit-wide
+   --  Suppress(All_Checks) above is a hot-loop perf decision; the SIZE math
+   --  must stay checked). Constraint_Error here = a tensor too large for the
+   --  in-memory FP32 path, raised loudly rather than wrapping.
    function Dequant_Num_Elements (Info : LLM_GGUF.Tensor_Info) return Natural is
-      N : Long_Long_Integer := 1;
+      pragma Unsuppress (All_Checks);
+      N64 : constant LLM_GGUF.U64 := LLM_GGUF.Tensor_Num_Elements (Info);
    begin
-      for D in 1 .. Natural (Info.N_Dims) loop
-         N := N * Long_Long_Integer (Info.Dims (D));
-      end loop;
-      return Natural (N);
+      return Natural (N64);
    end Dequant_Num_Elements;
 
    --  Row-major logical shape: GGUF lists dims fastest-varying first, so the
@@ -848,6 +854,10 @@ package body LLM_Dequant is
 
       Row_Info.N_Dims := 2;
       Row_Info.Dims   := [Info.Dims (1), 1, 0, 0];
+      --  Row_Info is a synthetic 1-row slice; clear the inherited (full-tensor)
+      --  Byte_Size so Tensor_Byte_Size recomputes it from the 1-row dims rather
+      --  than returning the stored whole-tensor size.
+      Row_Info.Byte_Size := 0;
       BPR := Natural (LLM_GGUF.Tensor_Byte_Size (Row_Info));
       for I in 1 .. In_Dim loop
          XL (I) := Get_Flat (X, I);
