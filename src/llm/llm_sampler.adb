@@ -146,12 +146,18 @@ package body LLM_Sampler is
                end loop;
                U := Next_Float (S);
                Result := N - 1;
-               for I in 1 .. N loop
-                  if L (I) > 0.0 then
-                     Acc := Acc + L (I) / MDen;
-                     if U <= Acc then Result := I - 1; exit; end if;
-                  end if;
-               end loop;
+               --  All survivors zero (or NaN): the denominator would be 0 and
+               --  L(I)/MDen a NaN. Fall back to greedy instead of dividing.
+               if MDen <= 0.0 then
+                  Result := Greedy - 1;
+               else
+                  for I in 1 .. N loop
+                     if L (I) > 0.0 then
+                        Acc := Acc + L (I) / MDen;
+                        if U <= Acc then Result := I - 1; exit; end if;
+                     end if;
+                  end loop;
+               end if;
             end;
          elsif S.P.Top_K <= 0 and then S.P.Top_P >= 1.0 then
             --  Pure temperature: draw straight from the full distribution.
@@ -206,10 +212,16 @@ package body LLM_Sampler is
                begin
                   for R in 1 .. Keep loop KDen := KDen + L (Idx (R)); end loop;
                   Result := Idx (Keep) - 1;   -- fallback (rounding)
-                  for R in 1 .. Keep loop
-                     Acc := Acc + L (Idx (R)) / KDen;
-                     if U <= Acc then Result := Idx (R) - 1; exit; end if;
-                  end loop;
+                  --  All kept probabilities zero (or NaN): KDen would be 0 and
+                  --  L/KDen a NaN. Fall back to greedy rather than dividing.
+                  if KDen <= 0.0 then
+                     Result := Greedy - 1;
+                  else
+                     for R in 1 .. Keep loop
+                        Acc := Acc + L (Idx (R)) / KDen;
+                        if U <= Acc then Result := Idx (R) - 1; exit; end if;
+                     end loop;
+                  end if;
                end;
                Free (Used);
             end;

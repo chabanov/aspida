@@ -110,10 +110,14 @@ package Train is
    --  1/sqrt(head_dim)). Q,K,V,O are [T x D]; A is [H*T x T] — head h's
    --  attention weights occupy rows (h-1)*T+1 .. h*T. H=1 reduces exactly to
    --  Attention_Forward/Backward.
+   --  H must divide the model dim D = Q'Length (2) evenly; otherwise the
+   --  head_dim = D/H truncates and the column offsets run past the slice.
    procedure MHA_Forward
-     (Q, K, V : Matrix; H : Positive; O : out Matrix; A : out Matrix);
+     (Q, K, V : Matrix; H : Positive; O : out Matrix; A : out Matrix)
+     with Pre => Q'Length (2) mod H = 0;
    procedure MHA_Backward
-     (Q, K, V, A : Matrix; H : Positive; DOut : Matrix; DQ, DK, DV : out Matrix);
+     (Q, K, V, A : Matrix; H : Positive; DOut : Matrix; DQ, DK, DV : out Matrix)
+     with Pre => Q'Length (2) mod H = 0;
 
    --  RoPE (interleaved/NORM convention, matching the Llama inference path):
    --  per head (head_dim = D/H), rotate adjacent dim pairs (2i,2i+1) of row p
@@ -134,14 +138,19 @@ package Train is
 
    --  Cross-entropy to hard labels (Target(r) = 0-based class id), mean rows.
    type Label_Array is array (Positive range <>) of Natural;
-   function  CE_Loss     (Logits : Matrix; Target : Label_Array) return Real;
+   --  Every target is a 0-based class id and must be < the vocab dim
+   --  (Logits'Length (2)); otherwise the +1 index runs past the row.
+   function  CE_Loss     (Logits : Matrix; Target : Label_Array) return Real
+     with Pre => (for all C of Target => C < Logits'Length (2));
    procedure CE_Backward (Logits : Matrix; Target : Label_Array; DLogits : out Matrix);
 
    --------------------------------------------------------------------
    --  Token embedding lookup: X[t,:] = E[Tokens(t), :]  (E is [Vocab x D],
    --  Tokens are 0-based ids). Backward scatter-adds into DE[Vocab x D].
    --------------------------------------------------------------------
-   procedure Embed_Forward  (E : Matrix; Tokens : Label_Array; X : out Matrix);
+   --  Every token is a 0-based id and must be < the vocab dim (E'Length (1)).
+   procedure Embed_Forward  (E : Matrix; Tokens : Label_Array; X : out Matrix)
+     with Pre => (for all C of Tokens => C < E'Length (1));
    procedure Embed_Backward (Tokens : Label_Array; DX : Matrix; DE : out Matrix);
 
    --------------------------------------------------------------------

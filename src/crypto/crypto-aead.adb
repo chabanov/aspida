@@ -50,6 +50,7 @@ package body Crypto.AEAD with SPARK_Mode => On is
 
       Poly1305.MAC (OTK, Mac_Data, Tag);
       Wipe (OTK);
+      Wipe (Mac_Data);   -- holds AAD || ciphertext; scrub before returning
    end Compute_Tag;
 
    procedure Seal
@@ -79,9 +80,11 @@ package body Crypto.AEAD with SPARK_Mode => On is
       Compute_Tag (Key, Nonce, AAD, Ciphertext, Expected);
       if not Const_Time_Equal (Expected, Tag) then
          Plaintext := [others => 0];            -- never release on auth failure
+         Wipe (Expected);                       -- scrub the computed tag
          return False;
       end if;
       ChaCha20.XOR_Stream (Key, Nonce, 1, Ciphertext, Plaintext);
+      Wipe (Expected);                          -- scrub the computed tag
       return True;
    end Open;
 

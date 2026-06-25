@@ -17,15 +17,22 @@ package BPE_Train is
    type Trainer is private;
 
    --  Learn a vocabulary of up to Target_Vocab tokens (>= 256; the first 256
-   --  are the byte alphabet) from Corpus.
+   --  are the byte alphabet) from Corpus. Token ids are packed two-per-pair as
+   --  Code (A, B) = (A << 32) | B during training, so every id must fit in 32
+   --  bits. Target_Vocab is Positive (<= 2**31-1 on this target), which is
+   --  already within that 32-bit packing limit.
    procedure Train
      (T : out Trainer; Corpus : String; Target_Vocab : Positive);
 
    function Vocab_Size (T : Trainer) return Natural;
    function Num_Merges (T : Trainer) return Natural;
 
+   --  Raised by Decode when an id is outside 0 .. Vocab_Size - 1.
+   Bad_Id : exception;
+
    --  The literal byte string token Id expands to (Id in 0 .. Vocab_Size - 1).
-   function Token_Piece (T : Trainer; Id : Natural) return String;
+   function Token_Piece (T : Trainer; Id : Natural) return String
+     with Pre => Id < Vocab_Size (T);
 
    --  The two parent token ids of the Index-th merge (1 .. Num_Merges), in the
    --  rank order they were learned. Lets an exporter emit the GGUF merges list.

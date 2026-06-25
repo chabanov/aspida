@@ -22,6 +22,7 @@ package body Socket_Transport is
       end loop;
       while Sent < Buf'Last loop
          Send_Socket (T.Sock, Buf (Sent + 1 .. Buf'Last), Last);
+         pragma Assert (Last <= Buf'Last);
          if Last < Sent + 1 then
             raise Connection_Closed with "send failed";
          end if;
@@ -38,6 +39,7 @@ package body Socket_Transport is
    begin
       while Got < Buf'Last loop
          Receive_Socket (T.Sock, Buf (Got + 1 .. Buf'Last), Last);
+         pragma Assert (Last <= Buf'Last);
          if Last < Got + 1 then              -- 0 bytes => peer closed
             raise Connection_Closed with "connection closed";
          end if;

@@ -97,7 +97,7 @@ procedure Test_KQuant_Synth is
 
    function Info_Of (Kind : LLM_GGUF.GGML_Type) return LLM_GGUF.Tensor_Info is
      (Name => Null_Unbounded_String, N_Dims => 2, Dims => [256, 1, 0, 0],
-      Kind => Kind, Offset => 0);
+      Kind => Kind, Offset => 0, Byte_Size => 0);
 
 begin
    Put_Line ("=== synthetic Q2_K / Q3_K block decode ===");

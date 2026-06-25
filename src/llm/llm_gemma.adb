@@ -21,7 +21,6 @@ with Ada.Exceptions;
 with LLM_GGUF;    use LLM_GGUF;
 with LLM_Dequant;
 with LLM_Tensor;  use LLM_Tensor;
-with LLM_Tokenizer;
 with LLM_RMSNorm;
 with LLM_RoPE;
 with LLM_Weight;
@@ -128,6 +127,7 @@ package body LLM_Gemma is
    begin
       RI.N_Dims := 2;
       RI.Dims   := [M.PLE_Tok_Info.Dims (1), 1, 0, 0];
+      RI.Byte_Size := 0;  -- synthetic 1-row slice; recompute size from dims
       Read_Tensor_Range (M.Gf, M.PLE_Tok_Info,
         U64 (Tok) * U64 (M.PLE_Row_Bytes), B'Address, M.PLE_Row_Bytes);
       return LLM_Dequant.Dequantize (RI, B);
@@ -244,6 +244,9 @@ package body LLM_Gemma is
          begin
             M.PLE_Tok_Info := I;
             RI.N_Dims := 2; RI.Dims := [I.Dims (1), 1, 0, 0];
+            --  Synthetic 1-row slice: clear the inherited full-tensor Byte_Size
+            --  so Tensor_Byte_Size recomputes it from the 1-row dims.
+            RI.Byte_Size := 0;
             M.PLE_Row_Bytes := Natural (Tensor_Byte_Size (RI));
          end;
          M.PLE_Proj      := LQ ("per_layer_model_proj.weight");
@@ -607,6 +610,61 @@ package body LLM_Gemma is
    end Forward_Step;
 
    --------------------------------------------------------------------
+   --  Forward_Logits — run the prompt through the model (incremental K/V cache,
+   --  exactly like Decode's prefill) and collect the soft-capped logits at
+   --  every position, for use as a distillation teacher.
+   --------------------------------------------------------------------
+   function Forward_Logits
+     (M : Gemma_Model; Ids : LLM_Tokenizer.Token_Array) return Logits_Flat
+   is
+      N     : constant Integer := Ids'Length;
+      Vc    : constant Integer := Vocab_Size (M);
+      Cap   : constant Integer := Integer'Max (1, N);
+      Cache : KV_Cache (1 .. M.N_Blocks);
+      procedure Free is
+        new Ada.Unchecked_Deallocation (Tensor_Array, Tensor_Array_Ptr);
+   begin
+      --  Extended return so the [N*Vocab] result is built on the (heap-backed)
+      --  secondary stack, not the primary stack (Gemma's 262k vocab => MBs).
+      return Res : Logits_Flat (0 .. Integer'Max (0, N * Vc - 1)) :=
+        [others => 0.0]
+      do
+         if N >= 1 then
+            for L in 1 .. M.N_Blocks loop
+               if M.Blocks (L).Has_KV then
+                  Cache (L).K := new Tensor_Array (1 .. Cap);
+                  Cache (L).V := new Tensor_Array (1 .. Cap);
+               end if;
+            end loop;
+            for P in 1 .. N loop
+               LLM_Step_Lock.Acquire;
+               begin
+                  declare
+                     L : constant Tensor :=
+                       Forward_Step (M, Cache, Ids (Ids'First + P - 1), P - 1);
+                  begin
+                     for K in 1 .. Vc loop
+                        Res ((P - 1) * Vc + (K - 1)) := Get_Flat (L, K);
+                     end loop;
+                  end;
+                  LLM_Step_Lock.Release;
+               exception
+                  when others =>
+                     LLM_Step_Lock.Release;
+                     raise;
+               end;
+            end loop;
+            for L in 1 .. M.N_Blocks loop
+               if M.Blocks (L).Has_KV then
+                  Free (Cache (L).K);
+                  Free (Cache (L).V);
+               end if;
+            end loop;
+         end if;
+      end return;
+   end Forward_Logits;
+
+   --------------------------------------------------------------------
    -- Decode (sampler-driven) with an incremental K/V cache.
    --------------------------------------------------------------------
 
@@ -624,7 +682,7 @@ package body LLM_Gemma is
       Logits : Tensor;
       Smp    : LLM_Sampler.Sampler := LLM_Sampler.Create (Params);
       Hist   : LLM_Sampler.History (1 .. Integer'Max (1, Max_New)) :=
-        (others => 0);
+        [others => 0];
       N_Hist : Natural := 0;
       In_Chan : Boolean := False;   -- inside a harmony reasoning channel?
 

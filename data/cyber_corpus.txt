@@ -1,0 +1,21 @@
+A buffer overflow occurs when a program writes more data into a buffer than it can hold. To prevent a buffer overflow, validate the length of every input and use bounds-checked operations. Safe languages and bounds checks stop a buffer overflow before it corrupts memory.
+
+SQL injection occurs when untrusted input is concatenated into a query. To prevent SQL injection, use parameterized queries and prepared statements. Never build a query by string concatenation. Parameterized queries separate code from data and stop SQL injection.
+
+Cross-site scripting occurs when untrusted input is rendered into a page without encoding. To prevent cross-site scripting, encode all output for its context and validate input. Output encoding stops cross-site scripting in the browser.
+
+The principle of least privilege means every account and process gets only the access it needs. Least privilege limits the damage of a compromise. Grant the minimum permission and remove access that is no longer needed.
+
+Defense in depth means using many layers of security so one failure does not break the whole system. A firewall, input validation, encryption, and monitoring are layers of defense in depth. No single control is enough on its own.
+
+Input validation means checking that input matches an expected format before use. Validate length, type, and range, and reject anything unexpected. Strong input validation stops many injection attacks at the boundary.
+
+Store passwords as salted hashes, never in plaintext. Use a slow password hash such as a key derivation function with a unique salt per user. A salted slow hash makes offline cracking expensive and protects passwords at rest.
+
+Encrypt sensitive data in transit with TLS and at rest with strong keys. TLS protects data on the network from eavesdropping and tampering. Encryption at rest protects data if a disk or backup is stolen.
+
+Log security events and monitor them for anomalies. Good logging records who did what and when, and monitoring raises an alert on suspicious activity. Logging and monitoring shorten the time to detect an intrusion.
+
+Patch software promptly to close known vulnerabilities. Attackers scan for unpatched systems and exploit known flaws. A timely patch removes a known vulnerability before it can be exploited.
+
+Authentication proves who a user is, and authorization decides what that user may do. Use strong authentication such as multi-factor, and check authorization on every request. Separating authentication and authorization reduces the blast radius of a stolen credential.

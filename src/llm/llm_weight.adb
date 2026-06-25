@@ -149,6 +149,9 @@ package body LLM_Weight is
       begin
          Row_Info.N_Dims := 2;
          Row_Info.Dims   := [W.Info.Dims (1), 1, 0, 0];
+         --  Synthetic 1-row slice: clear the inherited full-tensor Byte_Size so
+         --  Tensor_Byte_Size recomputes it from the 1-row dims.
+         Row_Info.Byte_Size := 0;
          declare
             BPR : constant Natural :=
               Natural (LLM_GGUF.Tensor_Byte_Size (Row_Info));
@@ -257,6 +260,9 @@ package body LLM_Weight is
          begin
             Sub.N_Dims := 2;
             Sub.Dims   := [W.Info.Dims (1), W.Info.Dims (2), 0, 0];
+            --  Per-expert 2D slice: clear the inherited full-tensor Byte_Size
+            --  so Tensor_Byte_Size recomputes it from the per-expert dims.
+            Sub.Byte_Size := 0;
             BPE := Natural (LLM_GGUF.Tensor_Byte_Size (Sub));
             declare
                Start : constant Natural := W.Bytes.all'First + (E - 1) * BPE;

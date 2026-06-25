@@ -12,7 +12,9 @@
 
 with Interfaces;            use Interfaces;
 with Interfaces.C;          use type Interfaces.C.int;
+with Interfaces.C_Streams;
 with Ada.Streams.Stream_IO;
+with Ada.Streams.Stream_IO.C_Streams;
 with Ada.Directories;
 with Crypto.Random;
 with Crypto.PBKDF2;
@@ -31,6 +33,20 @@ package body At_Rest is
    function C_Rename
      (Oldp, Newp : Interfaces.C.char_array) return Interfaces.C.int
      with Import, Convention => C, External_Name => "rename";
+
+   --  int chmod(const char *path, mode_t mode);  POSIX chmod(2).
+   --  mode_t is an unsigned 16-bit int on the BSD/macOS ABI and a 32-bit int
+   --  on Linux; Interfaces.C.int is wide enough for both 0600/0700 values.
+   function C_Chmod
+     (Pathp : Interfaces.C.char_array; Mode : Interfaces.C.int)
+      return Interfaces.C.int
+     with Import, Convention => C, External_Name => "chmod";
+
+   --  int fsync(int fd);  POSIX fsync(2). Flushes the file's data and metadata
+   --  to stable storage so the atomic rename cannot expose a zero-length file
+   --  after a crash.
+   function C_Fsync (Fd : Interfaces.C.int) return Interfaces.C.int
+     with Import, Convention => C, External_Name => "fsync";
 
    --  Atomically replace Dst with Src (both must be on the same filesystem).
    --  Raises Use_Error on a non-zero rename(2) return.
@@ -89,18 +105,42 @@ package body At_Rest is
       Crypto.AEAD.Seal (Key, Nonce, Header, Plaintext, CT, Tag);
       Wipe (Key);
 
-      --  Write to <path>.tmp then atomically rename, so a crash or exception
-      --  mid-write leaves the previous file intact instead of a truncated one.
-      --  rename(2) is atomic on POSIX (same filesystem).
+      --  Write to <path>.tmp, fsync, then atomically rename: rename(2) is
+      --  atomic on POSIX (same filesystem), and the prior fsync guarantees the
+      --  bytes are on stable storage first, so a crash leaves either the old
+      --  file intact or the fully-written new one — never a truncated or
+      --  zero-length result.
       declare
          Tmp : constant String := Path & ".tmp";
       begin
          SIO.Create (F, SIO.Out_File, Tmp);
+         --  Restrict the temp file to owner read/write before any ciphertext is
+         --  written, so a local user cannot copy it for an offline dictionary
+         --  attack on the master password. The rename preserves the mode.
+         if C_Chmod (Interfaces.C.To_C (Tmp), 8#600#) /= 0 then
+            raise Ada.Directories.Use_Error with "chmod of temp file failed";
+         end if;
          Byte_Array'Write (SIO.Stream (F), Header);
          if CT'Length > 0 then
             Byte_Array'Write (SIO.Stream (F), CT);
          end if;
          Byte_Array'Write (SIO.Stream (F), Byte_Array (Tag));
+         --  Flush the userspace buffer, then fsync the underlying fd so the
+         --  data reaches stable storage before the atomic rename.
+         declare
+            Stream_C : constant Interfaces.C_Streams.FILEs :=
+              Ada.Streams.Stream_IO.C_Streams.C_Stream (F);
+         begin
+            if Interfaces.C_Streams.fflush (Stream_C) /= 0 then
+               raise Ada.Directories.Use_Error with "fflush failed";
+            end if;
+            if C_Fsync
+                 (Interfaces.C.int (Interfaces.C_Streams.fileno (Stream_C)))
+                 /= 0
+            then
+               raise Ada.Directories.Use_Error with "fsync failed";
+            end if;
+         end;
          SIO.Close (F);
          Atomic_Replace (Tmp, Path);
       exception

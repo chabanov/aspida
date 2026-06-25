@@ -290,6 +290,15 @@ package body LLM_Tokenizer is
 
    function Encode (T : Tokenizer; Text : String) return Token_Array is
    begin
+      --  Cap input length first: greedy BPE below is ~O(N^2..N^3), so a single
+      --  huge prompt could pin a CPU before the engine's context clamp runs.
+      --  Reject loudly (the cap is far above any real context window).
+      if Text'Length > Max_Encode_Len then
+         raise Input_Too_Long
+           with "Encode input length" & Integer'Image (Text'Length)
+                & " exceeds cap" & Integer'Image (Max_Encode_Len);
+      end if;
+
       -- Byte-level fallback when no vocabulary is loaded.
       if not Is_Loaded (T) then
          return R : Token_Array (1 .. Text'Length) do

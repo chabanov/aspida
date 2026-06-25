@@ -8,17 +8,45 @@ package body Crypto.Poly1305 with SPARK_Mode => On is
 
    Mask26 : constant U32 := 16#3FFFFFF#;
 
+   --  Best-effort scrub of a secret scalar limb. The `in out` parameter both
+   --  references the variable (so the caller's wipe is not flagged as a useless
+   --  assignment under -gnatwa/-gnatwe) and lets the body read the post-zero
+   --  value, mirroring Crypto.Wipe's anti-dead-store-elimination trick: the
+   --  optimiser cannot prove the read dead, so the store survives. The branch
+   --  is on the just-zeroed value (always 0 unless the wipe was skipped, a
+   --  bug), never on live secret data.
+   procedure Scrub (X : in out U32)
+     with Global => null, Always_Terminates => True, Post => X = 0;
+   procedure Scrub (X : in out U64)
+     with Global => null, Always_Terminates => True, Post => X = 0;
+
+   --  Overlay the scalar as bytes and reuse Crypto.Wipe, whose post-wipe
+   --  fold-and-read defeats dead-store elimination without tripping -gnatwc
+   --  (a direct `if X /= 0` after `X := 0` is statically known False).
+   procedure Scrub (X : in out U32) with SPARK_Mode => Off is
+      B : Byte_Array (0 .. 3) with Import, Address => X'Address;
+   begin
+      Wipe (B);
+   end Scrub;
+
+   procedure Scrub (X : in out U64) with SPARK_Mode => Off is
+      B : Byte_Array (0 .. 7) with Import, Address => X'Address;
+   begin
+      Wipe (B);
+   end Scrub;
+
    procedure MAC (Key : Key_256; Msg : Byte_Array; Tag : out Tag_128) is
-      --  Clamped r split into 26-bit limbs, and s_i = r_i * 5.
-      R0 : constant U32 := Load_LE32 (Key, 0)                    and 16#3FFFFFF#;
-      R1 : constant U32 := Shift_Right (Load_LE32 (Key, 3),  2)  and 16#3FFFF03#;
-      R2 : constant U32 := Shift_Right (Load_LE32 (Key, 6),  4)  and 16#3FFC0FF#;
-      R3 : constant U32 := Shift_Right (Load_LE32 (Key, 9),  6)  and 16#3F03FFF#;
-      R4 : constant U32 := Shift_Right (Load_LE32 (Key, 12), 8)  and 16#00FFFFF#;
-      S1 : constant U32 := R1 * 5;
-      S2 : constant U32 := R2 * 5;
-      S3 : constant U32 := R3 * 5;
-      S4 : constant U32 := R4 * 5;
+      --  Clamped r split into 26-bit limbs, and s_i = r_i * 5. Not `constant`
+      --  so they can be scrubbed before return (secret key material).
+      R0 : U32 := Load_LE32 (Key, 0)                    and 16#3FFFFFF#;
+      R1 : U32 := Shift_Right (Load_LE32 (Key, 3),  2)  and 16#3FFFF03#;
+      R2 : U32 := Shift_Right (Load_LE32 (Key, 6),  4)  and 16#3FFC0FF#;
+      R3 : U32 := Shift_Right (Load_LE32 (Key, 9),  6)  and 16#3F03FFF#;
+      R4 : U32 := Shift_Right (Load_LE32 (Key, 12), 8)  and 16#00FFFFF#;
+      S1 : U32 := R1 * 5;
+      S2 : U32 := R2 * 5;
+      S3 : U32 := R3 * 5;
+      S4 : U32 := R4 * 5;
 
       --  Accumulator h (5 x 26-bit limbs).
       H0, H1, H2, H3, H4 : U32 := 0;
@@ -82,6 +110,13 @@ package body Crypto.Poly1305 with SPARK_Mode => On is
             D4 := D4 + U64 (C); C := U32 (Shift_Right (D4, 26)); H4 := U32 (D4 and 16#3FFFFFF#);
             H0 := H0 + C * 5;   C := Shift_Right (H0, 26); H0 := H0 and Mask26;
             H1 := H1 + C;
+
+            --  Scrub per-block secret temporaries (message bytes and the
+            --  intermediate products) before this block's scope is left.
+            Scrub (T0); Scrub (T1); Scrub (T2); Scrub (T3);
+            Scrub (D0); Scrub (D1); Scrub (D2); Scrub (D3); Scrub (D4);
+            Scrub (C);
+            Wipe (Blk);
          end;
       end loop;
 
@@ -91,10 +126,12 @@ package body Crypto.Poly1305 with SPARK_Mode => On is
          G0, G1, G2, G3, G4 : U32;
          Mask : U32;
          F : U64;
-         Pad0 : constant U32 := Load_LE32 (Key, 16);
-         Pad1 : constant U32 := Load_LE32 (Key, 20);
-         Pad2 : constant U32 := Load_LE32 (Key, 24);
-         Pad3 : constant U32 := Load_LE32 (Key, 28);
+         --  Not `constant` so the pad (second half of the one-time key) can be
+         --  scrubbed before the block's scope is left.
+         Pad0 : U32 := Load_LE32 (Key, 16);
+         Pad1 : U32 := Load_LE32 (Key, 20);
+         Pad2 : U32 := Load_LE32 (Key, 24);
+         Pad3 : U32 := Load_LE32 (Key, 28);
       begin
          C := Shift_Right (H1, 26); H1 := H1 and Mask26;
          H2 := H2 + C; C := Shift_Right (H2, 26); H2 := H2 and Mask26;
@@ -137,7 +174,19 @@ package body Crypto.Poly1305 with SPARK_Mode => On is
          Store_LE32 (Tag, 4,  H1);
          Store_LE32 (Tag, 8,  H2);
          Store_LE32 (Tag, 12, H3);
+
+         --  Scrub final-reduction secret temporaries (the reduced accumulator
+         --  candidate g and the key's pad half) before the block's scope ends.
+         Scrub (G0); Scrub (G1); Scrub (G2); Scrub (G3); Scrub (G4);
+         Scrub (Mask); Scrub (C); Scrub (F);
+         Scrub (Pad0); Scrub (Pad1); Scrub (Pad2); Scrub (Pad3);
       end;
+
+      --  Scrub the clamped key limbs and the accumulator before returning
+      --  (best-effort overwrite of secret scalar state held on the stack).
+      Scrub (R0); Scrub (R1); Scrub (R2); Scrub (R3); Scrub (R4);
+      Scrub (S1); Scrub (S2); Scrub (S3); Scrub (S4);
+      Scrub (H0); Scrub (H1); Scrub (H2); Scrub (H3); Scrub (H4);
    end MAC;
 
 end Crypto.Poly1305;

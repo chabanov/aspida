@@ -3,6 +3,7 @@
 ---------------------------------------------------------------------
 
 with Ada.Text_IO;
+with Ada.Exceptions;
 with System.Storage_Elements;
 
 package body LLM_GGUF is
@@ -28,6 +29,7 @@ package body LLM_GGUF is
    O_RDONLY : constant C_Int := 0;
    SEEK_SET : constant C_Int := 0;
    SEEK_CUR : constant C_Int := 1;
+   SEEK_END : constant C_Int := 2;
 
    --  Sanity caps on GGUF metadata sizes. A hostile or truncated file could
    --  otherwise advertise a multi-gigabyte string / millions of tensors and
@@ -144,6 +146,18 @@ package body LLM_GGUF is
       GGUF_TYPE_U64,   -- 10
       GGUF_TYPE_I64);  -- 11
 
+   --  Convert an on-disk value-type code to the enum, rejecting any code that
+   --  is out of range BEFORE 'Val (which would raise a raw Constraint_Error on
+   --  a hostile code >= 12). The code is attacker-controlled.
+   function To_Value_Type (Code : U32) return GGUF_Value_Type is
+   begin
+      if Code > U32 (GGUF_Value_Type'Pos (GGUF_Value_Type'Last)) then
+         raise Malformed_GGUF
+           with "GGUF metadata value-type code out of range:" & U32'Image (Code);
+      end if;
+      return GGUF_Value_Type'Val (Code);
+   end To_Value_Type;
+
    function Read_Metadata_Value (FD : C_Int; VT : GGUF_Value_Type) return String is
       V_Str : Unbounded_String;
    begin
@@ -180,7 +194,7 @@ package body LLM_GGUF is
             end;
          when GGUF_TYPE_ARR =>
             declare
-               Arr_Type : constant GGUF_Value_Type := GGUF_Value_Type'Val (Read_U32 (FD));
+               Arr_Type : constant GGUF_Value_Type := To_Value_Type (Read_U32 (FD));
                Arr_Len  : constant U64 := Read_U64 (FD);
             begin
                if Arr_Len > Max_Array_Len then
@@ -196,6 +210,73 @@ package body LLM_GGUF is
       end case;
       return To_String (V_Str);
    end Read_Metadata_Value;
+
+   --------------------------------------------------------------------
+   -- Checked tensor size math (single source of truth)
+   --------------------------------------------------------------------
+
+   --  All tensor element-count / byte-size arithmetic flows through here so it
+   --  is computed exactly ONCE, with overflow checks ENABLED, on the untrusted
+   --  dims + type. Three call sites used to do this three divergent ways
+   --  (U64 modular wrap, suppressed Long_Long_Integer, suppressed 32-bit Int);
+   --  any disagreement fed an allocation, the decode loop count, and the read
+   --  size with no cross-check -> OOB read/write. Now the validated byte size is
+   --  stored in Tensor_Info.Byte_Size and everyone consumes that.
+   --
+   --  A weight that genuinely needs > ~2^63 bytes is not a real model; we reject
+   --  it as malformed rather than wrapping silently.
+   Max_Tensor_Bytes : constant U64 := 2 ** 62;  -- generous, well below 2^63
+
+   --  Multiply two U64s, raising Malformed_GGUF on overflow past Max_Tensor_Bytes.
+   function Checked_Mul (A, B : U64) return U64 is
+   begin
+      if A /= 0 and then B > Max_Tensor_Bytes / A then
+         raise Malformed_GGUF with "GGUF tensor size overflow";
+      end if;
+      return A * B;
+   end Checked_Mul;
+
+   --  Add two U64s, raising Malformed_GGUF on overflow past Max_Tensor_Bytes.
+   function Checked_Add (A, B : U64) return U64 is
+   begin
+      if A > Max_Tensor_Bytes - B then
+         raise Malformed_GGUF with "GGUF tensor size overflow";
+      end if;
+      return A + B;
+   end Checked_Add;
+
+   --  Element count = product of the declared dims, overflow-checked.
+   function Checked_Num_Elements (Info : Tensor_Info) return U64 is
+      N : U64 := 1;
+   begin
+      for D in 1 .. Natural (Info.N_Dims) loop
+         N := Checked_Mul (N, Info.Dims (D));
+      end loop;
+      return N;
+   end Checked_Num_Elements;
+
+   --  Byte size from element count + type, overflow-checked. This is the only
+   --  place the per-type block math lives.
+   function Checked_Byte_Size (Info : Tensor_Info) return U64 is
+      N : constant U64 := Checked_Num_Elements (Info);
+   begin
+      case Info.Kind is
+         when GGML_TYPE_F32  => return Checked_Mul (N, 4);
+         when GGML_TYPE_F16  => return Checked_Mul (N, 2);
+         when GGML_TYPE_BF16 => return Checked_Mul (N, 2);
+         when GGML_TYPE_Q4_0 => return Checked_Mul ((N + 31) / 32, 18);
+         when GGML_TYPE_Q5_0 => return Checked_Mul ((N + 31) / 32, 22);
+         when GGML_TYPE_Q5_1 => return Checked_Mul ((N + 31) / 32, 24);
+         when GGML_TYPE_Q2_K => return Checked_Mul ((N + 255) / 256, 84);
+         when GGML_TYPE_Q3_K => return Checked_Mul ((N + 255) / 256, 110);
+         when GGML_TYPE_Q4_K => return Checked_Mul ((N + 255) / 256, 144);
+         when GGML_TYPE_Q5_K => return Checked_Mul ((N + 255) / 256, 176);
+         when GGML_TYPE_Q6_K => return Checked_Mul ((N + 255) / 256, 210);
+         when GGML_TYPE_Q8_K => return Checked_Mul ((N + 255) / 256, 292);
+         when GGML_TYPE_Q8_0 => return Checked_Mul ((N + 31) / 32, 34);
+         when others         => return Checked_Mul (N, 4);
+      end case;
+   end Checked_Byte_Size;
 
    --------------------------------------------------------------------
    -- GGML type mapping
@@ -295,7 +376,7 @@ package body LLM_GGUF is
          declare
             Key  : constant String := Read_String (FD);
             VT_Int : constant U32   := Read_U32 (FD);
-            VT   : constant GGUF_Value_Type := GGUF_Value_Type'Val (Integer (VT_Int));
+            VT   : constant GGUF_Value_Type := To_Value_Type (VT_Int);
             M    : Metadata_Entry;
             Val  : Unbounded_String;
          begin
@@ -307,7 +388,7 @@ package body LLM_GGUF is
                --  containing commas/brackets survives intact.
                declare
                   Arr_Type : constant GGUF_Value_Type :=
-                    GGUF_Value_Type'Val (Read_U32 (FD));
+                    To_Value_Type (Read_U32 (FD));
                   Arr_Len  : constant U64 := Read_U64 (FD);
                begin
                   if Arr_Len > Max_Array_Len then
@@ -342,9 +423,31 @@ package body LLM_GGUF is
                  " (type=" & Integer'Image (Integer (VT_Int)) & ")");
             end if;
 
-            -- Extract alignment from metadata
+            -- Extract alignment from metadata. The value comes from an
+            -- attacker-controlled string and is later used as a divisor for the
+            -- data-start rounding, so a non-numeric / zero / absurd value would
+            -- raise (U64'Value) or divide by zero. Validate: must parse, be a
+            -- power of two, and lie in 1 .. 65536; otherwise keep the default 32.
             if Key = "general.alignment" then
-               File.Alignment_Val := U64'Value (To_String (Val));
+               declare
+                  A : U64;
+               begin
+                  A := U64'Value (To_String (Val));
+                  if A >= 1 and then A <= 65_536
+                    and then (A and (A - 1)) = 0   -- power of two
+                  then
+                     File.Alignment_Val := A;
+                  else
+                     Ada.Text_IO.Put_Line
+                       ("WARN: ignoring invalid general.alignment="
+                        & To_String (Val) & " (keeping 32)");
+                  end if;
+               exception
+                  when others =>
+                     Ada.Text_IO.Put_Line
+                       ("WARN: unparsable general.alignment="
+                        & To_String (Val) & " (keeping 32)");
+               end;
             end if;
          end;
       end loop;
@@ -356,6 +459,14 @@ package body LLM_GGUF is
             Name : constant String := Read_String (FD);
             ND   : constant U32 := Read_U32 (FD);
          begin
+            --  Dims is a 4-element array; a hostile ND > 4 would index out of
+            --  bounds in the dim loop below. Reject before reading any dims.
+            if ND > 4 then
+               raise Malformed_GGUF
+                 with "GGUF tensor """ & Name & """ has" & U32'Image (ND)
+                      & " dims (max 4)";
+            end if;
+
             Info.Name := To_Unbounded_String (Name);
             Info.N_Dims := ND;
 
@@ -372,6 +483,13 @@ package body LLM_GGUF is
             Info.Kind := To_GGML_Type (Read_U32 (FD));
             Info.Offset := Read_U64 (FD);
 
+            --  Compute the validated, overflow-checked byte size ONCE here and
+            --  store it; this is the single source of truth consumed by every
+            --  allocation, the decode loop count, and the read size. (File-end
+            --  bounds are checked in a second pass below, once Data_Start and
+            --  File_Size are known.)
+            Info.Byte_Size := Checked_Byte_Size (Info);
+
             File.Tensors.Append (Info);
          end;
       end loop;
@@ -385,8 +503,60 @@ package body LLM_GGUF is
          File.Data_Start := ((Pos + A - 1) / A) * A;
       end;
 
+      --  Determine the real file length once (seek to end, then restore). Used
+      --  to validate that every tensor's [Data_Start + Offset, + Byte_Size)
+      --  range actually lies within the file — a hostile descriptor could
+      --  otherwise advertise an offset/size that reads past EOF (OOB) or, near
+      --  2^63, produce a negative C_Off in Read_Tensor_Raw.
+      declare
+         End_Pos : constant C_Off := C_LSeek (FD, 0, SEEK_END);
+      begin
+         if End_Pos < 0 then
+            raise Malformed_GGUF with "cannot determine GGUF file size";
+         end if;
+         File.File_Size := U64 (End_Pos);
+         Ignore (C_LSeek (FD, C_Off (File.Data_Start), SEEK_SET));
+      end;
+
+      --  Validate every tensor against the file length using checked 64-bit
+      --  arithmetic (Checked_Add rejects overflow in the addition itself). The
+      --  read offset C_Off conversion must also stay non-negative.
+      for I in 1 .. Natural (File.Tensors.Length) loop
+         declare
+            T   : constant Tensor_Info := File.Tensors (I);
+            Abs_Off : constant U64 := Checked_Add (File.Data_Start, T.Offset);
+            End_Off : constant U64 := Checked_Add (Abs_Off, T.Byte_Size);
+         begin
+            if End_Off > File.File_Size then
+               raise Malformed_GGUF
+                 with "GGUF tensor """ & To_String (T.Name)
+                      & """ extends past end of file (needs"
+                      & U64'Image (End_Off) & " bytes, file is"
+                      & U64'Image (File.File_Size) & ")";
+            end if;
+            --  Abs_Off <= File_Size <= C_Off'Last here (a real file length is
+            --  far below 2^63), so the C_Off conversion in Read_Tensor_Raw is
+            --  guaranteed non-negative; assert the invariant defensively.
+            if Abs_Off > U64 (C_Off'Last) then
+               raise Malformed_GGUF
+                 with "GGUF tensor offset out of addressable range";
+            end if;
+         end;
+      end loop;
+
       Ada.Text_IO.Put_Line ("GGUF: parsed" & Integer'Image (Natural (N_Tensors)) &
         " tensors, alignment=" & U64'Image (File.Alignment_Val));
+   exception
+      --  Any failure mid-parse (malformed header, short read, overflow) must
+      --  not leak the file descriptor opened above and must not surface as a
+      --  raw Constraint_Error. Close the fd and re-raise as Malformed_GGUF.
+      when Malformed_GGUF =>
+         Close (File);
+         raise;
+      when E : others =>
+         Close (File);
+         raise Malformed_GGUF
+           with "GGUF parse error: " & Ada.Exceptions.Exception_Message (E);
    end Open;
 
    --------------------------------------------------------------------
@@ -463,16 +633,34 @@ package body LLM_GGUF is
       raise Constraint_Error with "Tensor not found: " & Name;
    end Find_Tensor;
 
+   function Has_Tensor (File : GGUF_File; Name : String) return Boolean is
+   begin
+      for I in 1 .. Natural (File.Tensors.Length) loop
+         if To_String (File.Tensors (I).Name) = Name then
+            return True;
+         end if;
+      end loop;
+      return False;
+   end Has_Tensor;
+
    procedure Read_Tensor_Raw
      (File   : in out GGUF_File;
       Info   : Tensor_Info;
       Buffer : System.Address;
       Buf_Size : Natural)
    is
-      FD : constant C_Int := C_Int (File.FD);
-      --  Info.Offset is relative to the aligned data-section start.
-      Off : constant C_Off := C_Off (File.Data_Start + Info.Offset);
+      FD  : constant C_Int := C_Int (File.FD);
+      --  Info.Offset is relative to the aligned data-section start. Use checked
+      --  64-bit arithmetic and bound the read against the file length so a
+      --  malformed tensor (validated in Open, but re-checked here defensively)
+      --  can never read past EOF or convert to a negative C_Off.
+      Abs_Off : constant U64 := Checked_Add (File.Data_Start, Info.Offset);
+      End_Off : constant U64 := Checked_Add (Abs_Off, U64 (Buf_Size));
+      Off     : constant C_Off := C_Off (Abs_Off);
    begin
+      if File.File_Size /= 0 and then End_Off > File.File_Size then
+         raise Malformed_GGUF with "Read_Tensor_Raw past end of file";
+      end if;
       Ignore (C_LSeek (FD, Off, SEEK_SET));
       Read_Exact (FD, Buffer, Buf_Size);
    end Read_Tensor_Raw;
@@ -485,49 +673,35 @@ package body LLM_GGUF is
       Buf_Size    : Natural)
    is
       FD  : constant C_Int := C_Int (File.FD);
-      Off : constant C_Off :=
-        C_Off (File.Data_Start + Info.Offset + Byte_Offset);
+      --  Checked 64-bit arithmetic + file-length bound (see Read_Tensor_Raw):
+      --  the unchecked U64 -> C_Off conversion could otherwise go negative near
+      --  2^63, and an over-range Byte_Offset could read past EOF.
+      Abs_Off : constant U64 :=
+        Checked_Add (Checked_Add (File.Data_Start, Info.Offset), Byte_Offset);
+      End_Off : constant U64 := Checked_Add (Abs_Off, U64 (Buf_Size));
+      Off     : constant C_Off := C_Off (Abs_Off);
    begin
+      if File.File_Size /= 0 and then End_Off > File.File_Size then
+         raise Malformed_GGUF with "Read_Tensor_Range past end of file";
+      end if;
       Ignore (C_LSeek (FD, Off, SEEK_SET));
       Read_Exact (FD, Buffer, Buf_Size);
    end Read_Tensor_Range;
 
+   --  Validated byte size, computed once in Open and stored in Info.Byte_Size.
+   --  QMatVec synthesises a 1-row sub-tensor on the fly (Byte_Size not set), so
+   --  fall back to the checked computation when the stored value is zero.
    function Tensor_Byte_Size (Info : Tensor_Info) return U64 is
-      N_Elements : constant U64 := Tensor_Num_Elements (Info);
    begin
-      case Info.Kind is
-         when GGML_TYPE_F32 => return N_Elements * 4;
-         when GGML_TYPE_F16 => return N_Elements * 2;
-         when GGML_TYPE_BF16 => return N_Elements * 2;
-         --  Legacy 32-element blocks: Q4_0 = f16 d + 16 qs (18 B);
-         --  Q5_0 = f16 d + 4 qh + 16 qs (22 B).
-         when GGML_TYPE_Q4_0 => return ((N_Elements + 31) / 32) * 18;
-         when GGML_TYPE_Q5_0 => return ((N_Elements + 31) / 32) * 22;
-         when GGML_TYPE_Q5_1 => return ((N_Elements + 31) / 32) * 24;
-         --  K-quant super-block sizes (bytes per 256 elements), per llama.cpp.
-         --  Ceiling division: a non-256-multiple tail still occupies a full
-         --  super-block on disk, so floor division would under-read it. Real
-         --  GGUFs are 256-aligned, so this is a no-op for valid files and only
-         --  matters for malformed ones (avoids silent short reads).
-         when GGML_TYPE_Q2_K => return ((N_Elements + 255) / 256) * 84;
-         when GGML_TYPE_Q3_K => return ((N_Elements + 255) / 256) * 110;
-         when GGML_TYPE_Q4_K => return ((N_Elements + 255) / 256) * 144;
-         when GGML_TYPE_Q5_K => return ((N_Elements + 255) / 256) * 176;
-         when GGML_TYPE_Q6_K => return ((N_Elements + 255) / 256) * 210;
-         when GGML_TYPE_Q8_K => return ((N_Elements + 255) / 256) * 292;
-         --  Q8_0: 32-element block = f16 scale (2) + 32 int8 = 34 bytes.
-         when GGML_TYPE_Q8_0 => return ((N_Elements + 31) / 32) * 34;
-         when others => return N_Elements * 4;
-      end case;
+      if Info.Byte_Size /= 0 then
+         return Info.Byte_Size;
+      end if;
+      return Checked_Byte_Size (Info);
    end Tensor_Byte_Size;
 
    function Tensor_Num_Elements (Info : Tensor_Info) return U64 is
-      N : U64 := 1;
    begin
-      for D in 1 .. Natural (Info.N_Dims) loop
-         N := N * Info.Dims (D);
-      end loop;
-      return N;
+      return Checked_Num_Elements (Info);
    end Tensor_Num_Elements;
 
    function Alignment (File : GGUF_File) return U64 is

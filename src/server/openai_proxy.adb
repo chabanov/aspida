@@ -240,6 +240,48 @@ procedure OpenAI_Proxy is
 
    CRLF : constant String := Character'Val (13) & Character'Val (10);
 
+   --  (Re-)establish the shared encrypted channel to the server. All HTTP
+   --  clients are multiplexed over this single channel, so if a request aborts
+   --  mid-stream (e.g. Recv_Message raises, or a Tag_Done is left unconsumed)
+   --  the channel is left half-consumed and the NEXT request would read stale
+   --  records — cross-request response confusion. After any such error we tear
+   --  this down and call Open_Channel again to resync before serving the next
+   --  client. Raises Channel_Failed if the server is unreachable.
+   Channel_Failed : exception;
+
+   procedure Open_Channel is
+   begin
+      Create_Socket (Sock);
+      Connect_Socket (Sock, (Family_Inet, Inet_Addr (Argument (1)),
+                             Port_Type'Value (Argument (2))));
+      CT.Sock := Sock;
+      Secure_Channel.Client_Handshake (Ch, CT'Access, From_Hex (Argument (3)));
+      --  Optional client authentication (ASPIDA_CLIENT_TOKEN), sent first; a
+      --  server without a token ignores it.
+      if Ada.Environment_Variables.Exists ("ASPIDA_CLIENT_TOKEN") then
+         Secure_Channel.Send_Message (Ch, CT'Access, Frame (Protocol.Tag_Auth,
+           Ada.Environment_Variables.Value ("ASPIDA_CLIENT_TOKEN")));
+      end if;
+      Secure_Channel.Send_Message (Ch, CT'Access, Frame (Protocol.Tag_Session, ""));
+      declare
+         Rep : constant Crypto.Byte_Array :=
+           Secure_Channel.Recv_Message (Ch, CT'Access);
+         pragma Unreferenced (Rep);
+      begin null; end;
+   exception
+      when others =>
+         raise Channel_Failed;
+   end Open_Channel;
+
+   --  Tear down the current channel/socket (best effort) and rebuild it. Used
+   --  in the request-loop error path to clear any half-consumed record state.
+   procedure Reset_Channel is
+   begin
+      begin Secure_Channel.Close (Ch); exception when others => null; end;
+      begin Close_Socket (Sock); exception when others => null; end;
+      Open_Channel;
+   end Reset_Channel;
+
 begin
    if Argument_Count < 3 then
       Put_Line ("usage: openai_proxy <host> <port> <server_pub_hex> [local_port]");
@@ -247,22 +289,13 @@ begin
    end if;
 
    --  Open the encrypted channel to the server (pin its key) once.
-   Create_Socket (Sock);
-   Connect_Socket (Sock, (Family_Inet, Inet_Addr (Argument (1)),
-                          Port_Type'Value (Argument (2))));
-   CT.Sock := Sock;
-   Secure_Channel.Client_Handshake (Ch, CT'Access, From_Hex (Argument (3)));
-   --  Optional client authentication (ASPIDA_CLIENT_TOKEN), sent first; a
-   --  server without a token ignores it.
-   if Ada.Environment_Variables.Exists ("ASPIDA_CLIENT_TOKEN") then
-      Secure_Channel.Send_Message (Ch, CT'Access, Frame (Protocol.Tag_Auth,
-        Ada.Environment_Variables.Value ("ASPIDA_CLIENT_TOKEN")));
-   end if;
-   Secure_Channel.Send_Message (Ch, CT'Access, Frame (Protocol.Tag_Session, ""));
-   declare
-      Rep : constant Crypto.Byte_Array := Secure_Channel.Recv_Message (Ch, CT'Access);
-      pragma Unreferenced (Rep);
-   begin null; end;
+   begin
+      Open_Channel;
+   exception
+      when Channel_Failed =>
+         Put_Line ("error: cannot reach the secure server");
+         return;
+   end;
 
    Put_Line ("  🔒 encrypted tunnel up: " & Secure_Channel.Cipher_Suite);
    Put_Line ("  OpenAI-compatible endpoint: http://127.0.0.1:"
@@ -375,6 +408,17 @@ begin
       exception
          when others =>
             begin Close_Socket (Client); exception when others => null; end;
+            --  The shared channel may be half-consumed (an exception fired
+            --  mid-record); rebuild it so the next client does not read stale
+            --  records. If the server is unreachable, exit cleanly.
+            begin
+               Reset_Channel;
+            exception
+               when Channel_Failed =>
+                  Put_Line ("error: lost the secure server; shutting down");
+                  exit;
+            end;
       end;
    end loop;
+   begin Close_Socket (Listener); exception when others => null; end;
 end OpenAI_Proxy;

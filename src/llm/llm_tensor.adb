@@ -48,7 +48,14 @@ package body LLM_Tensor is
    -- Helpers
    --------------------------------------------------------------------
 
+   --  Element count used to size every tensor allocation. The unit-wide
+   --  Suppress(All_Checks) above is a hot-element-access perf decision, but
+   --  SIZE math must stay checked: a silent 32-bit overflow here would
+   --  under-allocate a buffer that later index arithmetic writes past (OOB).
+   --  Unsuppress locally so an overflowing shape raises Constraint_Error loudly
+   --  instead of wrapping.
    function Product (D : Dims) return Integer is
+      pragma Unsuppress (All_Checks);
       P : Integer := 1;
    begin
       if D'Length = 0 then

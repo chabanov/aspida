@@ -78,8 +78,10 @@ procedure Secure_Server is
    begin
       if Ada.Environment_Variables.Exists ("ASPIDA_IDLE_TIMEOUT") then
          begin
-            return Duration'Value
-              (Ada.Environment_Variables.Value ("ASPIDA_IDLE_TIMEOUT"));
+            --  Clamp to >= 1s: a 0 (or negative) idle timeout yields a
+            --  zero receive timeout that fails reads instantly.
+            return Duration'Max (1.0, Duration'Value
+              (Ada.Environment_Variables.Value ("ASPIDA_IDLE_TIMEOUT")));
          exception
             when others => null;   -- malformed -> fall through to default
          end;
@@ -96,8 +98,10 @@ procedure Secure_Server is
    begin
       if Ada.Environment_Variables.Exists ("ASPIDA_HANDSHAKE_TIMEOUT") then
          begin
-            return Duration'Value
-              (Ada.Environment_Variables.Value ("ASPIDA_HANDSHAKE_TIMEOUT"));
+            --  Clamp to >= 1s: a 0 deadline drops every peer before it can
+            --  even send its client hello (instant handshake failure).
+            return Duration'Max (1.0, Duration'Value
+              (Ada.Environment_Variables.Value ("ASPIDA_HANDSHAKE_TIMEOUT")));
          exception
             when others => null;
          end;
@@ -128,10 +132,12 @@ procedure Secure_Server is
       use Interfaces.C;
       function C_Chmod (P : char_array; Mode : int) return int
         with Import, Convention => C, External_Name => "chmod";
-      Discard : constant int := C_Chmod (To_C (Path), 8#600#);
-      pragma Unreferenced (Discard);   -- best-effort; failure is non-fatal
+      Discard : int;
    begin
-      null;
+      --  Explicit statement (not an initializer side effect) so the 0600
+      --  protection on the static key is load-bearing and survives refactors.
+      Discard := C_Chmod (To_C (Path), 8#600#);
+      pragma Unreferenced (Discard);   -- best-effort; failure is non-fatal
    end Set_Owner_Only;
 
    --  Optional shared-secret client authentication. Empty (unset) => disabled,
@@ -406,7 +412,7 @@ procedure Secure_Server is
       ST    : aliased Socket_Transport.Sock_Transport;
       Ch    : aliased Secure_Channel.Channel;
       Store : Session_Store.Store;
-      Id_B  : Byte_Array (0 .. 7);
+      Id_B  : Byte_Array (0 .. 15);   -- 128-bit auto-generated session id
       Sid   : Unbounded_String;          -- acquired session id (for Release)
 
       Auth_Failed : exception;
@@ -571,20 +577,26 @@ procedure Secure_Server is
                  OpenAI.Catalog_Response (Model_Path, Autoreload));
 
             elsif Tag = Protocol.Tag_Select then
-               --  Switch the active model. The body is the chosen model id
-               --  (its path, exactly as returned in the catalog). Validate it
-               --  against the catalog, persist it, and reload if supervised.
+               --  Switch the active model. The body is the chosen model id as
+               --  returned in the catalog (the opaque basename); a full path
+               --  is also accepted for backward compatibility. Resolve it to a
+               --  real path against the catalog, persist it, reload if
+               --  supervised.
                declare
                   use type LLM_Catalog.Model_Status;
-                  Cat   : constant LLM_Catalog.Entry_Vectors.Vector :=
+                  Cat        : constant LLM_Catalog.Entry_Vectors.Vector :=
                     LLM_Catalog.Discover;
-                  Found : Boolean := False;
+                  Found      : Boolean := False;
+                  Found_Path : Unbounded_String;
                begin
                   for E of Cat loop
-                     if To_String (E.Path) = Prompt
+                     if (To_String (E.Path) = Prompt
+                         or else Ada.Directories.Simple_Name
+                                   (To_String (E.Path)) = Prompt)
                        and then E.Status = LLM_Catalog.Supported
                      then
-                        Found := True;
+                        Found      := True;
+                        Found_Path := E.Path;
                         exit;
                      end if;
                   end loop;
@@ -592,15 +604,17 @@ procedure Secure_Server is
                   if not Found then
                      Send_Tagged (Protocol.Tag_Resp, OpenAI.Select_Result
                        (False, False, "unknown or unsupported model"));
-                  elsif Prompt = Model_Path then
+                  elsif To_String (Found_Path) = Model_Path then
                      Send_Tagged (Protocol.Tag_Resp, OpenAI.Select_Result
                        (True, False, "already active"));
                   else
-                     Write_Selected (Prompt);
+                     Write_Selected (To_String (Found_Path));
                      if Autoreload then
                         Send_Tagged (Protocol.Tag_Resp, OpenAI.Select_Result
                           (True, True, "switching model; reloading"));
-                        Put_Line ("model switch -> " & Prompt & "; reloading");
+                        Put_Line ("model switch -> "
+                          & Ada.Directories.Simple_Name (To_String (Found_Path))
+                          & "; reloading");
                         delay 0.3;   -- let the reply flush to the client
                         GNAT.OS_Lib.OS_Exit (Reload_Code);
                      else
@@ -842,7 +856,10 @@ begin
          end if;
          Put_Line ("  " & LLM_Catalog.Describe (E));
       end loop;
-      Put_Line ("  -->" & Runnable'Image & " runnable; active:" & Model_Path);
+      --  Log the basename, not the absolute path, to avoid leaking the
+      --  server's username / directory layout into stdout/log files.
+      Put_Line ("  -->" & Runnable'Image & " runnable; active: "
+        & Ada.Directories.Simple_Name (Model_Path));
    exception
       when others =>
          Put_Line ("model discovery skipped (non-fatal).");

@@ -16,6 +16,7 @@
 
 with LLM_Qwen;
 with LLM_Sampler;
+with LLM_Tokenizer;
 
 package LLM_Gemma is
 
@@ -42,6 +43,14 @@ package LLM_Gemma is
    function Vocab_Size  (M : Gemma_Model) return Integer;
    function Dim         (M : Gemma_Model) return Integer;
    function Block_Count (M : Gemma_Model) return Integer;
+
+   --  Per-position logits over a token sequence, returned flat as [seq*vocab]
+   --  with row index (Pos-1)*vocab + (k-1); the final logit soft-cap is applied
+   --  per position. Lets a real Gemma model act as a distillation teacher (see
+   --  Teacher_Gemma). Ids are 0-based token ids (as the tokenizer produces).
+   type Logits_Flat is array (Natural range <>) of Float;
+   function Forward_Logits
+     (M : Gemma_Model; Ids : LLM_Tokenizer.Token_Array) return Logits_Flat;
 
 private
 

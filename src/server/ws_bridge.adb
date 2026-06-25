@@ -439,6 +439,20 @@ procedure WS_Bridge is
                WLen : Natural := 0;
                Done : Boolean := False;
 
+               --  Idle-deadline for the relay: a silent browser must not pin a
+               --  bridge slot (and the backend handler it holds) forever — that
+               --  is a DoS on a public 0.0.0.0 demo. Check_Selector blocks at
+               --  most Sel_Timeout seconds; after Max_Idle accumulated seconds
+               --  with no traffic in either direction we tear the relay down.
+               --  Override the idle ceiling with ASPIDA_WS_IDLE (seconds).
+               Sel_Timeout : constant Selector_Duration := 30.0;
+               Max_Idle    : constant Duration :=
+                 (if Ada.Environment_Variables.Exists ("ASPIDA_WS_IDLE")
+                  then Duration'Max (1.0, Duration'Value
+                         (Ada.Environment_Variables.Value ("ASPIDA_WS_IDLE")))
+                  else 300.0);
+               Idle_Acc    : Duration := 0.0;   -- accumulated idle time
+
                --  Parse every COMPLETE WebSocket frame currently in WBuf,
                --  unmask it, and forward binary/text payloads to the server.
                procedure Pump_Frames is
@@ -526,11 +540,19 @@ procedure WS_Bridge is
                while not Done loop
                   Empty (RSet); Empty (ESet);
                   Set (RSet, Client); Set (RSet, Srv);
-                  Check_Selector (Sel, RSet, ESet, Status);
+                  Check_Selector (Sel, RSet, ESet, Status, Sel_Timeout);
                   if Dbg then Put_Line ("  [sel] status=" & Status'Image
                     & " srv=" & Boolean'Image (Is_Set (RSet, Srv))
                     & " cli=" & Boolean'Image (Is_Set (RSet, Client))); Flush; end if;
+                  if Status = Expired then
+                     --  No traffic this window; accrue idle time and drop the
+                     --  relay once it has been silent past the ceiling.
+                     Idle_Acc := Idle_Acc + Duration (Sel_Timeout);
+                     exit when Idle_Acc >= Max_Idle;
+                     goto Continue_Relay;
+                  end if;
                   exit when Status /= Completed;
+                  Idle_Acc := 0.0;   -- saw activity; reset the idle clock
 
                   if Is_Set (RSet, Srv) then               -- server -> browser
                      Receive_Socket (Srv, Buf, Last);
@@ -551,6 +573,9 @@ procedure WS_Bridge is
                      end loop;
                      Pump_Frames;
                   end if;
+
+                  <<Continue_Relay>>
+                  null;   -- goto target for the idle-Expired branch above
                end loop;
 
                Close_Selector (Sel);

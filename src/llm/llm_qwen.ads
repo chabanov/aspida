@@ -26,6 +26,16 @@ package LLM_Qwen is
    -- Forward pass: token_ids [seq_len] → logits [vocab_size]
    function Forward (M : Qwen_Model; Token_Ids : LLM_Tensor.Tensor) return LLM_Tensor.Tensor;
 
+   --  Per-position logits over a token sequence, returned flat as
+   --  [seq*vocab] with row index (Pos-1)*vocab + (k-1). Unlike Forward (which
+   --  projects only the last position), this projects EVERY position, so a real
+   --  Qwen model can act as a distillation teacher (see Teacher_Qwen): the
+   --  student matches the teacher's distribution at each position. Ids are
+   --  0-based token ids (as the tokenizer produces).
+   type Logits_Flat is array (Natural range <>) of Float;
+   function Forward_Logits
+     (M : Qwen_Model; Ids : LLM_Tokenizer.Token_Array) return Logits_Flat;
+
    -- Streaming sink for real-time output. Override Emit to receive each
    -- generated token's text as soon as it is produced; Tick fires once per
    -- prompt token during prefill (so a UI can show progress before the first

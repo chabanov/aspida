@@ -365,6 +365,70 @@ package body LLM_Qwen is
    end Forward;
 
    --------------------------------------------------------------------
+   --  Forward_Logits — like Forward, but the final RMSNorm + head are applied
+   --  at EVERY position (not just the last), yielding per-position logits for
+   --  distillation. Embedding rows follow the generation path (row = id + 1).
+   --------------------------------------------------------------------
+   function Forward_Logits
+     (M : Qwen_Model; Ids : LLM_Tokenizer.Token_Array) return Logits_Flat
+   is
+      Dim : constant Integer := M.Model_Dim;
+      Vc  : constant Integer := M.Vocab_Sz;
+      N   : constant Integer := Ids'Length;
+      H   : Tensor;
+   begin
+      --  Extended return: the [N*Vocab] result is built on the (heap-backed)
+      --  secondary stack, so a large vocab never lands a megabyte array on the
+      --  primary stack.
+      return Res : Logits_Flat (0 .. Integer'Max (0, N * Vc - 1)) :=
+        [others => 0.0]
+      do
+         if N >= 1 then
+            --  Build the embedding sequence [N, Dim].
+            H := New_Tensor ([N, Dim]);
+            for Pos in 1 .. N loop
+               declare
+                  Row : Integer := Ids (Ids'First + Pos - 1) + 1;  -- id -> row
+               begin
+                  if Row < 1 then
+                     Row := 1;
+                  elsif Row > Vc then
+                     Row := Vc;
+                  end if;
+                  for D in 1 .. Dim loop
+                     Set (H, [Pos, D], Get (M.Token_Emb, [Row, D]));
+                  end loop;
+               end;
+            end loop;
+
+            for I in 1 .. M.N_Blocks loop
+               H := LLM_Qwen_Blk.Forward (M.Blocks (I).all, H);
+            end loop;
+
+            --  Final RMSNorm + head at every position.
+            for Pos in 1 .. N loop
+               declare
+                  Last : Tensor := New_Tensor ([1, Dim]);
+               begin
+                  for D in 1 .. Dim loop
+                     Set_Flat (Last, D, Get (H, [Pos, D]));
+                  end loop;
+                  declare
+                     Normed : constant Tensor :=
+                       LLM_RMSNorm.Forward (Last, M.Final_Norm);
+                     RL     : constant Tensor := MatVec_Rows (M.LM_Head, Normed);
+                  begin
+                     for K in 1 .. Vc loop
+                        Res ((Pos - 1) * Vc + (K - 1)) := Get_Flat (RL, K);
+                     end loop;
+                  end;
+               end;
+            end loop;
+         end if;
+      end return;
+   end Forward_Logits;
+
+   --------------------------------------------------------------------
    -- Generate (autoregressive loop)
    --------------------------------------------------------------------
 
@@ -386,7 +450,7 @@ package body LLM_Qwen is
       Out_Buf : Unbounded_String;
       Smp     : LLM_Sampler.Sampler := LLM_Sampler.Create (Params);
       Hist    : LLM_Sampler.History (1 .. Integer'Max (1, Max_New_Tokens)) :=
-        (others => 0);
+        [others => 0];
       N_Hist  : Natural := 0;
       Produced : Natural := 0;       -- generated tokens (completion_tokens)
       Hit_Stop : Boolean := False;   -- stopped on a stop token, not the cap

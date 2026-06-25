@@ -201,12 +201,19 @@ package body GGUF_Write is
    function Round_Up (N : Natural) return Natural is
      (((N + Align - 1) / Align) * Align);
 
+   --  64-bit variant for the running tensor-data offset/cursor: a tensor-data
+   --  section >= 2 GiB overflows a 32-bit Natural, so the accumulators below
+   --  use Unsigned_64. Alignment is always 32, so a wrapped Round_Up never
+   --  exceeds the input by more than Align-1 < 2**63 — no overflow here.
+   function Round_Up_64 (N : Unsigned_64) return Unsigned_64 is
+     (((N + Align - 1) / Align) * Align);
+
    procedure Save (B : in out Builder; Path : String) is
       use Ada.Streams.Stream_IO;
       F   : File_Type;
       Hdr : Unbounded_String;
       TI  : Unbounded_String;   -- tensor infos
-      Off : Natural := 0;       -- running data offset (relative to data start)
+      Off : Unsigned_64 := 0;   -- running data offset (relative to data start)
 
       procedure Put (Str : String) is
          Buf : Stream_Element_Array (1 .. Stream_Element_Offset (Str'Length));
@@ -237,8 +244,8 @@ package body GGUF_Write is
             Append (TI, B_U64 (Unsigned_64 (T.Dims (D))));
          end loop;
          Append (TI, B_U32 (Unsigned_32 (T.Kind)));   -- GGML type (0=F32, 8=Q8_0)
-         Append (TI, B_U64 (Unsigned_64 (Off)));
-         Off := Round_Up (Off + Length (T.Data));
+         Append (TI, B_U64 (Off));
+         Off := Round_Up_64 (Off + Unsigned_64 (Length (T.Data)));
       end loop;
 
       Create (F, Out_File, Path);
@@ -250,19 +257,21 @@ package body GGUF_Write is
       declare
          Pos        : constant Natural := Length (Hdr) + Length (B.Meta.Bytes) + Length (TI);
          Data_Start : constant Natural := Round_Up (Pos);
-         Cursor     : Natural := 0;       -- bytes written within the data section
+         Cursor     : Unsigned_64 := 0;   -- bytes written within the data section
       begin
          Pad (Data_Start - Pos);
          for T of B.Tens loop
             --  each tensor's data begins at its (aligned) offset
             declare
-               Want : constant Natural := Round_Up (Cursor);
+               Want : constant Unsigned_64 := Round_Up_64 (Cursor);
             begin
-               Pad (Want - Cursor);
+               --  Want - Cursor is the padding to the next 32-byte boundary,
+               --  always < Align, so the Natural conversion cannot overflow.
+               Pad (Natural (Want - Cursor));
                Cursor := Want;
             end;
             Put (To_String (T.Data));
-            Cursor := Cursor + Length (T.Data);
+            Cursor := Cursor + Unsigned_64 (Length (T.Data));
          end loop;
       end;
       Close (F);

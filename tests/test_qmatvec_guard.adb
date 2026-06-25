@@ -23,8 +23,9 @@ procedure Test_QMatVec_Guard is
      (Name   => Null_Unbounded_String,
       N_Dims => 2,
       Dims   => [4, 2, 0, 0],
-      Kind   => LLM_GGUF.GGML_TYPE_F32,
-      Offset => 0);
+      Kind      => LLM_GGUF.GGML_TYPE_F32,
+      Offset    => 0,
+      Byte_Size => 0);
    Raw : constant String (1 .. 32) := [others => Character'Val (0)];
 
    Ok, R_Short, R_Long : Boolean := False;

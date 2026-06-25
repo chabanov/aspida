@@ -1365,32 +1365,38 @@ package body LLM_Llama is
       Vc    : constant Integer := M.Vocab;
       Cap   : constant Integer := Integer'Max (1, N);
       Cache : KV_Cache (1 .. M.N_Blocks);
-      Res   : Logits_Flat (0 .. Integer'Max (0, N * Vc - 1));
       procedure Free is
         new Ada.Unchecked_Deallocation (Tensor_Array, Tensor_Array_Ptr);
    begin
-      for L in 1 .. M.N_Blocks loop
-         Cache (L).K := new Tensor_Array (1 .. Cap);
-         Cache (L).V := new Tensor_Array (1 .. Cap);
-      end loop;
-      for P in 1 .. N loop
-         LLM_Step_Lock.Acquire;
-         begin
-            declare
-               L : constant Tensor :=
-                 Forward_Step (M, Cache, Ids (Ids'First + P - 1), P - 1);
+      --  Extended return: build the [N*Vocab] result on the (heap-backed)
+      --  secondary stack so a large vocab never lands a megabyte array on the
+      --  primary stack.
+      return Res : Logits_Flat (0 .. Integer'Max (0, N * Vc - 1)) do
+         for L in 1 .. M.N_Blocks loop
+            Cache (L).K := new Tensor_Array (1 .. Cap);
+            Cache (L).V := new Tensor_Array (1 .. Cap);
+         end loop;
+         for P in 1 .. N loop
+            LLM_Step_Lock.Acquire;
             begin
-               for K in 1 .. Vc loop
-                  Res ((P - 1) * Vc + (K - 1)) := Get_Flat (L, K);
-               end loop;
+               declare
+                  L : constant Tensor :=
+                    Forward_Step (M, Cache, Ids (Ids'First + P - 1), P - 1);
+               begin
+                  for K in 1 .. Vc loop
+                     Res ((P - 1) * Vc + (K - 1)) := Get_Flat (L, K);
+                  end loop;
+               end;
+               LLM_Step_Lock.Release;
+            exception
+               when others => LLM_Step_Lock.Release; raise;
             end;
-            LLM_Step_Lock.Release;
-         exception
-            when others => LLM_Step_Lock.Release; raise;
-         end;
-      end loop;
-      for L in 1 .. M.N_Blocks loop Free (Cache (L).K); Free (Cache (L).V); end loop;
-      return Res;
+         end loop;
+         for L in 1 .. M.N_Blocks loop
+            Free (Cache (L).K);
+            Free (Cache (L).V);
+         end loop;
+      end return;
    end Forward_Logits;
 
    function Generate
