@@ -36,8 +36,15 @@ package body LLM_GPU is
 
    function To_MM is new Ada.Unchecked_Conversion (System.Address, MatMul_Fn);
 
+   --  Matches  void aspida_gpu_free_weight(const void* w)
+   type Free_Fn is access procedure (W : System.Address)
+     with Convention => C;
+
+   function To_Free is new Ada.Unchecked_Conversion (System.Address, Free_Fn);
+
    Fn        : MatVec_Fn := null;
    MM_Fn     : MatMul_Fn := null;
+   Free_W_Fn : Free_Fn := null;
 
    --  The lazy dlopen must run exactly once even when several handler tasks
    --  call Available()/Init concurrently at startup. A bare Boolean flag had a
@@ -94,6 +101,16 @@ package body LLM_GPU is
                   MM_Fn := To_MM (A);
                end if;
             end;
+            declare
+               CS : chars_ptr := New_String ("aspida_gpu_free_weight");
+               A  : System.Address;
+            begin
+               A := C_dlsym (H, CS);
+               Free (CS);
+               if A /= System.Null_Address then
+                  Free_W_Fn := To_Free (A);
+               end if;
+            end;
          end;
       end Run;
    end Init_Guard;
@@ -141,5 +158,13 @@ package body LLM_GPU is
       MM_Fn (W_Addr, Interfaces.C.long (W_Bytes), int (Kind),
              int (In_Dim), int (Out_Dim), int (Batch), X, Y);
    end MatMul;
+
+   procedure Free_Weight (Addr : System.Address) is
+   begin
+      Init;
+      if Free_W_Fn /= null and then Addr /= System.Null_Address then
+         Free_W_Fn (Addr);
+      end if;
+   end Free_Weight;
 
 end LLM_GPU;

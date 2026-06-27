@@ -23,6 +23,14 @@ package LLM_Llama is
 
    function Load (Path : String) return Llama_Model;
 
+   --  Release everything the model owns and deallocate it (Phase 1b eviction):
+   --  every weight's quantized host bytes (and any GPU-side mirror of them),
+   --  the per-block array, then the model record itself. Idempotent — M is set
+   --  to null, so a second call is a no-op. The model must not be in use by any
+   --  in-flight Chat/Generate when this is called (the registry guarantees this
+   --  by only evicting a slot with refcount = 0).
+   procedure Free (M : in out Llama_Model);
+
    --  Decode core: single-stream sampling from a ready token-id sequence
    --  (sampler Params; greedy by default), stopping at Stop_A or Stop_B
    --  (token ids; -1 disables). Used by Complete and direct callers;

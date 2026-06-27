@@ -26,6 +26,12 @@ package LLM_Gemma is
 
    function Load (Path : String) return Gemma_Model;
 
+   --  Release everything the model owns and deallocate it (Phase 1b eviction):
+   --  every weight's quantized host bytes (and any GPU mirror), the per-block
+   --  array, the still-open GGUF used for streaming the per-layer embedding,
+   --  then the model record. Idempotent — M is set to null. Must not be in use.
+   procedure Free (M : in out Gemma_Model);
+
    --  Multi-turn chat using the Gemma turn template; greedy decode with the
    --  same streaming sink contract as the Qwen backend.
    function Chat

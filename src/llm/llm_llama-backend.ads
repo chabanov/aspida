@@ -23,6 +23,7 @@ package LLM_Llama.Backend is
    overriding function Arch_Name   (M : Llama_Backend) return String;
    overriding function Dim         (M : Llama_Backend) return Integer;
    overriding function Block_Count (M : Llama_Backend) return Integer;
+   overriding procedure Release    (M : in out Llama_Backend);
 
 private
    type Llama_Backend is limited new LLM_Backend.Model_Backend with record

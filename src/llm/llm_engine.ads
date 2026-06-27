@@ -22,6 +22,14 @@ package LLM_Engine is
 
    function Load (Path : String) return Engine;
 
+   --  Tear down an engine and free everything its backend owns (Phase 1b LRU
+   --  eviction): dispatches to the backend's Release, then deallocates the
+   --  backend access and nulls it. Idempotent — Unload of an already-unloaded
+   --  (or never-loaded) engine is a no-op. The engine must not be in use by any
+   --  in-flight Chat when this is called (the registry only evicts a slot with
+   --  refcount = 0).
+   procedure Unload (E : in out Engine);
+
    --  Sampling parameters (re-exported for callers); default is greedy.
    subtype Sampling is LLM_Sampler.Params;
    Greedy : LLM_Sampler.Params renames LLM_Sampler.Greedy;

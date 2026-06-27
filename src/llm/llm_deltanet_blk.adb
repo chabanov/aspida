@@ -7,8 +7,21 @@ use Ada.Numerics.Elementary_Functions;
 with LLM_Tensor; use LLM_Tensor;
 with LLM_Weight; use LLM_Weight;
 with LLM_DeltaNet;
+with LLM_GPU;
 
 package body LLM_DeltaNet_Blk is
+
+   procedure Drop_W (W : in out LLM_Weight.Weight) is
+   begin
+      LLM_GPU.Free_Weight (LLM_Weight.Raw_Address (W));
+      LLM_Weight.Free_Bytes (W);
+   end Drop_W;
+
+   procedure Free (L : in out DeltaNet_Layer) is
+   begin
+      Drop_W (L.QKV_W);  Drop_W (L.Alpha_W); Drop_W (L.Beta_W);
+      Drop_W (L.Out_W);  Drop_W (L.Gate_W);
+   end Free;
 
    --  Hot per-token kernel; loop indices derive from the layer's own dims, so
    --  range/overflow checks are redundant. Suppressed for the inner math.

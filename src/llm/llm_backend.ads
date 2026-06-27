@@ -41,4 +41,14 @@ package LLM_Backend is
    function Dim         (M : Model_Backend) return Integer is abstract;
    function Block_Count (M : Model_Backend) return Integer is abstract;
 
+   --  Release every resource the backend owns — the model's quantized weight
+   --  bytes, any GPU-side mirror of them, per-layer/per-block heap structures,
+   --  and (where held) the streaming GGUF file handle. Called by
+   --  LLM_Engine.Unload when a model is evicted (Phase 1b LRU). Must be
+   --  idempotent (a second call is a no-op) and must only run when the backend
+   --  is not in use by any in-flight Chat — the registry guarantees this by
+   --  evicting only a slot with refcount = 0. The default is a null procedure
+   --  so a backend that owns nothing reclaimable needs no override.
+   procedure Release (M : in out Model_Backend) is null;
+
 end LLM_Backend;

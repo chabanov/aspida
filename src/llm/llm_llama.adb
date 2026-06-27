@@ -277,6 +277,51 @@ package body LLM_Llama is
       return M;
    end Load;
 
+   --------------------------------------------------------------------
+   --  Free — full teardown for Phase 1b LRU eviction.
+   --------------------------------------------------------------------
+   procedure Free_Rec is
+     new Ada.Unchecked_Deallocation (Llama_Model_Rec, Llama_Model);
+   procedure Free_Blocks is
+     new Ada.Unchecked_Deallocation (Block_Arr, Block_Arr_Ptr);
+
+   --  Drop a weight's GPU mirror (if any) THEN its host bytes, in that order:
+   --  the host address is the device cache key and must be valid for the free.
+   procedure Drop_Weight (W : in out LLM_Weight.Weight) is
+   begin
+      LLM_GPU.Free_Weight (LLM_Weight.Raw_Address (W));
+      LLM_Weight.Free_Bytes (W);
+   end Drop_Weight;
+
+   procedure Free (M : in out Llama_Model) is
+   begin
+      if M = null then
+         return;   --  idempotent
+      end if;
+
+      if M.Blocks /= null then
+         for I in M.Blocks'Range loop
+            declare
+               B : L_Block renames M.Blocks (I);
+            begin
+               Drop_Weight (B.W_Q);    Drop_Weight (B.W_K);
+               Drop_Weight (B.W_V);    Drop_Weight (B.W_O);
+               Drop_Weight (B.W_Gate); Drop_Weight (B.W_Up);
+               Drop_Weight (B.W_Down);
+               --  Attn_Norm / Ffn_Norm are controlled Tensors: they finalize
+               --  when the block array is deallocated below.
+            end;
+         end loop;
+         Free_Blocks (M.Blocks);   --  finalizes the per-block norm Tensors
+      end if;
+
+      Drop_Weight (M.Tok_Emb);
+      Drop_Weight (M.Output);
+      --  Out_Norm / Rope_Freqs are controlled Tensors finalized with the record.
+
+      Free_Rec (M);   --  nulls M (idempotent on a second call)
+   end Free;
+
    --  Matvec, on the GPU when the LLM_GPU shim is loaded (Q4_K/Q5_K/Q6_K
    --  weights — those with Kind_Code >= 0), else the pure-Ada CPU path.
    --  Bit-identical kernels, so output is unchanged.

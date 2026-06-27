@@ -21,6 +21,7 @@ package LLM_Qwen.Backend is
    overriding function Arch_Name   (M : Qwen_Backend) return String;
    overriding function Dim         (M : Qwen_Backend) return Integer;
    overriding function Block_Count (M : Qwen_Backend) return Integer;
+   overriding procedure Release    (M : in out Qwen_Backend);
 
 private
    type Qwen_Backend is limited new LLM_Backend.Model_Backend with record

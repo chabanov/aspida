@@ -23,4 +23,9 @@ package body LLM_Qwen.Backend is
    overriding function Block_Count (M : Qwen_Backend) return Integer
      is (LLM_Qwen.Block_Count (M.Model));
 
+   overriding procedure Release (M : in out Qwen_Backend) is
+   begin
+      LLM_Qwen.Free (M.Model);   --  idempotent; nulls M.Model
+   end Release;
+
 end LLM_Qwen.Backend;

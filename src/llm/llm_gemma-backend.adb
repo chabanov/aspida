@@ -23,4 +23,9 @@ package body LLM_Gemma.Backend is
    overriding function Block_Count (M : Gemma_Backend) return Integer
      is (LLM_Gemma.Block_Count (M.Model));
 
+   overriding procedure Release (M : in out Gemma_Backend) is
+   begin
+      LLM_Gemma.Free (M.Model);   --  idempotent; nulls M.Model
+   end Release;
+
 end LLM_Gemma.Backend;

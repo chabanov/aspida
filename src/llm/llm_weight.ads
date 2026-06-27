@@ -26,6 +26,19 @@ package LLM_Weight is
    function From_Quant
      (Info : LLM_GGUF.Tensor_Info; Bytes : Byte_Data) return Weight;
 
+   --  Free everything this weight owns on the host: the quantized byte block
+   --  (Byte_Data) for a quantized weight. Idempotent — safe to call more than
+   --  once (a freed weight becomes Present=False with a null Bytes). The dense
+   --  variant's Tensor is a controlled type and finalizes on its own, so this
+   --  only releases the raw quantized bytes that nothing else frees.
+   --
+   --  Phase 1b eviction: a backend's Release calls this for every weight it
+   --  owns so an evicted model leaves no host RAM behind. The caller is
+   --  responsible for first dropping any GPU-side mirror of these bytes
+   --  (LLM_GPU.Free_Weight on Raw_Address) BEFORE Free_Bytes, since the host
+   --  address is the device cache key and must still be valid at that point.
+   procedure Free_Bytes (W : in out Weight);
+
    function Present (W : Weight) return Boolean;
    function Rows    (W : Weight) return Integer;   -- output dim
    function Cols    (W : Weight) return Integer;   -- input dim
