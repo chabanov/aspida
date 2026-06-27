@@ -298,6 +298,39 @@ package body LLM_Qwen is
    end Load;
 
    --------------------------------------------------------------------
+   --  Free — full teardown for Phase 1b LRU eviction.
+   --
+   --  Qwen_Model is a by-value record (not an access type): the record itself
+   --  and its dense controlled Tensors (Token_Emb / LM_Head / Final_Norm) are
+   --  finalized when the enclosing backend object is deallocated. Free only
+   --  releases what the record OWNS on the heap and would otherwise leak: the
+   --  per-block weight bytes (+ any GPU mirror) and the block array/records.
+   --------------------------------------------------------------------
+   procedure Free_Block is
+     new Ada.Unchecked_Deallocation (LLM_Qwen_Blk.Qwen_Block, Block_Access);
+   procedure Free_Block_Arr is
+     new Ada.Unchecked_Deallocation (Block_Array, Block_Array_Ptr);
+
+   procedure Free (M : in out Qwen_Model) is
+   begin
+      if M.Blocks /= null then
+         for I in M.Blocks'Range loop
+            if M.Blocks (I) /= null then
+               --  Free both attention paths' weights: the unused one carries
+               --  no bytes (Free_Bytes is idempotent on an empty weight).
+               LLM_FullAttn.Free (M.Blocks (I).Full);
+               LLM_DeltaNet_Blk.Free (M.Blocks (I).DNet);
+               LLM_MoE.Free (M.Blocks (I).MoE);
+               --  Attn_Norm_W / Post_Attn_Norm_W are controlled Tensors,
+               --  finalized when the block record is deallocated next.
+               Free_Block (M.Blocks (I));
+            end if;
+         end loop;
+         Free_Block_Arr (M.Blocks);   --  nulls M.Blocks -> idempotent
+      end if;
+   end Free;
+
+   --------------------------------------------------------------------
    -- Forward pass: token_ids [seq_len] → next-token logits [1, vocab]
    --------------------------------------------------------------------
 

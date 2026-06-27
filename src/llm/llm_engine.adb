@@ -3,12 +3,16 @@
 -- (registry-driven), then dispatch over the unified Model_Backend protocol.
 ---------------------------------------------------------------------
 
+with Ada.Unchecked_Deallocation;
 with LLM_GGUF;
 with LLM_Qwen.Backend;
 with LLM_Gemma.Backend;
 with LLM_Llama.Backend;
 
 package body LLM_Engine is
+
+   procedure Free_Backend is new Ada.Unchecked_Deallocation
+     (LLM_Backend.Model_Backend'Class, LLM_Backend.Backend_Access);
 
    --  Architecture registry: a GGUF general.architecture string -> the backend
    --  constructor. Adding a model = add one row here; nothing else changes.
@@ -75,6 +79,15 @@ package body LLM_Engine is
         "unsupported architecture '" & Arch
         & "' (supported: qwen35moe, qwen2, gemma4, llama)";
    end Load;
+
+   procedure Unload (E : in out Engine) is
+      use type LLM_Backend.Backend_Access;
+   begin
+      if E.Impl /= null then
+         E.Impl.Release;          --  free weights / GPU mirror / file handles
+         Free_Backend (E.Impl);   --  deallocate the class-wide backend; nulls E.Impl
+      end if;
+   end Unload;
 
    function Chat
      (E : Engine; Conversation : LLM_Qwen.Message_Array;

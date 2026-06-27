@@ -321,6 +321,18 @@ static uint8_t *upload_weight(const void *w, long wbytes) {
     g_wcache[w] = dw; return dw;
 }
 
+//  Phase 1b eviction: drop the VRAM mirror of one host weight pointer. Called
+//  by the engine when a model is unloaded, BEFORE its host bytes are freed (so
+//  the pointer is still a valid cache key). Without this the device buffer
+//  leaks AND a later model whose host bytes are reallocated at the same address
+//  would be served this model's stale weights. No-op if w was never uploaded.
+extern "C" void aspida_gpu_free_weight(const void *w) {
+    auto it = g_wcache.find(w);
+    if (it == g_wcache.end()) return;
+    cudaFree(it->second);
+    g_wcache.erase(it);
+}
+
 extern "C" void aspida_gpu_matvec(const void *w, long wbytes, int kind,
                                   int in_dim, int out_dim, const float *x, float *y) {
     static float *dx = nullptr, *dy = nullptr; static long cx = 0, cy = 0;

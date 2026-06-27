@@ -28,6 +28,19 @@ package LLM_GPU is
       X       : System.Address;
       Y       : System.Address);
 
+   --  Drop the device-side mirror of the weight whose host bytes start at
+   --  Addr (the same address passed as W_Addr to MatVec/MatMul). The shim
+   --  caches each distinct host weight pointer's uploaded VRAM copy keyed by
+   --  that pointer; when a model is evicted its host bytes are freed and may be
+   --  reallocated, so the stale device buffer must be released first — both to
+   --  avoid a VRAM leak and to prevent a future model whose bytes land at the
+   --  same host address from being served the previous model's weights.
+   --
+   --  No-op when the GPU is disabled, the shim is absent, or the shim predates
+   --  this entry point (older shims simply leak the eviction's VRAM — call it
+   --  unconditionally; it is always safe). Idempotent for a given Addr.
+   procedure Free_Weight (Addr : System.Address);
+
    --  True iff the loaded shim also exports the batched matmul entry point.
    function Has_MatMul return Boolean;
 

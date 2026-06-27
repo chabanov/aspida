@@ -55,4 +55,10 @@ package LLM_MoE is
    -- Forward pass: x [1, dim] → output [1, dim]
    function Forward (M : MoE_Layer; X : LLM_Tensor.Tensor) return LLM_Tensor.Tensor;
 
+   --  Release the quantized host bytes (and any GPU mirror) of this layer's
+   --  router / expert / shared-expert weights — for Phase 1b model eviction.
+   --  Idempotent. The dense Shexp_Gate_Inp_W Tensor is controlled and finalizes
+   --  with the enclosing block array.
+   procedure Free (M : in out MoE_Layer);
+
 end LLM_MoE;

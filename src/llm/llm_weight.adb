@@ -4,11 +4,15 @@
 
 with Ada.Environment_Variables;
 with Ada.Text_IO;
+with Ada.Unchecked_Deallocation;
 with LLM_Dequant;
 
 package body LLM_Weight is
 
    use LLM_Tensor;
+
+   procedure Free_String is
+     new Ada.Unchecked_Deallocation (String, Byte_Data);
 
    --------------------------------------------------------------------
    -- Dense weight cache (OPT-IN — off by default, enable with LLM_WEIGHT_CACHE)
@@ -95,6 +99,15 @@ package body LLM_Weight is
          W.Bytes     := Bytes;
       end return;
    end From_Quant;
+
+   procedure Free_Bytes (W : in out Weight) is
+   begin
+      if W.Bytes /= null then
+         Free_String (W.Bytes);   --  nulls W.Bytes
+      end if;
+      W.Present_F := False;
+      W.Is_Quant  := False;
+   end Free_Bytes;
 
    function Present (W : Weight) return Boolean is (W.Present_F);
 

@@ -23,4 +23,9 @@ package body LLM_Llama.Backend is
    overriding function Block_Count (M : Llama_Backend) return Integer
      is (LLM_Llama.Block_Count (M.Model));
 
+   overriding procedure Release (M : in out Llama_Backend) is
+   begin
+      LLM_Llama.Free (M.Model);   --  idempotent; nulls M.Model
+   end Release;
+
 end LLM_Llama.Backend;

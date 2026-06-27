@@ -38,6 +38,7 @@ with Encrypting_Sink;
 with Protocol;
 with LLM_Qwen;
 with LLM_Engine;
+with LLM_Registry;
 with LLM_Catalog;
 with LLM_Sampler;
 with OpenAI;
@@ -627,6 +628,9 @@ procedure Secure_Server is
             elsif Tag = Protocol.Tag_Chat then
                declare
                   Locked : Boolean := False;
+                  Lse    : LLM_Registry.Lease;
+                  Leased : Boolean := False;   -- lease held (also = Acquire Ok)
+                  LErr   : Unbounded_String;
                begin
                   declare
                      Rq      : constant OpenAI.Request := OpenAI.Parse_Chat (Prompt);
@@ -647,12 +651,21 @@ procedure Secure_Server is
                         if P.Top_P <= 0.0 or else P.Top_P > 1.0 then P.Top_P := 1.0; end if;
                         if P.Top_K < 0 then P.Top_K := 0; end if;
                         if P.Min_P < 0.0 or else P.Min_P > 1.0 then P.Min_P := 0.0; end if;
+                        --  Route to the requested model (multi-model serving):
+                        --  lease its engine (lazy-load up to the budget), or
+                        --  fail loud when it cannot be resolved / is not warm.
+                        LLM_Registry.Acquire
+                          (To_String (Rq.Model), Lse, Leased, LErr);
+                        if not Leased then
+                           Send_Tagged (Protocol.Tag_Resp, OpenAI.Error_Response
+                             (To_String (LErr), "model_not_available"));
+                        else
                         Infer_Lock.Acquire; Locked := True;
                         if Rq.Stream then
                            declare
                               R : constant String := LLM_Engine.Chat
-                                (Model, Rq.Messages, Eff_Max, Sink'Access, P,
-                                 St'Access);
+                                (LLM_Registry.Engine_Of (Lse), Rq.Messages,
+                                 Eff_Max, Sink'Access, P, St'Access);
                               pragma Unreferenced (R);
                            begin null; end;
                            Infer_Lock.Release; Locked := False;
@@ -670,7 +683,8 @@ procedure Secure_Server is
                         else
                            declare
                               R : constant String := LLM_Engine.Chat
-                                (Model, Rq.Messages, Eff_Max, null, P, St'Access);
+                                (LLM_Registry.Engine_Of (Lse), Rq.Messages,
+                                 Eff_Max, null, P, St'Access);
                            begin
                               Infer_Lock.Release; Locked := False;
                               if St.Overflow then
@@ -687,12 +701,15 @@ procedure Secure_Server is
                               end if;
                            end;
                         end if;
+                        LLM_Registry.Release (Lse); Leased := False;
+                        end if;
                      end if;
                   end;
                exception
                   when JSON.Parse_Error =>
                      --  Malformed request body: client fault -> 400-style error.
                      if Locked then Infer_Lock.Release; end if;
+                     if Leased then LLM_Registry.Release (Lse); end if;
                      Send_Tagged (Protocol.Tag_Resp,
                        OpenAI.Error_Response ("bad request", "bad_request"));
                   when others =>
@@ -700,6 +717,7 @@ procedure Secure_Server is
                      --  -> 500-style error. Don't mislabel a crash as "bad
                      --  request", which hides engine bugs from the client.
                      if Locked then Infer_Lock.Release; end if;
+                     if Leased then LLM_Registry.Release (Lse); end if;
                      Send_Tagged (Protocol.Tag_Resp,
                        OpenAI.Error_Response ("internal error", "internal_error"));
                end;
@@ -789,6 +807,10 @@ begin
          GNAT.OS_Lib.OS_Exit (1);
       end if;
       Model := LLM_Engine.Load (Path);
+      --  Seed the multi-model registry with the default model (always warm,
+      --  slot 1). Requests routed by the OpenAI `model` field lazy-load others
+      --  up to ASPIDA_MAX_LOADED_MODELS (see LLM_Registry).
+      LLM_Registry.Init (Ada.Directories.Simple_Name (Path), Model);
    exception
       when E : others =>
          Put_Line ("fatal: cannot load model """ & Path & """: "

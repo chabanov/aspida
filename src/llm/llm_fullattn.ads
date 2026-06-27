@@ -33,6 +33,12 @@ package LLM_FullAttn is
    function Forward (L : Full_Attn_Layer; X : LLM_Tensor.Tensor)
       return LLM_Tensor.Tensor;
 
+   --  Release the quantized host bytes (and any GPU mirror) of this layer's
+   --  projection weights — for Phase 1b model eviction. Idempotent. The dense
+   --  Q_Norm/K_Norm Tensors are controlled and finalize with the enclosing
+   --  block array; only the byte-data weights need explicit release.
+   procedure Free (L : in out Full_Attn_Layer);
+
    --------------------------------------------------------------------
    -- Incremental decode (KV cache, one token at a time).
    --

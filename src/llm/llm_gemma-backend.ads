@@ -22,6 +22,7 @@ package LLM_Gemma.Backend is
    overriding function Arch_Name   (M : Gemma_Backend) return String;
    overriding function Dim         (M : Gemma_Backend) return Integer;
    overriding function Block_Count (M : Gemma_Backend) return Integer;
+   overriding procedure Release    (M : in out Gemma_Backend);
 
 private
    type Gemma_Backend is limited new LLM_Backend.Model_Backend with record

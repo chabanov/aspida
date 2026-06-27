@@ -23,6 +23,12 @@ package LLM_Qwen is
    -- Load model from GGUF file
    function Load (Path : String) return Qwen_Model;
 
+   --  Release everything the model owns and deallocate it (Phase 1b eviction):
+   --  every block's projection/expert weights' quantized host bytes (and any
+   --  GPU mirror), the per-block records and block array, then the model
+   --  record. Idempotent — M is set to null. Must not be in use.
+   procedure Free (M : in out Qwen_Model);
+
    -- Forward pass: token_ids [seq_len] → logits [vocab_size]
    function Forward (M : Qwen_Model; Token_Ids : LLM_Tensor.Tensor) return LLM_Tensor.Tensor;
 

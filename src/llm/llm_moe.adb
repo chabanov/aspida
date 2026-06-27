@@ -10,8 +10,22 @@ with Ada.Numerics.Generic_Elementary_Functions;
 with LLM_Tensor; use LLM_Tensor;
 with LLM_Weight; use LLM_Weight;
 with LLM_Pool;
+with LLM_GPU;
 
 package body LLM_MoE is
+
+   procedure Drop_W (W : in out LLM_Weight.Weight) is
+   begin
+      LLM_GPU.Free_Weight (LLM_Weight.Raw_Address (W));
+      LLM_Weight.Free_Bytes (W);
+   end Drop_W;
+
+   procedure Free (M : in out MoE_Layer) is
+   begin
+      Drop_W (M.Gate_Inp_W);
+      Drop_W (M.Gate_Exp_W);   Drop_W (M.Up_W);   Drop_W (M.Down_W);
+      Drop_W (M.Shexp_Gate_W); Drop_W (M.Shexp_Up_W); Drop_W (M.Shexp_Down_W);
+   end Free;
 
    --  Hot per-token kernel (router + 8 experts); indices derive from dims.
    pragma Suppress (All_Checks);

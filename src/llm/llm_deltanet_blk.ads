@@ -39,6 +39,11 @@ package LLM_DeltaNet_Blk is
    function Forward (L : DeltaNet_Layer; X : LLM_Tensor.Tensor)
       return LLM_Tensor.Tensor;
 
+   --  Release the quantized host bytes (and any GPU mirror) of this layer's
+   --  projection weights — for Phase 1b model eviction. Idempotent. The dense
+   --  conv/a/dt/norm Tensors are controlled and finalize with the block array.
+   procedure Free (L : in out DeltaNet_Layer);
+
    --------------------------------------------------------------------
    -- Incremental decode (one token at a time, O(1) per step).
    --

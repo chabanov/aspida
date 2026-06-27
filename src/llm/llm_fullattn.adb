@@ -8,8 +8,21 @@ with LLM_Tensor; use LLM_Tensor;
 with LLM_RMSNorm;
 with LLM_Weight; use LLM_Weight;
 with LLM_RoPE;   use LLM_RoPE;
+with LLM_GPU;
 
 package body LLM_FullAttn is
+
+   --  Drop a weight's GPU mirror (keyed by host address) THEN its host bytes.
+   procedure Drop_W (W : in out LLM_Weight.Weight) is
+   begin
+      LLM_GPU.Free_Weight (LLM_Weight.Raw_Address (W));
+      LLM_Weight.Free_Bytes (W);
+   end Drop_W;
+
+   procedure Free (L : in out Full_Attn_Layer) is
+   begin
+      Drop_W (L.Q_W); Drop_W (L.K_W); Drop_W (L.V_W); Drop_W (L.O_W);
+   end Free;
 
    --  Hot per-token kernel; indices derive from the layer's own dims.
    pragma Suppress (All_Checks);

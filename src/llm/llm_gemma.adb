@@ -24,6 +24,7 @@ with LLM_Tensor;  use LLM_Tensor;
 with LLM_RMSNorm;
 with LLM_RoPE;
 with LLM_Weight;
+with LLM_GPU;
 with LLM_Step_Lock;
 
 package body LLM_Gemma is
@@ -353,6 +354,56 @@ package body LLM_Gemma is
         & " prefill=" & (if M.Use_Chan_Prefill then "yes" else "no"));
       return M;   -- G (= M.Gf) stays open for on-demand PLE row reads
    end Load;
+
+   --------------------------------------------------------------------
+   --  Free — full teardown for Phase 1b LRU eviction.
+   --------------------------------------------------------------------
+   procedure Free_Rec is
+     new Ada.Unchecked_Deallocation (Gemma_Model_Rec, Gemma_Model);
+   procedure Free_Blocks is
+     new Ada.Unchecked_Deallocation (Block_Arr, Block_Arr_Ptr);
+
+   procedure Drop_Weight (W : in out LLM_Weight.Weight) is
+   begin
+      LLM_GPU.Free_Weight (LLM_Weight.Raw_Address (W));
+      LLM_Weight.Free_Bytes (W);
+   end Drop_Weight;
+
+   procedure Free (M : in out Gemma_Model) is
+   begin
+      if M = null then
+         return;   --  idempotent
+      end if;
+
+      --  The PLE per-layer embedding table is streamed from the still-open
+      --  GGUF; close it so the eviction releases the file handle + mmap.
+      if Is_Open (M.Gf) then
+         Close (M.Gf);
+      end if;
+
+      if M.Blocks /= null then
+         for I in M.Blocks'Range loop
+            declare
+               B : G_Block renames M.Blocks (I);
+            begin
+               Drop_Weight (B.W_Q);    Drop_Weight (B.W_K);
+               Drop_Weight (B.W_V);    Drop_Weight (B.W_O);
+               Drop_Weight (B.W_Gate); Drop_Weight (B.W_Up);
+               Drop_Weight (B.W_Down);
+               Drop_Weight (B.Inp_Gate); Drop_Weight (B.Proj);
+               --  Norm Tensors are controlled; finalized with the block array.
+            end;
+         end loop;
+         Free_Blocks (M.Blocks);
+      end if;
+
+      Drop_Weight (M.Tok_Emb);
+      Drop_Weight (M.PLE_Proj);
+      --  Out_Norm / Rope_Freqs / PLE_Proj_Norm are controlled Tensors,
+      --  finalized when the record is deallocated.
+
+      Free_Rec (M);
+   end Free;
 
    --------------------------------------------------------------------
    -- One incremental decode step: forward the single token Tok at 0-based
