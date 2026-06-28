@@ -24,16 +24,18 @@ package body LLM_Engine is
       Make : Constructor;
    end record;
 
-   A_Gemma : aliased constant String := "gemma4";
-   A_QMoe  : aliased constant String := "qwen35moe";
-   A_Qwen2 : aliased constant String := "qwen2";
-   A_Llama : aliased constant String := "llama";
+   A_Gemma  : aliased constant String := "gemma4";
+   A_QMoe   : aliased constant String := "qwen35moe";
+   A_Qwen35 : aliased constant String := "qwen35";
+   A_Qwen2  : aliased constant String := "qwen2";
+   A_Llama  : aliased constant String := "llama";
 
    Registry : constant array (Positive range <>) of Registration :=
-     [1 => (A_Gemma'Access, LLM_Gemma.Backend.Create'Access),
-      2 => (A_QMoe'Access,  LLM_Qwen.Backend.Create'Access),
-      3 => (A_Qwen2'Access, LLM_Qwen.Backend.Create'Access),
-      4 => (A_Llama'Access, LLM_Llama.Backend.Create'Access)];
+     [1 => (A_Gemma'Access,  LLM_Gemma.Backend.Create'Access),
+      2 => (A_QMoe'Access,   LLM_Qwen.Backend.Create'Access),
+      3 => (A_Qwen35'Access, LLM_Qwen.Backend.Create'Access),
+      4 => (A_Qwen2'Access,  LLM_Qwen.Backend.Create'Access),
+      5 => (A_Llama'Access,  LLM_Llama.Backend.Create'Access)];
 
    --  Peek general.architecture: open, read metadata, close. (One-time on
    --  load; the chosen backend reopens the file to stream tensor data.)
@@ -77,7 +79,7 @@ package body LLM_Engine is
       end loop;
       raise Model_Load_Error with
         "unsupported architecture '" & Arch
-        & "' (supported: qwen35moe, qwen2, gemma4, llama)";
+        & "' (supported: qwen35moe, qwen35, qwen2, gemma4, llama)";
    end Load;
 
    procedure Unload (E : in out Engine) is

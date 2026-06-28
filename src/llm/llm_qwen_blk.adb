@@ -8,6 +8,16 @@ package body LLM_Qwen_Blk is
 
    use LLM_Tensor;
 
+   --  Dispatch the post-attention FFN: routed MoE or dense SwiGLU.
+   function FFN (B : Qwen_Block; X : Tensor) return Tensor is
+   begin
+      if B.Is_MoE then
+         return LLM_MoE.Forward (B.MoE, X);
+      else
+         return LLM_Dense_FFN.Forward (B.Dense, X);
+      end if;
+   end FFN;
+
    function Forward (B : Qwen_Block; X : Tensor) return Tensor is
       Seq : constant Integer := Shape (X) (1);
       Dim : constant Integer := B.Dim;
@@ -59,7 +69,7 @@ package body LLM_Qwen_Blk is
          declare
             NR      : constant Tensor :=
               LLM_RMSNorm.Forward (Row (H, T), B.Post_Attn_Norm_W);
-            Moe_Row : constant Tensor := LLM_MoE.Forward (B.MoE, NR);
+            Moe_Row : constant Tensor := FFN (B, NR);
          begin
             for I in 1 .. Dim loop
                Set (H, [T, I], Get (H, [T, I]) + Get_Flat (Moe_Row, I));
@@ -107,7 +117,7 @@ package body LLM_Qwen_Blk is
       --  Step 2: post-attention RMSNorm + MoE + residual.
       declare
          NR      : constant Tensor := LLM_RMSNorm.Forward (H, B.Post_Attn_Norm_W);
-         Moe_Row : constant Tensor := LLM_MoE.Forward (B.MoE, NR);
+         Moe_Row : constant Tensor := FFN (B, NR);
       begin
          for I in 1 .. Dim loop
             Set_Flat (H, I, Get_Flat (H, I) + Get_Flat (Moe_Row, I));
