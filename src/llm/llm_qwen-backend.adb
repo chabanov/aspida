@@ -17,7 +17,7 @@ package body LLM_Qwen.Backend is
    overriding function Vocab_Size  (M : Qwen_Backend) return Integer
      is (LLM_Qwen.Vocab_Size (M.Model));
    overriding function Arch_Name   (M : Qwen_Backend) return String
-     is ("qwen35moe");
+     is (LLM_Qwen.Arch_Name (M.Model));
    overriding function Dim         (M : Qwen_Backend) return Integer
      is (LLM_Qwen.Dim (M.Model));
    overriding function Block_Count (M : Qwen_Backend) return Integer

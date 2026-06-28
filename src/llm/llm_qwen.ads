@@ -100,6 +100,8 @@ package LLM_Qwen is
    function Context_Len (M : Qwen_Model) return Integer;
    function Dim (M : Qwen_Model) return Integer;
    function Block_Count (M : Qwen_Model) return Integer;
+   --  general.architecture this model was loaded as (qwen35moe / qwen35 / qwen2).
+   function Arch_Name (M : Qwen_Model) return String;
 
 private
 
@@ -122,6 +124,7 @@ private
       Eos_Id       : Integer := -1;
       Im_Start_Id  : Integer := -1;
       Im_End_Id    : Integer := -1;
+      Arch         : Ada.Strings.Unbounded.Unbounded_String;
    end record;
 
    function "=" (Left, Right : Qwen_Model) return Boolean;

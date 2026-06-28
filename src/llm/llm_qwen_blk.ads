@@ -9,6 +9,7 @@
 
 with LLM_Tensor;
 with LLM_MoE;
+with LLM_Dense_FFN;
 with LLM_FullAttn;
 with LLM_DeltaNet_Blk;
 
@@ -18,7 +19,11 @@ package LLM_Qwen_Blk is
       Is_Full_Attn     : Boolean := False;
       Full             : LLM_FullAttn.Full_Attn_Layer;       -- if Is_Full_Attn
       DNet             : LLM_DeltaNet_Blk.DeltaNet_Layer;    -- otherwise
-      MoE              : LLM_MoE.MoE_Layer;
+      --  FFN: routed experts (qwen35moe) when Is_MoE, else a single dense
+      --  SwiGLU MLP (qwen35 dense). Exactly one of MoE / Dense is populated.
+      Is_MoE           : Boolean := True;
+      MoE              : LLM_MoE.MoE_Layer;                   -- if Is_MoE
+      Dense            : LLM_Dense_FFN.Dense_FFN_Layer;       -- otherwise
       Attn_Norm_W      : LLM_Tensor.Tensor;
       Post_Attn_Norm_W : LLM_Tensor.Tensor;
       Dim              : Integer := 0;

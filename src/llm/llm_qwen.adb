@@ -14,6 +14,7 @@ with LLM_GGUF;    use LLM_GGUF;
 with LLM_Dequant; use LLM_Dequant;
 with LLM_Tensor;  use LLM_Tensor;
 with LLM_MoE;
+with LLM_Dense_FFN;
 with LLM_Step_Lock;
 with LLM_RMSNorm;
 with LLM_FullAttn;
@@ -50,7 +51,8 @@ package body LLM_Qwen is
       M    : Qwen_Model;
       Dim  : Integer := 2048;
       N_Layers : Integer := 36;
-      N_Experts     : Integer := 256;   -- GGUF override below; Qwen-3.5 default
+      N_Experts     : Integer := 256;   -- GGUF override below; Qwen-3.5 MoE default
+      Is_Dense      : Boolean := False;  -- no expert_count key => dense SwiGLU FFN
       Full_Interval : Integer := 4;     -- full-attn every Nth layer (L mod N = N-1)
       RoPE_Dim      : Integer := 64;            -- rope dimension count
       RoPE_Base     : Float   := 10_000_000.0;  -- rope frequency base
@@ -103,22 +105,28 @@ package body LLM_Qwen is
       declare
          Arch : constant String := Metadata (G, "general.architecture");
       begin
-         if Arch /= "qwen35moe" and then Arch /= "qwen2" then
+         if Arch /= "qwen35moe" and then Arch /= "qwen35"
+           and then Arch /= "qwen2"
+         then
             raise Model_Load_Error with
               "unsupported architecture '" & Arch
-              & "' — this backend supports qwen35moe and qwen2";
+              & "' — this backend supports qwen35moe, qwen35 and qwen2";
          end if;
+         M.Arch := To_Unbounded_String (Arch);
       end;
 
       -- Read config from metadata (try qwen35moe.* first, fallback to qwen2.*)
       declare
          function Read_Meta_Int (Key : String) return Integer is
-            Val : constant String := Metadata (G, "qwen35moe." & Key);
+            V_Moe : constant String := Metadata (G, "qwen35moe." & Key);
+            V_Q35 : constant String := Metadata (G, "qwen35." & Key);
          begin
-            if Val /= "" then
-               return Integer'Value (Val);
+            -- Prefix chain: qwen35moe. -> qwen35. -> qwen2.
+            if V_Moe /= "" then
+               return Integer'Value (V_Moe);
+            elsif V_Q35 /= "" then
+               return Integer'Value (V_Q35);
             end if;
-            -- Fallback: try qwen2 prefix
             return Integer'Value (Metadata (G, "qwen2." & Key));
          end Read_Meta_Int;
       begin
@@ -157,22 +165,35 @@ package body LLM_Qwen is
       --  from GGUF metadata when present, else keep the known Qwen-3.5 default,
       --  so the bundled model is byte-identical while other configs work.
       declare
+         --  Look up Key under qwen35moe. then qwen35. (empty if neither).
+         function Meta (Key : String) return String is
+            V_Moe : constant String := Metadata (G, "qwen35moe." & Key);
+         begin
+            return (if V_Moe /= "" then V_Moe
+                    else Metadata (G, "qwen35." & Key));
+         end Meta;
          function Meta_Int (Key : String; Default : Integer) return Integer is
-            V : constant String := Metadata (G, "qwen35moe." & Key);
+            V : constant String := Meta (Key);
          begin
             return (if V = "" then Default else Integer'Value (V));
          exception
             when others => return Default;
          end;
          function Meta_Float (Key : String; Default : Float) return Float is
-            V : constant String := Metadata (G, "qwen35moe." & Key);
+            V : constant String := Meta (Key);
          begin
             return (if V = "" then Default else Float'Value (V));
          exception
             when others => return Default;
          end;
       begin
-         N_Experts := Meta_Int ("expert_count", N_Experts);
+         --  Dense vs MoE is decided by the presence of expert_count: absent
+         --  (sentinel -1) => dense SwiGLU FFN (qwen35); present and > 0 => MoE.
+         N_Experts := Meta_Int ("expert_count", -1);
+         Is_Dense  := N_Experts <= 0;
+         if Is_Dense then
+            N_Experts := 0;
+         end if;
          Full_Interval :=
            Meta_Int ("attention.full_attention_interval", Full_Interval);
          if Full_Interval < 1 then
@@ -186,7 +207,8 @@ package body LLM_Qwen is
       end;
       Ada.Text_IO.Put_Line ("  rope: dim=" & Img (RoPE_Dim)
         & " base=" & Float'Image (RoPE_Base)
-        & " experts=" & Img (N_Experts)
+        & (if Is_Dense then " ffn=dense"
+           else " experts=" & Img (N_Experts))
         & " full_attn_every=" & Img (Full_Interval));
 
       -- Allocate block array
@@ -257,17 +279,26 @@ package body LLM_Qwen is
                   LQ (Pre & "attn_gate.weight"));
             end if;
 
-            --  MoE FFN on every block.
-            Blk.MoE := LLM_MoE.Create_MoE
-              (LQ (Pre & "ffn_gate_inp.weight"),
-               LQ (Pre & "ffn_gate_exps.weight"),
-               LQ (Pre & "ffn_up_exps.weight"),
-               LQ (Pre & "ffn_down_exps.weight"),
-               LQ (Pre & "ffn_gate_shexp.weight"),
-               LQ (Pre & "ffn_up_shexp.weight"),
-               LQ (Pre & "ffn_down_shexp.weight"),
-               L  (Pre & "ffn_gate_inp_shexp.weight"),
-               N_Experts);
+            --  FFN on every block: dense SwiGLU (qwen35) or routed MoE
+            --  (qwen35moe). Decided once at load from expert_count presence.
+            Blk.Is_MoE := not Is_Dense;
+            if Is_Dense then
+               Blk.Dense := LLM_Dense_FFN.Create
+                 (LQ (Pre & "ffn_gate.weight"),
+                  LQ (Pre & "ffn_up.weight"),
+                  LQ (Pre & "ffn_down.weight"));
+            else
+               Blk.MoE := LLM_MoE.Create_MoE
+                 (LQ (Pre & "ffn_gate_inp.weight"),
+                  LQ (Pre & "ffn_gate_exps.weight"),
+                  LQ (Pre & "ffn_up_exps.weight"),
+                  LQ (Pre & "ffn_down_exps.weight"),
+                  LQ (Pre & "ffn_gate_shexp.weight"),
+                  LQ (Pre & "ffn_up_shexp.weight"),
+                  LQ (Pre & "ffn_down_shexp.weight"),
+                  L  (Pre & "ffn_gate_inp_shexp.weight"),
+                  N_Experts);
+            end if;
 
             M.Blocks (I + 1) := new LLM_Qwen_Blk.Qwen_Block'(Blk);
          end;
@@ -320,7 +351,10 @@ package body LLM_Qwen is
                --  no bytes (Free_Bytes is idempotent on an empty weight).
                LLM_FullAttn.Free (M.Blocks (I).Full);
                LLM_DeltaNet_Blk.Free (M.Blocks (I).DNet);
+               --  Free whichever FFN this block carries (the other holds no
+               --  bytes; Free is idempotent on an empty layer).
                LLM_MoE.Free (M.Blocks (I).MoE);
+               LLM_Dense_FFN.Free (M.Blocks (I).Dense);
                --  Attn_Norm_W / Post_Attn_Norm_W are controlled Tensors,
                --  finalized when the block record is deallocated next.
                Free_Block (M.Blocks (I));
@@ -733,14 +767,20 @@ package body LLM_Qwen is
                       + Safe_N (B.DNet.Norm_W) + LLM_Weight.Count (B.DNet.Out_W)
                       + LLM_Weight.Count (B.DNet.Gate_W);
             end if;
-            C := C + LLM_Weight.Count (B.MoE.Gate_Inp_W)
-                    + LLM_Weight.Count (B.MoE.Gate_Exp_W)
-                    + LLM_Weight.Count (B.MoE.Up_W)
-                    + LLM_Weight.Count (B.MoE.Down_W)
-                    + LLM_Weight.Count (B.MoE.Shexp_Gate_W)
-                    + LLM_Weight.Count (B.MoE.Shexp_Up_W)
-                    + LLM_Weight.Count (B.MoE.Shexp_Down_W)
-                    + Safe_N (B.MoE.Shexp_Gate_Inp_W);
+            if B.Is_MoE then
+               C := C + LLM_Weight.Count (B.MoE.Gate_Inp_W)
+                       + LLM_Weight.Count (B.MoE.Gate_Exp_W)
+                       + LLM_Weight.Count (B.MoE.Up_W)
+                       + LLM_Weight.Count (B.MoE.Down_W)
+                       + LLM_Weight.Count (B.MoE.Shexp_Gate_W)
+                       + LLM_Weight.Count (B.MoE.Shexp_Up_W)
+                       + LLM_Weight.Count (B.MoE.Shexp_Down_W)
+                       + Safe_N (B.MoE.Shexp_Gate_Inp_W);
+            else
+               C := C + LLM_Weight.Count (B.Dense.Gate_W)
+                       + LLM_Weight.Count (B.Dense.Up_W)
+                       + LLM_Weight.Count (B.Dense.Down_W);
+            end if;
          end;
       end loop;
       return C;
@@ -750,5 +790,7 @@ package body LLM_Qwen is
    function Context_Len (M : Qwen_Model) return Integer is (M.Ctx_Len);
    function Dim         (M : Qwen_Model) return Integer is (M.Model_Dim);
    function Block_Count (M : Qwen_Model) return Integer is (M.N_Blocks);
+   function Arch_Name   (M : Qwen_Model) return String is
+     (To_String (M.Arch));
 
 end LLM_Qwen;
