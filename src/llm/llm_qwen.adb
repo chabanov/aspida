@@ -21,10 +21,31 @@ with LLM_FullAttn;
 with LLM_DeltaNet_Blk;
 with LLM_RoPE;
 with LLM_Weight;
+with LLM_Chat_Parser;
 
 package body LLM_Qwen is
 
    use Ada.Strings.Fixed;
+
+   --  Default Chat_Sink.Emit / Tick forward to On_Text so a sink that
+   --  overrides only On_Text still receives text pieces (legacy Token_Sink
+   --  compatibility). The chat layer routes reasoning/tools via their
+   --  dedicated callbacks, never Emit.
+   overriding procedure Emit (S : in out Chat_Sink; Piece : String) is
+   begin
+      On_Text (S, Piece);
+   end Emit;
+
+   overriding procedure Tick (S : in out Chat_Sink) is
+   begin
+      null;
+   end Tick;
+
+   function New_Null_Sink return Null_Sink_Access is
+      Result : constant Null_Sink_Access := new Null_Sink;
+   begin
+      return Result;
+   end New_Null_Sink;
 
    --  Debug: dump residual-stream norm per layer when LLM_DEBUG_NORMS is set.
    Debug_Norms : constant Boolean :=
@@ -572,6 +593,20 @@ package body LLM_Qwen is
       end if;
 
       for Step in 1 .. Max_New_Tokens loop
+         --  Min-token floor: while fewer than Min_Tokens have been produced,
+         --  drive the stop-token logits to -inf so the sampler cannot draw
+         --  them. This defeats the "im_end on the very first token" pathology
+         --  (some Qwen3 reasoning fine-tunes emit 0-token answers on certain
+         --  prompts). Last_Logits is a fresh tensor each step (from Decode),
+         --  so mutating it here corrupts no cached state.
+         if Params.Min_Tokens > 0 and then Produced < Params.Min_Tokens then
+            if Stop1 >= 0 then
+               Set_Flat (Last_Logits, Stop1 + 1, -1.0e30);
+            end if;
+            if Stop2 >= 0 and then Stop2 /= Stop1 then
+               Set_Flat (Last_Logits, Stop2 + 1, -1.0e30);
+            end if;
+         end if;
          declare
             Win : constant Natural :=
               Integer'Min (N_Hist, Integer'Max (0, Params.Repeat_Last_N));
@@ -618,44 +653,8 @@ package body LLM_Qwen is
       return Prompt & Decode_Tokens (M, Ids, Max_New_Tokens, -1, -1, Sink);
    end Generate;
 
-   --  Drop a leading <think>...</think> reasoning block and any whitespace
-   --  before the answer; if the block never closed (ran past the budget),
-   --  keep the raw text so nothing is silently lost.
-   function Strip_Think (S : String) return String is
-      Close_Tag : constant String := "</think>";
-      Idx       : constant Natural := Index (S, Close_Tag);
-      First     : Integer;
-   begin
-      if Idx = 0 then
-         return S;
-      end if;
-      First := Idx + Close_Tag'Length;
-      while First <= S'Last
-        and then (S (First) = ' ' or else S (First) = ASCII.LF
-                  or else S (First) = ASCII.CR or else S (First) = ASCII.HT)
-      loop
-         First := First + 1;
-      end loop;
-      return S (First .. S'Last);
-   end Strip_Think;
-
    function One (Id : Integer) return LLM_Tokenizer.Token_Array is
      [1 => Id];
-
-   --  A control marker resolved to its single special-token id if the vocab
-   --  has one, else its byte-BPE pieces — works whether <think> etc. are
-   --  special tokens or plain text.
-   function Marker (M : Qwen_Model; Piece : String)
-      return LLM_Tokenizer.Token_Array
-   is
-      Id : constant Integer := LLM_Tokenizer.Token_To_Id (M.Tok, Piece);
-   begin
-      if Id >= 0 then
-         return One (Id);
-      else
-         return LLM_Tokenizer.Encode (M.Tok, Piece);
-      end if;
-   end Marker;
 
    function Role_Str (R : Role_Kind) return String is
      (case R is when Role_System => "system", when Role_User => "user",
@@ -690,50 +689,138 @@ package body LLM_Qwen is
       end if;
    end Conv_Ids;
 
-   function Chat
+   --  Structured chat internal: build the prompt, generate raw pieces,
+   --  drive the FSM parser, and return the assembled Chat_Result. Used by
+   --  both the streaming (with Chat_Sink) and non-streaming variants.
+   function Chat_Raw
      (M : Qwen_Model; Conversation : Message_Array;
-      Max_New_Tokens : Integer := 256;
-      Sink : access Token_Sink'Class := null;
-      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
-      Stats : access Gen_Stats := null) return String
+      Max_New_Tokens : Integer;
+      Sink : access Chat_Sink'Class;
+      Params : LLM_Sampler.Params;
+      Stats : access Gen_Stats) return Chat_Result
    is
-      LF : constant String := [1 => ASCII.LF];
-      use type LLM_Tokenizer.Token_Array;
+      LF     : constant String := [1 => ASCII.LF];
+      P      : LLM_Chat_Parser.Parser := LLM_Chat_Parser.New_Parser;
+      Nullish : constant Null_Sink_Access := New_Null_Sink;
+      function Resolve_Sink return access Chat_Sink'Class is
+      begin
+         if Sink /= null then
+            return Sink;
+         else
+            return Nullish.all'Access;
+         end if;
+      end Resolve_Sink;
+      SinkRef : constant access Chat_Sink'Class := Resolve_Sink;
    begin
-      --  Fall back to raw generation if the model has no ChatML tokens.
+      --  Fall back to raw generation when the model has no ChatML tokens.
       if M.Im_Start_Id < 0 or else M.Im_End_Id < 0 then
-         return Generate
-           (M, To_String (Conversation (Conversation'Last).Text),
-            Max_New_Tokens, Sink);
+         declare
+            Last : constant Unbounded_String :=
+              Conversation (Conversation'Last).Text;
+            Raw  : constant String :=
+              Generate (M, To_String (Last), Max_New_Tokens, null);
+         begin
+            LLM_Chat_Parser.Feed (P, Raw, SinkRef);
+            LLM_Chat_Parser.Finalize (P, SinkRef);
+            declare
+               NC : constant Natural := LLM_Chat_Parser.N_Tool_Calls (P);
+            begin
+               return R : Chat_Result (NC) do
+                  R.Reasoning := To_Unbounded_String
+                    (LLM_Chat_Parser.Reasoning_Of (P));
+                  R.Answer    := To_Unbounded_String
+                    (LLM_Chat_Parser.Answer_Of (P));
+                  R.Finish    := To_Unbounded_String
+                    (LLM_Chat_Parser.Finish_Of (P));
+                  declare
+                     Parsed : constant LLM_Chat_Parser.Tool_Call_Array :=
+                       LLM_Chat_Parser.Tool_Calls_Of (P);
+                  begin
+                     for I in 1 .. NC loop
+                        R.Tool_Calls (I) :=
+                          (Id           => Parsed (I).Id,
+                           Name         => Parsed (I).Name,
+                           Arguments_JS => Parsed (I).Arguments_JS);
+                     end loop;
+                  end;
+               end return;
+            end;
+         end;
       end if;
 
-      --  Full transcript, then the assistant turn with thinking disabled
-      --  (empty <think></think> — Qwen3 enable_thinking=False convention).
       declare
+         use type LLM_Tokenizer.Token_Array;
+         --  Prefill only the assistant turn opener. Do NOT prefill any
+         --  reasoning marker: the chat parser starts in S_Idle and detects
+         --  the reasoning opener (canonical ąd OR Hura's bare "think") in
+         --  the GENERATED stream, using a balance counter where the first
+         --  occurrence opens and the second closes a region. Prefilling an
+         --  opener puts it in the prompt (not the generated stream), so the
+         --  parser never sees it and the balance is thrown off. The earlier
+         --  code prefilled "think\n\nthink\n\n" (open+close of an EMPTY
+         --  block): that suppressed reasoning and primed the model with the
+         --  literal word "think" repeated, which made Hura loop on
+         --  "think\n…" or emit EOS immediately on prompts such as the UA
+         --  recursion question (greedy, with a system prompt -> 0 tokens).
+         --  Letting the model emit its own tags restores reasoning and fixes
+         --  the degenerate stops.
          Ids : constant LLM_Tokenizer.Token_Array :=
            Conv_Ids (M, Conversation, Conversation'First)
            & One (M.Im_Start_Id)
-           & LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
-           & Marker (M, "<think>")
-           & LLM_Tokenizer.Encode (M.Tok, LF & LF)
-           & Marker (M, "</think>")
-           & LLM_Tokenizer.Encode (M.Tok, LF & LF);
+           & LLM_Tokenizer.Encode (M.Tok, "assistant" & LF);
          Raw : constant String :=
            Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id,
-                          Sink, Params, Stats);
+                          null, Params, Stats);
       begin
-         return Strip_Think (Raw);
+         LLM_Chat_Parser.Feed (P, Raw, SinkRef);
+         LLM_Chat_Parser.Finalize (P, SinkRef);
+         declare
+            NC : constant Natural := LLM_Chat_Parser.N_Tool_Calls (P);
+         begin
+            return R : Chat_Result (NC) do
+               R.Reasoning := To_Unbounded_String
+                 (LLM_Chat_Parser.Reasoning_Of (P));
+               R.Answer    := To_Unbounded_String
+                 (LLM_Chat_Parser.Answer_Of (P));
+               R.Finish    := To_Unbounded_String
+                 (LLM_Chat_Parser.Finish_Of (P));
+               declare
+                  Parsed : constant LLM_Chat_Parser.Tool_Call_Array :=
+                    LLM_Chat_Parser.Tool_Calls_Of (P);
+               begin
+                  for I in 1 .. NC loop
+                     R.Tool_Calls (I) :=
+                       (Id           => Parsed (I).Id,
+                        Name         => Parsed (I).Name,
+                        Arguments_JS => Parsed (I).Arguments_JS);
+                  end loop;
+               end;
+            end return;
+         end;
       end;
-   end Chat;
+   end Chat_Raw;
 
+   --  Non-streaming Chat: returns Chat_Result directly. No sink events.
    function Chat
-     (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256;
-      Sink : access Token_Sink'Class := null) return String
+     (M : Qwen_Model; Conversation : Message_Array;
+      Max_New_Tokens : Integer := 256;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access Gen_Stats := null) return Chat_Result
    is
    begin
-      return Chat
-        (M, Message_Array'(1 => (Role_User, To_Unbounded_String (User))),
-         Max_New_Tokens, Sink);
+      return Chat_Raw (M, Conversation, Max_New_Tokens, null, Params, Stats);
+   end Chat;
+
+   --  Streaming Chat: Chat_Sink callbacks fire as the parser walks the
+   --  model's raw output. Returns the same Chat_Result for convenience.
+   function Chat
+     (M : Qwen_Model; Conversation : Message_Array;
+      Max_New_Tokens : Integer := 256;
+      Sink : access Chat_Sink'Class := null;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access Gen_Stats := null) return Chat_Result is
+   begin
+      return Chat_Raw (M, Conversation, Max_New_Tokens, Sink, Params, Stats);
    end Chat;
 
    -- Parameter count (total FP32 params after dequantization)

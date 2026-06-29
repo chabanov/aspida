@@ -21,7 +21,9 @@ package body OpenAI is
    function Parse_Chat (Body_JSON : String) return Request is
       V : constant JSON.Value_Ref := JSON.Parse (Body_JSON);
       M : constant JSON.Value_Ref := JSON.Get (V, "messages");
+      T : constant JSON.Value_Ref := JSON.Get (V, "tools");
       N : constant Natural := JSON.Length (M);
+      Has_Tools : constant Boolean := JSON.Is_Array (T) and then JSON.Length (T) > 0;
    begin
       return R : Request (N) do
          for I in 1 .. N loop
@@ -50,11 +52,76 @@ package body OpenAI is
             R.Params.Repeat_Penalty :=
               1.0 + JSON.As_Float (JSON.Get (V, "frequency_penalty"), 0.0);
          end if;
+         if Has_Tools then
+            --  Synthesize a system prompt that lists every available function
+            --  and the exact XML block format Hura emits. The chat layer
+            --  then prepends this to the conversation. The format mirrors
+            --  Qwen3.5 / ChatML tool spec:
+            --
+            --    <tool_call>
+            --    <function=NAME>
+            --    <parameter=KEY>VALUE</parameter>
+            --    </function>
+            --    <tool_call>
+            --
+            declare
+               Acc : Unbounded_String :=
+                 Null_Unbounded_String & "# Tools" & ASCII.LF
+                 & "You may call one or more functions to assist with the user"
+                 & " query." & ASCII.LF & "Here are the available tools:" & ASCII.LF
+                 & ASCII.LF & "<tools>" & ASCII.LF;
+            begin
+               for I in 1 .. JSON.Length (T) loop
+                  declare
+                     Ti : constant JSON.Value_Ref := JSON.Item (T, I);
+                     F  : constant JSON.Value_Ref := JSON.Get (Ti, "function");
+                     Nm : constant String :=
+                       JSON.As_String (JSON.Get (F, "name"), "");
+                     Desc : constant String :=
+                       JSON.As_String (JSON.Get (F, "description"), "");
+                     Params : constant JSON.Value_Ref := JSON.Get (F, "parameters");
+                  begin
+                     if Nm /= "" then
+                        Acc := Acc & "{" & ASCII.LF
+                          & "  ""name"": """ & Nm & """,";
+                        if Desc /= "" then
+                           Acc := Acc & ASCII.LF
+                             & "  ""description"": """ & Desc & """,";
+                        end if;
+                        Acc := Acc & ASCII.LF
+                          & "  ""parameters"": "
+                          & JSON.To_String (Params) & ASCII.LF
+                          & "}" & ASCII.LF;
+                     end if;
+                  end;
+               end loop;
+               Acc := Acc & "</tools>" & ASCII.LF & ASCII.LF
+                 & "When you make a tool call, emit a tag and a body. Two equivalent forms are accepted:" & ASCII.LF
+                 & "  Form A (canonical):" & ASCII.LF
+                 & "    <tool_call>" & ASCII.LF
+                 & "    <function=NAME>" & ASCII.LF
+                 & "    <parameter=KEY>VALUE</parameter>" & ASCII.LF
+                 & "    </function>" & ASCII.LF
+                 & "    </tool_call>" & ASCII.LF
+                 & "  Form B (bare tags, line-aligned):" & ASCII.LF
+                 & "    tool_call" & ASCII.LF
+                 & "    <function=NAME>" & ASCII.LF
+                 & "    <parameter=KEY>VALUE</parameter>" & ASCII.LF
+                 & "    </function>" & ASCII.LF
+                 & "    tool_call" & ASCII.LF
+                 & "Pick Form A unless you were fine-tuned on Form B. In either form, output" & ASCII.LF
+                 & "the angle brackets literally and do NOT wrap in Markdown fences or code blocks." & ASCII.LF
+                 & "Otherwise answer normally. Do not make up parameter values." & ASCII.LF;
+               R.Tools_Sysmsg := Acc;
+            end;
+         end if;
       end return;
    end Parse_Chat;
 
    function Chat_Response
      (Model, Content : String;
+      Reasoning       : String := "";
+      Tool_Calls_JSON : String := "";   -- raw JSON array string; empty = none
       Prompt_Tokens, Completion_Tokens : Natural := 0;
       Finish : String := "stop") return String
    is
@@ -65,7 +132,26 @@ package body OpenAI is
       Usage   : constant JSON.Value_Ref := JSON.New_Object;
    begin
       JSON.Set (Msg, "role", JSON.Str ("assistant"));
-      JSON.Set (Msg, "content", JSON.Str (Content));
+      if Reasoning /= "" then
+         JSON.Set (Msg, "reasoning_content", JSON.Str (Reasoning));
+      end if;
+      if Tool_Calls_JSON /= "" then
+         --  When tools are emitted the assistant may have no `content` (the
+         --  model chose to act instead of talk). OpenAI convention: omit
+         --  the field rather than emit an empty string.
+         if Content /= "" then
+            JSON.Set (Msg, "content", JSON.Str (Content));
+         end if;
+         declare
+            Arr : constant JSON.Value_Ref := JSON.Parse (Tool_Calls_JSON);
+         begin
+            if JSON.Is_Array (Arr) then
+               JSON.Set (Msg, "tool_calls", Arr);
+            end if;
+         end;
+      else
+         JSON.Set (Msg, "content", JSON.Str (Content));
+      end if;
       JSON.Set (Choice, "index", JSON.Int (0));
       JSON.Set (Choice, "message", Msg);
       JSON.Set (Choice, "finish_reason", JSON.Str (Finish));
@@ -82,7 +168,9 @@ package body OpenAI is
       return JSON.To_String (Root);
    end Chat_Response;
 
-   function Chat_Chunk (Model, Piece : String; First : Boolean) return String is
+   function Chat_Chunk
+     (Model, Piece : String; First, Reason : Boolean) return String
+   is
       Root    : constant JSON.Value_Ref := JSON.New_Object;
       Choices : constant JSON.Value_Ref := JSON.New_Array;
       Choice  : constant JSON.Value_Ref := JSON.New_Object;
@@ -91,7 +179,11 @@ package body OpenAI is
       if First then
          JSON.Set (Delta_O, "role", JSON.Str ("assistant"));
       end if;
-      JSON.Set (Delta_O, "content", JSON.Str (Piece));
+      if Reason then
+         JSON.Set (Delta_O, "reasoning_content", JSON.Str (Piece));
+      else
+         JSON.Set (Delta_O, "content", JSON.Str (Piece));
+      end if;
       JSON.Set (Choice, "index", JSON.Int (0));
       JSON.Set (Choice, "delta", Delta_O);
       JSON.Set (Choice, "finish_reason", JSON.Null_Value);
@@ -102,6 +194,37 @@ package body OpenAI is
       JSON.Set (Root, "choices", Choices);
       return JSON.To_String (Root);
    end Chat_Chunk;
+
+   function Tool_Call_Chunk
+     (Model, Id, Name, Arguments : String) return String
+   is
+      Root    : constant JSON.Value_Ref := JSON.New_Object;
+      Choices : constant JSON.Value_Ref := JSON.New_Array;
+      Choice  : constant JSON.Value_Ref := JSON.New_Object;
+      Delta_O : constant JSON.Value_Ref := JSON.New_Object;
+      TC      : constant JSON.Value_Ref := JSON.New_Object;
+      Fn      : constant JSON.Value_Ref := JSON.New_Object;
+      Arr     : constant JSON.Value_Ref := JSON.New_Array;
+   begin
+      JSON.Set (Fn, "name", JSON.Str (Name));
+      JSON.Set (Fn, "arguments", JSON.Str (Arguments));
+      JSON.Set (TC, "index", JSON.Int (0));
+      JSON.Set (TC, "id", JSON.Str (Id));
+      JSON.Set (TC, "type", JSON.Str ("function"));
+      JSON.Set (TC, "function", Fn);
+      JSON.Append (Arr, TC);
+      JSON.Set (Delta_O, "role", JSON.Str ("assistant"));
+      JSON.Set (Delta_O, "tool_calls", Arr);
+      JSON.Set (Choice, "index", JSON.Int (0));
+      JSON.Set (Choice, "delta", Delta_O);
+      JSON.Set (Choice, "finish_reason", JSON.Null_Value);
+      JSON.Append (Choices, Choice);
+      JSON.Set (Root, "id", JSON.Str (ID_Str));
+      JSON.Set (Root, "object", JSON.Str ("chat.completion.chunk"));
+      JSON.Set (Root, "model", JSON.Str (Model));
+      JSON.Set (Root, "choices", Choices);
+      return JSON.To_String (Root);
+   end Tool_Call_Chunk;
 
    function Chat_Done_Chunk
      (Model : String;

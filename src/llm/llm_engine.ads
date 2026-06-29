@@ -41,9 +41,9 @@ package LLM_Engine is
    function Chat
      (E : Engine; Conversation : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
-      Sink : access LLM_Qwen.Token_Sink'Class := null;
+      Sink : access LLM_Qwen.Chat_Sink'Class := null;
       Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
-      Stats : access Gen_Stats := null) return String;
+      Stats : access Gen_Stats := null) return LLM_Qwen.Chat_Result;
 
    function Vocab_Size (E : Engine) return Integer;
    function Arch_Name  (E : Engine) return String;

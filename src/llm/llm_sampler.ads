@@ -22,6 +22,13 @@ package LLM_Sampler is
       Min_P          : Float    := 0.0;   -- > 0.0  => keep prob >= Min_P*p_max
       Repeat_Penalty : Float    := 1.0;   -- 1.0    => no penalty
       Repeat_Last_N  : Integer  := 64;    -- window of recent tokens penalised
+      --  Minimum tokens to generate before the stop/EOS token may be sampled.
+      --  The generation loop masks the stop-token logits to -inf until this
+      --  many tokens have been produced, so a model that assigns high
+      --  probability to im_end at the very first step (a pathology of some
+      --  Qwen3 reasoning fine-tunes on certain prompts, producing 0-token
+      --  answers) is forced to emit real content first. 0 => disabled.
+      Min_Tokens     : Integer  := 0;
       Seed           : Long_Long_Integer := 0;  -- 0 => fixed default seed
    end record;
 

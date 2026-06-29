@@ -15,6 +15,8 @@ with Ada.Text_IO;             use Ada.Text_IO;
 with Ada.Environment_Variables;
 with Ada.Streams;             use Ada.Streams;
 with Ada.Strings.Fixed;
+with Ada.Strings.Unbounded;
+with JSON; use JSON;
 with GNAT.Sockets;            use GNAT.Sockets;
 with Crypto;
 with Crypto.X25519;
@@ -333,8 +335,16 @@ begin
                --  React to the server's reply type: Tag_Resp = one JSON;
                --  Tag_Token... / Tag_Done = streaming (emit SSE).
                declare
-                  Streaming : Boolean := False;
-                  First     : Boolean := True;
+                  Streaming   : Boolean := False;
+                  First       : Boolean := True;
+                  --  Tracks which channel the next Tag_Token belongs to.
+                  --  Reason = reasoning_content (① block); false = content.
+                  In_Reasoning : Boolean := False;
+                  --  Cached finish_reason from Tag_Finish_Reason; used by
+                  --  Chat_Done_Chunk when Tag_Done arrives (Tag_Done carries
+                  --  only usage + length flag, not the finish reason itself).
+                  Finish_Reason : Ada.Strings.Unbounded.Unbounded_String :=
+                    Ada.Strings.Unbounded.To_Unbounded_String ("stop");
                begin
                   loop
                      declare
@@ -345,6 +355,48 @@ begin
                         if Rec (Rec'First) = Protocol.Tag_Resp then
                            Write_JSON (Client, "200 OK", Body_Of (Rec));
                            exit;
+                        elsif Rec (Rec'First) = Protocol.Tag_Reasoning_Begin then
+                           if not Streaming then
+                              Sock_Write (Client, "HTTP/1.1 200 OK" & CRLF
+                                & "Content-Type: text/event-stream" & CRLF
+                                & "Cache-Control: no-cache" & CRLF
+                                & "Access-Control-Allow-Origin: *" & CRLF
+                                & "Connection: close" & CRLF & CRLF);
+                              Streaming := True;
+                           end if;
+                           --  Opening a reasoning channel: from now on
+                           --  Tag_Token pieces populate delta.reasoning_content.
+                           In_Reasoning := True;
+                        elsif Rec (Rec'First) = Protocol.Tag_Tool_Call then
+                           if not Streaming then
+                              Sock_Write (Client, "HTTP/1.1 200 OK" & CRLF
+                                & "Content-Type: text/event-stream" & CRLF
+                                & "Cache-Control: no-cache" & CRLF
+                                & "Access-Control-Allow-Origin: *" & CRLF
+                                & "Connection: close" & CRLF & CRLF);
+                              Streaming := True;
+                           end if;
+                           declare
+                              JSON_Body : constant String := Body_Of (Rec);
+                              Idx       : constant JSON.Value_Ref :=
+                                (if JSON_Body'Length > 0
+                                 then JSON.Parse (JSON_Body)
+                                 else null);
+                           begin
+                              if Idx /= null
+                                and then JSON.Exists (JSON.Get (Idx, "id"))
+                                and then JSON.Exists (JSON.Get (Idx, "name"))
+                                and then JSON.Exists (JSON.Get (Idx, "arguments"))
+                              then
+                                 Sock_Write (Client, "data: "
+                                   & OpenAI.Tool_Call_Chunk
+                                       (Model_Name,
+                                        JSON.As_String (JSON.Get (Idx, "id")),
+                                        JSON.As_String (JSON.Get (Idx, "name")),
+                                        JSON.As_String (JSON.Get (Idx, "arguments")))
+                                   & CRLF & CRLF);
+                              end if;
+                           end;
                         elsif Rec (Rec'First) = Protocol.Tag_Token then
                            if not Streaming then
                               Sock_Write (Client, "HTTP/1.1 200 OK" & CRLF
@@ -355,17 +407,22 @@ begin
                               Streaming := True;
                            end if;
                            Sock_Write (Client, "data: "
-                             & OpenAI.Chat_Chunk (Model_Name, Body_Of (Rec), First)
+                             & OpenAI.Chat_Chunk
+                                 (Model_Name, Body_Of (Rec), First, In_Reasoning)
                              & CRLF & CRLF);
                            First := False;
+                           --  A reasoning block typically ends before the
+                           --  next event. The natural signal is the
+                           --  first non-reasoning Tag_Token; we treat the
+                           --  explicit Tag_Text_Begin marker as authoritative.
+                        elsif Rec (Rec'First) = Protocol.Tag_Text_Begin then
+                           In_Reasoning := False;
+                        elsif Rec (Rec'First) = Protocol.Tag_Finish_Reason then
+                           Finish_Reason :=
+                             Ada.Strings.Unbounded.To_Unbounded_String
+                               (Body_Of (Rec));
                         elsif Rec (Rec'First) = Protocol.Tag_Done then
                            if not Streaming then
-                              --  Empty reply: no Tag_Token was ever emitted, so
-                              --  the SSE headers were never written. Emit them
-                              --  now (plus a terminal [DONE]) so the HTTP client
-                              --  sees a well-formed 200 stream instead of a bare
-                              --  TCP close, which downstream parsers treat as an
-                              --  error/connection-drop.
                               Sock_Write (Client, "HTTP/1.1 200 OK" & CRLF
                                 & "Content-Type: text/event-stream" & CRLF
                                 & "Cache-Control: no-cache" & CRLF
@@ -378,11 +435,19 @@ begin
                               PT, CT : Natural;
                            begin
                               Parse_Done (Body_Of (Rec), Trunc, PT, CT);
-                              Sock_Write (Client, "data: "
-                                & OpenAI.Chat_Done_Chunk
-                                    (Model_Name, PT, CT,
-                                     (if Trunc then "length" else "stop"))
-                                & CRLF & CRLF);
+                              --  Honour the explicit finish_reason when
+                              --  present; otherwise map the truncated flag
+                              --  to "length".
+                              declare
+                                 Effective : constant String :=
+                                   (if Trunc then "length"
+                                    else Ada.Strings.Unbounded.To_String (Finish_Reason));
+                              begin
+                                 Sock_Write (Client, "data: "
+                                   & OpenAI.Chat_Done_Chunk
+                                       (Model_Name, PT, CT, Effective)
+                                   & CRLF & CRLF);
+                              end;
                            end;
                            Sock_Write (Client, "data: [DONE]" & CRLF & CRLF);
                            exit;
