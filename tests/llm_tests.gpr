@@ -27,7 +27,9 @@ project LLM_Tests is
                  "test_registry.adb",
                  "test_sampler.adb",
                  "test_kv_overflow.adb",
-                 "test_pool.adb");
+                 "test_pool.adb",
+                 "test_chat_parser.adb",
+                 "test_chat_tools_integration.adb");
 
    package Compiler is
       --  Use the shared strict (warnings-as-errors) switch set so the test

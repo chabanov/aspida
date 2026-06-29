@@ -47,6 +47,16 @@ GPRCLEAN    := $(GPRBUILD_BIN)/gprclean
 GNATPROVE   := $(firstword $(wildcard $(HOME)/.alire/bin/gnatprove) $(GNAT_BIN)/gnatprove)
 FORMATTER   := $(GNAT_BIN)/gnatpp
 
+# ── C ABI / libaspida.dylib ──────────────────────────────────────────
+# The GNAT driver and the Ada runtime (libgnat-15/libgnarl-15) live in the
+# toolchain's adalib dir. The shared-library link is done manually with the
+# gcc driver (gprbuild ignores package-Linker switches for library projects
+# on this platform, so its default -syslibroot hits the nonexistent
+# MacOSX14.sdk and fails to find -lSystem).
+GCC         := $(GNAT_BIN)/gcc
+ADALIB      := $(firstword $(wildcard $(dir $(GNAT_BIN))lib/gcc/*/1*/adalib))
+ASPIDA_LIB  := lib/aspida/libaspida.dylib
+
 # ── Flags ────────────────────────────────────────────────────────────
 # ARCH=portable drops -march=native (binaries run on any CPU); see shared.gpr.
 ARCH        ?= native
@@ -71,6 +81,31 @@ build: ## Build aspida CLI (debug)
 .PHONY: server
 server: ## Build the encrypted chat server + client (the ONLY chat path — no plaintext mode)
 	$(GPRBUILD) -P $(SECURE_GPR) $(GPR_FLAGS)
+
+.PHONY: lib
+lib: $(ASPIDA_LIB) ## Build libaspida.dylib (C ABI over the engine) for the native UI
+$(ASPIDA_LIB): $(wildcard src/llm/*.ad?) src/llm/aspida_capi.ads src/llm/aspida_capi.adb aspida_lib.gpr shared.gpr
+	@mkdir -p lib/aspida obj/aspida-lib
+	@# 1) Compile all units with gprbuild. The library-project *link* step is
+	@#    expected to fail on macOS (gprbuild won't honour -syslibroot here),
+	@#    so we capture its log and only fail if compilation produced no .o.
+	@log=$$(mktemp); MACOSX_DEPLOYMENT_TARGET=26.5 $(GPRBUILD) -P aspida_lib.gpr $(GPR_FLAGS) > $$log 2>&1; rc=$$?; \
+	if [ ! -f obj/aspida-lib/aspida_capi.o ]; then cat $$log; rm -f $$log; \
+	    echo "## gprbuild compile failed (rc=$$rc)"; exit 1; fi; rm -f $$log
+	@# 2) Link the shared library manually with the real SDK sysroot.
+	@MACOSX_DEPLOYMENT_TARGET=26.5 $(GCC) -dynamiclib obj/aspida-lib/*.o -o $(ASPIDA_LIB) \
+	    -Wl,-install_name,@rpath/libaspida.dylib \
+	    -Wl,-syslibroot,$(SDKROOT) \
+	    -L$(ADALIB) -lgnat -lgnarl
+	@echo "Built $(ASPIDA_LIB)  (deps: $$(otool -L $(ASPIDA_LIB) | tail -n +2 | tr -s ' ' | cut -d' ' -f1 | tr '\n' ' '))"
+
+.PHONY: smoke
+smoke: $(ASPIDA_LIB) ## Build + run the C-ABI smoke test (loads the default model; pass MODEL=...)
+	@cc tools/capi_smoke.c -Iinclude -Llib/aspida -laspida \
+	    -Wl,-rpath,@loader_path/lib/aspida -Wl,-rpath,$(ADALIB) \
+	    -Wl,-syslibroot,$(SDKROOT) -o ./capi_smoke
+	@./capi_smoke $(MODEL)
+	@rm -f ./capi_smoke
 
 .PHONY: serve
 serve: server ## Build + launch the server; model switches auto-reload (Ctrl-C to stop)

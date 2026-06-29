@@ -551,8 +551,9 @@ procedure Secure_Server is
             Tag : constant Crypto.U8 :=
               (if Req'Length >= 1 then Req (Req'First) else 0);
             Sink : aliased Encrypting_Sink.Enc_Sink :=
-              (LLM_Qwen.Token_Sink with
-                 Ch => Ch'Unchecked_Access, T => ST'Unchecked_Access);
+              (LLM_Qwen.Chat_Sink with
+                 Ch => Ch'Unchecked_Access, T => ST'Unchecked_Access,
+                 In_Reasoning => False);
             Prompt : String (1 .. Integer'Max (0, Req'Length - 1));
 
             --  Frame Tag + text into one AEAD record and send it.
@@ -638,6 +639,13 @@ procedure Secure_Server is
                        Integer'Min (Integer'Max (1, Rq.Max_Tokens), Max_Reply_Tokens);
                      P       : LLM_Sampler.Params := Rq.Params;
                      St      : aliased LLM_Engine.Gen_Stats;
+                     --  When Tools_Sysmsg is set, prepend it as a Role_System
+                     --  message so the model learns the available functions.
+                     N_Msg     : constant Natural :=
+                       Rq.N + (if Length (Rq.Tools_Sysmsg) > 0 then 1 else 0);
+                     Conv      : LLM_Qwen.Message_Array (1 .. N_Msg);
+                     First_Idx : constant Positive :=
+                       (if Length (Rq.Tools_Sysmsg) > 0 then 2 else 1);
                      function Finish return String is
                        (if St.Truncated then "length" else "stop");
                   begin
@@ -645,15 +653,16 @@ procedure Secure_Server is
                         Send_Tagged (Protocol.Tag_Resp,
                           OpenAI.Error_Response ("messages required"));
                      else
+                        if First_Idx = 2 then
+                           Conv (1) := (LLM_Qwen.Role_System, Rq.Tools_Sysmsg);
+                        end if;
+                        Conv (First_Idx .. N_Msg) := Rq.Messages (1 .. Rq.N);
                         --  Never trust client params: clamp.
                         if P.Temperature < 0.0 then P.Temperature := 0.0;
                         elsif P.Temperature > 2.0 then P.Temperature := 2.0; end if;
                         if P.Top_P <= 0.0 or else P.Top_P > 1.0 then P.Top_P := 1.0; end if;
                         if P.Top_K < 0 then P.Top_K := 0; end if;
                         if P.Min_P < 0.0 or else P.Min_P > 1.0 then P.Min_P := 0.0; end if;
-                        --  Route to the requested model (multi-model serving):
-                        --  lease its engine (lazy-load up to the budget), or
-                        --  fail loud when it cannot be resolved / is not warm.
                         LLM_Registry.Acquire
                           (To_String (Rq.Model), Lse, Leased, LErr);
                         if not Leased then
@@ -663,8 +672,8 @@ procedure Secure_Server is
                         Infer_Lock.Acquire; Locked := True;
                         if Rq.Stream then
                            declare
-                              R : constant String := LLM_Engine.Chat
-                                (LLM_Registry.Engine_Of (Lse), Rq.Messages,
+                              R : constant LLM_Qwen.Chat_Result := LLM_Engine.Chat
+                                (LLM_Registry.Engine_Of (Lse), Conv,
                                  Eff_Max, Sink'Access, P, St'Access);
                               pragma Unreferenced (R);
                            begin null; end;
@@ -674,16 +683,14 @@ procedure Secure_Server is
                                 ("prompt exceeds the model context window",
                                  "context_length_exceeded"));
                            else
-                              --  Carry finish_reason + usage on the done record so
-                              --  the proxy emits a standards-correct final chunk.
                               Send_Tagged (Protocol.Tag_Done,
                                 Finish & St.Prompt_Tokens'Image
                                        & St.Completion_Tokens'Image);
                            end if;
                         else
                            declare
-                              R : constant String := LLM_Engine.Chat
-                                (LLM_Registry.Engine_Of (Lse), Rq.Messages,
+                              R : constant LLM_Qwen.Chat_Result := LLM_Engine.Chat
+                                (LLM_Registry.Engine_Of (Lse), Conv,
                                  Eff_Max, null, P, St'Access);
                            begin
                               Infer_Lock.Release; Locked := False;
@@ -692,12 +699,41 @@ procedure Secure_Server is
                                    ("prompt exceeds the model context window",
                                     "context_length_exceeded"));
                               else
-                                 Send_Tagged (Protocol.Tag_Resp,
-                                   OpenAI.Chat_Response
-                                     (To_String (Rq.Model), R,
-                                      Prompt_Tokens     => St.Prompt_Tokens,
-                                      Completion_Tokens => St.Completion_Tokens,
-                                      Finish            => Finish));
+                                 declare
+                                    TC_Str : Ada.Strings.Unbounded.Unbounded_String :=
+                                      Ada.Strings.Unbounded.Null_Unbounded_String;
+                                 begin
+                                    if R.Tool_Calls'Length > 0 then
+                                       TC_Str := TC_Str & "[";
+                                       for I in R.Tool_Calls'Range loop
+                                          if I > R.Tool_Calls'First then
+                                             TC_Str := TC_Str & ",";
+                                          end if;
+                                          TC_Str := TC_Str
+                                            & "{" & ASCII.LF
+                                            & "  ""id"": """ &
+                                               To_String (R.Tool_Calls (I).Id) & """," & ASCII.LF
+                                            & "  ""type"": ""function""," & ASCII.LF
+                                            & "  ""function"": {" & ASCII.LF
+                                            & "    ""name"": """ &
+                                               To_String (R.Tool_Calls (I).Name) & """," & ASCII.LF
+                                            & "    ""arguments"": """ &
+                                               To_String (R.Tool_Calls (I).Arguments_JS) & """" & ASCII.LF
+                                            & "  }" & ASCII.LF
+                                            & "}";
+                                       end loop;
+                                       TC_Str := TC_Str & "]";
+                                    end if;
+                                    Send_Tagged (Protocol.Tag_Resp,
+                                      OpenAI.Chat_Response
+                                        (To_String (Rq.Model),
+                                         To_String (R.Answer),
+                                         Reasoning       => To_String (R.Reasoning),
+                                         Tool_Calls_JSON => To_String (TC_Str),
+                                         Prompt_Tokens     => St.Prompt_Tokens,
+                                         Completion_Tokens => St.Completion_Tokens,
+                                         Finish            => Finish));
+                                 end;
                               end if;
                            end;
                         end if;
@@ -727,7 +763,7 @@ procedure Secure_Server is
                N    : constant Natural := Session_Store.Turn_Count (Store);
                Conv : LLM_Qwen.Message_Array (1 .. 2 * N + 1);
                Locked : Boolean := False;
-               R_Val  : Unbounded_String;
+               R     : LLM_Qwen.Chat_Result (0);
             begin
                for I in 1 .. N loop
                   Conv (2 * I - 1) := (LLM_Qwen.Role_User,
@@ -740,13 +776,12 @@ procedure Secure_Server is
 
                --  Only one generation runs at a time across all clients.
                Infer_Lock.Acquire; Locked := True;
-               R_Val := To_Unbounded_String
-                 (LLM_Engine.Chat
-                    (Model, Conv, Max_Reply_Tokens, Sink'Access, Sampler_Cfg));
+               R := LLM_Engine.Chat
+                    (Model, Conv, Max_Reply_Tokens, Sink'Access, Sampler_Cfg);
                Infer_Lock.Release; Locked := False;
 
                Secure_Channel.Send_Message (Ch, ST'Access, [0 => Protocol.Tag_Done]);
-               Session_Store.Append_Turn (Store, Prompt, To_String (R_Val));
+               Session_Store.Append_Turn (Store, Prompt, To_String (R.Answer));
             exception
                when others =>
                   if Locked then Infer_Lock.Release; end if;

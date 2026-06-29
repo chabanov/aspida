@@ -41,4 +41,15 @@ package Protocol is
    --  Streaming chat reuses Tag_Token (each piece = a chat.completion.chunk
    --  delta) terminated by Tag_Done.
 
+   --  Chat event sub-channels: emitted in-stream between Tag_Token text
+   --  pieces so the proxy can render reasoning_content / tool_calls without
+   --  trying to second-guess the chat-template parser. All are one-byte tag +
+   --  body; Tag_Finish_Reason and Tag_Tool_Call carry the full structured
+   --  payload (no incremental deltas needed — we only emit one Tag_Tool_Call
+   --  per assembled tool invocation).
+   Tag_Reasoning_Begin : constant Crypto.U8 := Character'Pos ('R'); -- S->C: opening a <think> block
+   Tag_Text_Begin      : constant Crypto.U8 := Character'Pos ('Z'); -- S->C: assistant text begins (after thinking/tools)
+   Tag_Tool_Call       : constant Crypto.U8 := Character'Pos ('T'); -- S->C: body = JSON {"id","name","arguments"}
+   Tag_Finish_Reason   : constant Crypto.U8 := Character'Pos ('F'); -- S->C: "stop" / "length" / "tool_calls"
+
 end Protocol;

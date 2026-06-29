@@ -51,11 +51,51 @@ package LLM_Qwen is
    procedure Emit (Sink : in out Token_Sink; Piece : String) is abstract;
    procedure Tick (Sink : in out Token_Sink) is null;
 
+   --  Structured chat sink: extends Token_Sink with the events Chat can emit
+   --  when its output contains reasoning blocks (OpenAI `reasoning_content`)
+   --  and/or tool-call XML blocks (`tool_c...tool_care_close` format).
+   --  Defaults are null so existing Token_Sink callers keep working; the
+   --  chat layer routes reasoning/tools via their dedicated callbacks,
+   --  never Emit.
+   --
+   --  Event ordering: Tick (prefill) → optional reasoning → optional tool
+   --  calls (in source order) → text → On_Finish_Reason. Each Tool_Call_Id
+   --  is unique within a single Chat call. On_Finish_Reason fires exactly
+   --  once at the end with "stop" / "length" / "tool_calls".
+   type Chat_Sink is abstract new Token_Sink with null record;
+   procedure On_Reasoning    (S : in out Chat_Sink; Piece : String) is null;
+   procedure On_Text         (S : in out Chat_Sink; Piece : String) is null;
+   procedure On_Tool_Call
+     (S : in out Chat_Sink;
+      Id            : String;
+      Name          : String;
+      Arguments_JS  : String) is null;
+   procedure On_Finish_Reason
+     (S : in out Chat_Sink; Reason : String) is null;
+   --  The default Emit forwards to On_Text so a sink that overrides only
+   --  On_Text still receives text pieces (legacy Token_Sink-style use).
+   overriding procedure Emit  (S : in out Chat_Sink; Piece : String);
+   overriding procedure Tick  (S : in out Chat_Sink);
+
+   --  Concrete empty sink used by the non-streaming Chat variant so the
+   --  FSM parser has a non-null `Sink` pointer to feed (the parser writes
+   --  no events because every callback is null — but it cannot dereference
+   --  a null access).  Reusable, never emits anything.
+   type Null_Sink is new Chat_Sink with null record;
+   type Null_Sink_Access is access all Null_Sink;
+   function New_Null_Sink return Null_Sink_Access;
+
+   --  A single assembled tool invocation the model asked for.
+   type Tool_Call is record
+      Id            : Ada.Strings.Unbounded.Unbounded_String;
+      Name          : Ada.Strings.Unbounded.Unbounded_String;
+      Arguments_JS  : Ada.Strings.Unbounded.Unbounded_String;
+   end record;
+   type Tool_Call_Array is array (Positive range <>) of Tool_Call;
+
    --  Per-generation accounting for OpenAI-standard usage + finish_reason.
    --  Truncated = generation stopped on the token/context cap, not a natural
-   --  end-of-turn token (=> finish_reason "length" rather than "stop"). Lives
-   --  here so every backend and the engine can share it (as with the other
-   --  conversation types) without a circular dependency on LLM_Backend.
+   --  end-of-turn token (=> finish_reason "length" rather than "stop").
    type Gen_Stats is record
       Prompt_Tokens     : Natural := 0;
       Completion_Tokens : Natural := 0;
@@ -63,21 +103,19 @@ package LLM_Qwen is
       Overflow          : Boolean := False;   -- request refused: prompt > window
    end record;
 
-   -- Generate text from prompt (raw completion; no chat template, no stop).
-   function Generate
-     (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128;
-      Sink : access Token_Sink'Class := null) return String;
-
-   -- Single-turn chat: wraps User in the Qwen ChatML template, generates the
-   -- assistant reply (stopping at <|im_end|>/EOS), and strips the model's
-   -- <think>...</think> reasoning. Returns just the assistant's answer.
-   function Chat
-     (M : Qwen_Model; User : String; Max_New_Tokens : Integer := 256;
-      Sink : access Token_Sink'Class := null) return String;
+   --  Result of a Chat call: the model can produce reasoning (exposed
+   --  separately), a final answer, and zero-or-more tool calls. In streaming
+   --  mode callers use the Chat_Sink events instead; the return value still
+   --  carries the full structured result for convenience.
+   type Chat_Result (N_Tool_Calls : Natural) is record
+      Reasoning  : Ada.Strings.Unbounded.Unbounded_String;
+      Answer     : Ada.Strings.Unbounded.Unbounded_String;
+      Finish     : Ada.Strings.Unbounded.Unbounded_String;
+      Tool_Calls : Tool_Call_Array (1 .. N_Tool_Calls);
+   end record;
 
    --  Multi-turn chat. Conversation is the full message history with the
-   --  current user message LAST (roles alternate user/assistant). Builds the
-   --  ChatML transcript so the model has the prior turns as context.
+   --  current user message LAST (roles alternate user/assistant).
    type Role_Kind is (Role_System, Role_User, Role_Assistant);
    type Message is record
       Role : Role_Kind;
@@ -85,12 +123,27 @@ package LLM_Qwen is
    end record;
    type Message_Array is array (Positive range <>) of Message;
 
+   -- Generate text from prompt (raw completion; no chat template, no stop).
+   function Generate
+     (M : Qwen_Model; Prompt : String; Max_New_Tokens : Integer := 128;
+      Sink : access Token_Sink'Class := null) return String;
+
+   -- Structured chat returning Chat_Result (non-streaming). When a chat
+   -- contains tool calls but no text, Finish = "tool_calls".
    function Chat
      (M : Qwen_Model; Conversation : Message_Array;
       Max_New_Tokens : Integer := 256;
-      Sink : access Token_Sink'Class := null;
       Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
-      Stats : access Gen_Stats := null) return String;
+      Stats : access Gen_Stats := null) return Chat_Result;
+
+   -- Streaming variant: Chat_Sink callbacks fire as the model emits each
+   -- piece. Returns the same Chat_Result.
+   function Chat
+     (M : Qwen_Model; Conversation : Message_Array;
+      Max_New_Tokens : Integer := 256;
+      Sink : access Chat_Sink'Class := null;
+      Params : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Stats : access Gen_Stats := null) return Chat_Result;
 
    -- Model params count (total, not activated)
    function Param_Count (M : Qwen_Model) return Long_Long_Integer;

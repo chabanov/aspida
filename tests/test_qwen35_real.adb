@@ -50,13 +50,13 @@ begin
            [1 => (LLM_Qwen.Role_User,
                   To_Unbounded_String
                     ("What is 2+2? Answer with just the number."))];
-         Out_Text : constant String :=
+         Out_Text : constant LLM_Qwen.Chat_Result :=
            LLM_Engine.Chat (E, Conv,
                             Max_New_Tokens => 32,
                             Params         => LLM_Sampler.Greedy);
       begin
          Put_Line ("--- generated (verbatim) ---");
-         Put_Line (Out_Text);
+         Put_Line (To_String (Out_Text.Answer));
          Put_Line ("--- end ---");
       end;
 

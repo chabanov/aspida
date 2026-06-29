@@ -2,7 +2,6 @@
 --  Model_Backend protocol (thin forwarding wrapper).
 with LLM_Backend;
 with LLM_Qwen;
-with LLM_Sampler;
 
 package LLM_Gemma.Backend is
 
@@ -14,9 +13,10 @@ package LLM_Gemma.Backend is
      (M              : Gemma_Backend;
       Conversation   : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
-      Sink           : access LLM_Qwen.Token_Sink'Class := null;
+      Sink           : access LLM_Qwen.Chat_Sink'Class := null;
       Params         : LLM_Sampler.Params := LLM_Sampler.Greedy;
-      Stats          : access LLM_Qwen.Gen_Stats := null) return String;
+      Stats          : access LLM_Qwen.Gen_Stats := null)
+      return LLM_Qwen.Chat_Result;
 
    overriding function Vocab_Size  (M : Gemma_Backend) return Integer;
    overriding function Arch_Name   (M : Gemma_Backend) return String;

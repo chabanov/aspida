@@ -1,0 +1,53 @@
+--  aspida_lib.gpr — libaspida.dylib: a C-ABI dynamic library over the engine.
+--
+--  Mirrors probe.gpr / gen.gpr (the proven minimal engine build — src/llm only,
+--  no crypto, no server) but emits a shared library instead of executables.
+--  The exported C surface lives in src/llm/aspida_capi.* and is compiled in
+--  automatically (Source_Dirs = src/llm).
+--
+--  Build:
+--    gprbuild -P aspida_lib.gpr -XSDKROOT=$(xcrun --show-sdk-path) \
+--             -XOS=darwin -XARCH=native
+--  Yields: lib/aspida/libaspida.dylib  (install_name @rpath/libaspida.dylib)
+--
+--  The install_name is pinned to @rpath so the dylib can be embedded in a
+--  macOS .app bundle at Contents/Frameworks/libaspida.dylib and resolved via
+--  the app's @loader_path/Frameworks rpath.
+
+with "shared.gpr";
+
+project Aspida_Lib is
+
+   for Library_Kind use "dynamic";
+   for Library_Name use "aspida";
+   for Library_Dir use "lib/aspida";
+   for Source_Dirs use ("src/llm");
+   for Object_Dir use "obj/aspida-lib";
+   for Languages use ("Ada");
+
+   --  Standalone library: gprbuild generates a binder elaboration
+   --  (b__aspida.adb) that runs every unit's elaboration in dependency order,
+   --  and Library_Auto_Init registers it as a dyld constructor so the Ada
+   --  runtime (soft-links, secondary-stack pool, environment task) is fully
+   --  initialised when the dylib is loaded by a foreign (C/Swift) host.
+   --  Without this, only the per-unit ___elabb/___elabs stubs are linked and
+   --  *never called*, so the secondary stack stays null and the first call
+   --  that returns an unconstrained String segfaults in SS_Mark.
+   for Library_Interface use ("Aspida_CAPI");
+   for Library_Auto_Init use "true";
+
+   package Compiler is
+      for Default_Switches ("Ada") use Shared.Ada_O3;
+   end Compiler;
+
+   package Linker is
+      for Default_Switches ("Ada") use
+        Shared.Linker_Switches &
+          ("-Wl,-install_name,@rpath/libaspida.dylib");
+   end Linker;
+
+   package Binder is
+      for Default_Switches ("Ada") use ("-E");
+   end Binder;
+
+end Aspida_Lib;

@@ -1,4 +1,20 @@
+with LLM_Sampler;
+with Ada.Strings.Unbounded;
+
 package body LLM_Llama.Backend is
+
+   --  Adapter sink: forwards every text piece to a Chat_Sink's On_Text
+   --  callback so a llama chat streams text into the same surface the
+   --  qwen backend uses. The On_Reasoning / On_Tool_Call callbacks are
+   --  unreachable for llama (which never emits chat-template XML), so
+   --  they are simply not called.
+   type Text_Adapter is new LLM_Qwen.Chat_Sink with record
+      Down : access LLM_Qwen.Chat_Sink'Class;
+   end record;
+   overriding procedure On_Text (S : in out Text_Adapter; Piece : String) is
+   begin
+      LLM_Qwen.On_Text (S.Down.all, Piece);
+   end On_Text;
 
    function Create (Path : String) return LLM_Backend.Backend_Access is
    begin
@@ -9,10 +25,32 @@ package body LLM_Llama.Backend is
      (M              : Llama_Backend;
       Conversation   : LLM_Qwen.Message_Array;
       Max_New_Tokens : Integer := 256;
-      Sink           : access LLM_Qwen.Token_Sink'Class := null;
+      Sink           : access LLM_Qwen.Chat_Sink'Class := null;
       Params         : LLM_Sampler.Params := LLM_Sampler.Greedy;
-      Stats          : access LLM_Qwen.Gen_Stats := null) return String
-   is (LLM_Llama.Chat (M.Model, Conversation, Max_New_Tokens, Sink, Params, Stats));
+      Stats          : access LLM_Qwen.Gen_Stats := null)
+      return LLM_Qwen.Chat_Result
+   is
+      --  'Unchecked_Access is safe: LLM_Llama.Chat uses the sink only
+      --  synchronously while generating and never retains the pointer, so
+      --  the local Adapter outlives every use. 'Access fails Ada's runtime
+      --  accessibility check (same as LLM_Gemma.Backend.Chat).
+      Adapter : aliased Text_Adapter := (Down => Sink);
+      Text    : constant String :=
+        (if Sink /= null then
+           LLM_Llama.Chat (M.Model, Conversation, Max_New_Tokens,
+                           Adapter'Unchecked_Access, Params, Stats)
+         else
+           LLM_Llama.Chat (M.Model, Conversation, Max_New_Tokens,
+                           null, Params, Stats));
+   begin
+      return R : LLM_Qwen.Chat_Result (0) do
+         R.Answer := Ada.Strings.Unbounded.To_Unbounded_String (Text);
+         R.Finish :=
+           Ada.Strings.Unbounded.To_Unbounded_String
+             ((if Stats /= null and then Stats.Truncated then "length"
+               else "stop"));
+      end return;
+   end Chat;
 
    overriding function Vocab_Size  (M : Llama_Backend) return Integer
      is (LLM_Llama.Vocab_Size (M.Model));
