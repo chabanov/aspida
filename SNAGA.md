@@ -38,18 +38,19 @@ src/
 │   ├── crypto-sha256.ads/adb    — Hash
 │   └── crypto-mem.ads/adb       — Secure zeroing
 │
-├── secure/        — Secure channel (6 файлів)
-│   ├── protocol.ads             — Wire protocol (Prompt/Token/Done)
-│   ├── secure_channel.ads/adb   — X25519 + ChaCha20-Poly1305
-│   └── encrypting_sink.ads/adb  — Streaming encryption
+├── secure/        — Transport + wire record tags (3 файли)
+│   ├── protocol.ads             — Wire record tags (Prompt/Token/Done)
+│   └── socket_transport.ads/adb — Raw TCP byte transport
 │
 ├── server/        — HTTP/WebSocket servers (10 файлів)
 │   ├── openai.ads/adb           — OpenAI API parser
 │   ├── openai_proxy.adb         — /v1/chat/completions endpoint
 │   ├── ws_bridge.adb            — WebSocket bridge for browsers
+│   ├── encrypting_sink.ads/adb  — Streaming encryption over the channel
 │   └── secure_server.adb        — Concurrent handler pool
 │
-├── session/       — Session management (4 файли)
+├── session/       — Session + secure channel (6 файлів)
+│   ├── secure_channel.ads/adb   — Noise-NK handshake + AEAD records (X25519 + ChaCha20-Poly1305)
 │   ├── session_store.ads/adb    — In-memory session cache
 │   └── at_rest.ads/adb          — At-rest encryption
 │
@@ -114,7 +115,7 @@ make clean              # Очистити build artifacts
 | `src/llm/llm_dequant.adb` | Q5_K/Q6_K dequant, QMatVec streaming |
 | `src/llm/llm_gpu.ads` | CUDA offload dispatch |
 | `src/server/openai_proxy.adb` | OpenAI API server |
-| `src/secure/secure_channel.ads` | Encrypted communication |
+| `src/session/secure_channel.ads` | Encrypted communication (Noise-NK handshake + AEAD records) |
 | `gpu/gpu_matvec.cu` | CUDA kernels for all 5 K-quants (Q2_K–Q6_K) |
 | `Makefile` | Build targets |
 | `server.gpr` | GNAT project file |

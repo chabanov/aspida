@@ -4,35 +4,46 @@
 [![Ada/SPARK](https://img.shields.io/badge/Language-Ada%2FSPARK-blue.svg)](https://ada-lang.io)
 [![GitHub](https://img.shields.io/github/stars/chabanov/aspida?style=social)](https://github.com/chabanov/aspida)
 
-**End-to-end encrypted LLM inference engine, built from scratch in Ada/SPARK.**
+**End-to-end encrypted LLM inference and training engine, built from scratch in Ada/SPARK.**
 
-Aspida is a high-performance LLM inference engine with its own GGUF parser, quantized weight kernels, and cryptographic stack — no third-party crypto or ML libraries. Prompts are sealed in the client and stay sealed across the network; only the inference boundary ever opens them.
+Aspida is a from-scratch LLM stack: its own GGUF parser, dequantization kernels, tokenizer, sampler, RoPE, KV cache, an encrypted client–server channel, and a training/distillation engine — no third-party crypto or ML libraries. A prompt is sealed in the client and stays sealed across the network; only the trusted inference boundary ever opens it. Conversation history is encrypted at rest with PBKDF2 + ChaCha20-Poly1305.
+
+The same engine serves Llama, Qwen (dense and MoE+SSM), and Gemma backends over a Noise-NK-style AEAD channel, exposes an OpenAI-compatible API, and is also available as a C-ABI dynamic library (`libaspida`) for in-process, no-network integration.
 
 ## Features
 
 - 🚀 **Native Performance** — Written in Ada/SPARK, compiled to native code
-- 🔐 **End-to-End Encryption** — X25519 key exchange + ChaCha20-Poly1305 AEAD
-- 🎯 **OpenAI-Compatible API** — Drop-in replacement for OpenAI SDKs
-- ⚡ **GPU Offload** — CUDA kernels for Q4_K/Q5_K/Q6_K quantization
-- 🧠 **Multiple Backends** — Qwen3.5-MoE+SSM, Llama 3.x, Gemma 4 (dense)
-- 📦 **GGUF Support** — Loads every standard ggml quant (Q2_K–Q6_K, Q4_0/Q5_0/Q8_0, F16/BF16); exports trained models to six formats
+- 🔐 **End-to-End Encryption** — X25519 key exchange + ChaCha20-Poly1305 AEAD, forward-secret per session
+- 🎯 **OpenAI-Compatible API** — Drop-in replacement for OpenAI SDKs (`/v1/chat/completions` + SSE streaming)
+- ⚡ **GPU Offload** — CUDA kernels for all five K-quants (Q2_K–Q6_K), loaded via `dlopen` with transparent CPU fallback (no link-time CUDA dependency)
+- 🧠 **Multiple Backends** — Llama 3.x / Mistral, Qwen3.5 (dense + MoE+SSM), Gemma 4 (dense) behind one unified API
+- 📦 **GGUF Support** — Reads 12 ggml formats (F32/F16/BF16, Q8_0/Q4_0/Q5_0, Q2_K–Q6_K, Q8_K); the trainer exports six (Q8_0/Q4_0/Q5_0/Q4_K/Q5_K/Q6_K) so a model trained here is served here
+- 🔧 **C ABI** — `libaspida.dylib` exposes the engine to foreign hosts (Swift/C) for in-process inference with no server and no network
 - 🔒 **SPARK-Verified Core** — ChaCha20, SHA-256, HKDF & PBKDF2 proved to AoRTE + functional contracts (`make prove`); flow analysis (init / data deps / non-aliasing) across the rest of the crypto library (`make prove-flow`). X25519, Poly1305 & AEAD remain on flow analysis pending field-arithmetic annotations.
 
 ## Supported Models
 
-| Architecture | Models | Quantization | Status |
-|--------------|--------|--------------|--------|
-| **Qwen3.5-MoE+SSM** | Qwen3.5-35B-A3B | Q5_K, Q8_K | ✅ Production |
-| **Llama 3.x** | Llama 3.1/3.2, Mistral | Q4_K, Q6_K | ✅ Production |
-| **Gemma 4 (dense)** | E4B, 12B, 26B | Q4_0, Q4_K, Q5_K | ✅ Validated¹ |
+Aspida dispatches on the GGUF `general.architecture` field through a one-row-per-architecture registry — any GGUF carrying a supported architecture loads without code changes. Quantization support is arch-independent: every backend reads all 12 ggml formats below.
 
-¹ Dense gemma4 (PLE *and* non-PLE/MQA paths) is greedy-decode bit-identical to llama.cpp on real E4B + 12B models. **MoE gemma4** (e.g. supergemma-26B, 128 routed experts) is **not supported** and is rejected at load with a clear error.
+| GGUF architecture | Backend | Model families | Status |
+|---|---|---|---|
+| `llama` | Dense Llama — GQA + RMSNorm + SwiGLU + NeoX RoPE | Llama 3.1 / 3.2, Mistral, and any dense GQA+RMSNorm+SwiGLU+RoPE model | ✅ Validated — Llama-3.2-1B (Q3_K_L) bit-correct vs llama.cpp; Llama-8B & 70B served on NVIDIA GPU |
+| `qwen2` | Qwen — dense path | Qwen2 0.5B / 1.5B / 7B | ✅ Supported (routed to the Qwen dense path) |
+| `qwen35` | Qwen — dense path | Qwen3.5 dense, Ornith-1.0-9B | ✅ Validated — Ornith-9B end-to-end via the C ABI (Swift bridge): reasoning/code prompts emit coherent multi-hundred-token turns |
+| `qwen35moe` | Qwen — MoE top-k router + shared expert + gated DeltaNet/SSM hybrid | Qwen3.5-MoE 35B-A3B | ✅ Validated — tensor shapes and hyperparameters verified against the real GGUF |
+| `gemma4` | Gemma — PLE + shared-KV + sliding-window attention + dual RoPE + logit softcap | Gemma 3n E4B, 12B, 26B (PLE and non-PLE/MQA variants) | ✅ Validated — greedy decode bit-identical to llama.cpp on real E4B + 12B models |
+
+**Quantization (read):** F32, F16, BF16, Q8_0, Q4_0, Q5_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K — 12 ggml formats, with fused decode+dot paths for all five K-quants. Unsupported types (IQ\*, ternary, Q4_1/Q5_1/Q8_1) are rejected at load with a clear error — never silently zero-filled.
+
+**Quantization (write):** the from-scratch trainer exports Q8_0, Q4_0, Q5_0, Q4_K, Q5_K, Q6_K — so a model trained in Aspida is served by Aspida.
+
+**Not supported (intentional):** MoE gemma4 (e.g. supergemma-26B, 128 routed experts) is rejected at load with a clear error; only the dense gemma4 path is implemented.
 
 ## Quick Start
 
 ### Prerequisites
 
-- GNAT Community 2021+ or GNAT Pro
+- Alire GNAT 15+ toolchain (the Makefile auto-detects it; the system GNAT is not used)
 - CUDA Toolkit 12+ (optional, for GPU offload)
 - Make, Git
 
@@ -46,8 +57,9 @@ cd aspida
 # Build the server
 make server
 
-# (Optional) Build CUDA kernels
-make gpu
+# (Optional) Build CUDA kernels — nvcc directly, not a Make target (see gpu/README.md)
+nvcc -O3 --fmad=false -arch=native -shared -Xcompiler -fPIC \
+     gpu/gpu_matvec.cu -o libaspidagpu.so   # then run with ASPIDA_GPU=1 + ASPIDA_GPU_LIB=…
 ```
 
 ### Run
@@ -101,8 +113,13 @@ carrying `finish_reason` + `usage`. Client `max_tokens` is honored.
 
 ### Example Request
 
+There are two client paths. **Both are end-to-end encrypted on the wire** — the difference is whether you want OpenAI-SDK compatibility (a same-machine loopback hop) or zero plaintext anywhere.
+
+**Path A — OpenAI-compatible proxy (use any OpenAI SDK).** You talk to a local proxy on `127.0.0.1`; it seals your request into the AEAD channel and relays it to the (possibly remote) server. The `http://` below is loopback-only on your own machine — it never touches the network. The network hop is encrypted.
+
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+# The proxy binds 127.0.0.1 only. The prompt is sealed before it leaves this machine.
+curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $ASPIDA_CLIENT_TOKEN" \
   -d '{
@@ -112,15 +129,26 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-> **Why `http://` and not `https://`?** The OpenAI-compatible endpoint is a
-> **local proxy** that binds `127.0.0.1` only. This hop is plaintext **on
-> loopback (the same machine)** — it never touches the network. The proxy then
-> seals every request into the AEAD-encrypted, pinned-key channel for the
-> **network** hop to the (possibly remote) server. So encryption is real and
-> end-to-end *on the wire*; the only plaintext is the same-machine loopback step
-> that exists for OpenAI-SDK compatibility. For full end-to-end with **no
-> plaintext anywhere** (the client performs the handshake itself), use the
-> native CLI (`secure_client`) or the browser client.
+```
+your app/SDK ──http(loopback, same machine)──► openai_proxy ──► AEAD-sealed channel ──► secure_server
+                                                  (X25519 handshake + ChaCha20-Poly1305 records, pinned server key)
+```
+
+**Path B — native client (no plaintext anywhere).** The client performs the Noise-NK handshake itself and seals the prompt before any bytes hit the socket; the server only decrypts inside the trusted inference boundary. No loopback hop, no proxy, no plaintext on any link.
+
+```bash
+make chat                       # native encrypted REPL (SESSION=<id> to resume)
+./obj/secure_client <host> <port>   # or call the binary directly
+```
+
+```
+native/browser client ──AEAD-sealed channel──► secure_server   (handshake done in the client; no plaintext on the wire)
+```
+
+> **Why does Path A use `http://`?** TLS would be redundant: the proxy binds
+> `127.0.0.1` only, so that hop never leaves your machine. The actual
+> network transit is handled by the AEAD-encrypted channel, not TLS. If you
+> want no same-machine plaintext hop at all, use Path B.
 
 ## Configuration
 
@@ -193,7 +221,7 @@ make prove
 - **Streaming matvec** — No full FP32 materialization, quantized weights stay quantized
 - **Fused K-quant kernels** — All five K-quants (Q2_K–Q6_K) decode+dot in one stack-local pass
 - **Thread pool** — Persistent workers avoid spawn/join overhead
-- **GPU kernels** — Block-level parallelism for Q4_K/Q5_K/Q6_K
+- **GPU kernels** — Block-level parallelism for all five K-quants (Q2_K–Q6_K), scalar / warp-per-row / warp-batched variants
 - **Stack allocation** — Hot-path decode uses stack-allocated blocks
 
 ## Roadmap
@@ -202,8 +230,9 @@ make prove
 - [x] Quantization-aware training (fake-quant + STE, demonstrated 2-bit robustness)
 - [x] Full GGML quant coverage — read all standard formats (Q2_K–Q6_K, Q4_0/Q5_0/Q8_0); export six formats from the trainer
 - [x] GPU kernels for Q2_K/Q3_K — CUDA matvec/matmul (kinds 3/4), validated on an L40S vs CPU reference (`gpu/test_matvec.cu`)
-- [ ] SSM selective scan (Mamba) — needs a Mamba GGUF reference
-- [ ] mRoPE positional encoding — only relevant for multimodal (image/video)
+- [x] mRoPE positional encoding — per-section rotation (`Apply_Sections`) implemented
+- [x] Gated DeltaNet/SSM hybrid — implemented in the Qwen MoE backend
+- [ ] Standalone Mamba selective-scan GGUF (separate from the DeltaNet/SSM hybrid above)
 - [ ] Multi-GPU support
 
 ## Contributing
