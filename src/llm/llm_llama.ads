@@ -14,6 +14,7 @@
 with LLM_Qwen;
 with LLM_Tokenizer;
 with LLM_Sampler;
+with LLM_GGUF;  --  H19: Load_From_File takes an already-open GGUF_File
 
 package LLM_Llama is
 
@@ -21,7 +22,41 @@ package LLM_Llama is
 
    Model_Load_Error : exception;
 
+   --  H19 Phase 7 partial-warm: raised by the forward pass when the background
+   --  block-fetcher failed mid-stream (channel/transport error) and a block
+   --  the forward pass reached was never loaded. Fail-loud: a partial model
+   --  whose remaining layers could not be fetched must abort Chat, not hang.
+   Fetch_Error : exception;
+
    function Load (Path : String) return Llama_Model;
+
+   --  H19 (weight-streaming): load from an ALREADY-OPEN GGUF_File (one whose
+   --  byte source may be a Remote_AEAD_Source over the Secure_Channel). The
+   --  caller has opened + parsed the header (and used it for arch detection);
+   --  this reads the tensors, builds the model, and CLOSES G (freeing the
+   --  underlying byte source). Ada forbids `in out` function parameters, so
+   --  this is a procedure with an out result. On any mid-load failure G is
+   --  closed (the source freed) and Model_Load_Error is raised — no leak.
+   procedure Load_From_File (G : in out LLM_GGUF.GGUF_File; M : out Llama_Model);
+
+   --  H19 Phase 7 partial-model warm: load the head (token embedding, output
+   --  norm, output head, RoPE freqs) + the first K transformer blocks EAGERLY,
+   --  then start a BACKGROUND task that streams blocks K+1..N from G into RAM
+   --  (in ascending block order — the same prompt-independent fetch pattern
+   --  as Prefetch_All) and marks each ready as it lands. Returns WITHOUT
+   --  waiting for the remaining blocks: the engine can start Chat at once,
+   --  and the forward pass blocks per-block (M.Warm.Wait) only if it reaches a
+   --  layer the fetcher has not finished yet — so fetching layers K+1..N
+   --  OVERLAPS with computing layers 1..K, bounding time-to-first-token.
+   --
+   --  Takes OWNERSHIP of G: the model keeps G alive (M.GGUF) for the fetcher to
+   --  read blocks K+1..N; the fetcher closes + frees G once all blocks are in
+   --  RAM (or on a fetch failure). The caller must NOT close G. On a mid-load
+   --  failure the model is freed and Model_Load_Error is raised (G is closed).
+   --  K must be in 1 .. block_count-1 (clamped if out of range; K >= block_count
+   --  degenerates to the eager full load and is handled by Load_From_File).
+   procedure Load_From_File_Partial
+     (G : LLM_GGUF.GGUF_Ptr; M : out Llama_Model; K : Positive);
 
    --  Release everything the model owns and deallocate it (Phase 1b eviction):
    --  every weight's quantized host bytes (and any GPU-side mirror of them),

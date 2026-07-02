@@ -21,6 +21,30 @@ package body LLM_Llama.Backend is
       return new Llama_Backend'(Model => LLM_Llama.Load (Path));
    end Create;
 
+   procedure Create_From_File
+     (G      : in out LLM_GGUF.GGUF_File;
+      Result : out LLM_Backend.Backend_Access) is
+      M : LLM_Llama.Llama_Model;
+   begin
+      --  Load_From_File reads the tensors and closes G (freeing the byte
+      --  source). On failure it raises Model_Load_Error with G already closed.
+      LLM_Llama.Load_From_File (G, M);
+      Result := new Llama_Backend'(Model => M);
+   end Create_From_File;
+
+   procedure Create_From_File_Partial
+     (G      : LLM_GGUF.GGUF_Ptr;
+      K      : Positive;
+      Result : out LLM_Backend.Backend_Access) is
+      M : LLM_Llama.Llama_Model;
+   begin
+      --  Takes ownership of G: Load_From_File_Partial keeps it alive (M.GGUF)
+      --  for the background fetcher, which closes + frees it when done. On
+      --  failure G is freed and Model_Load_Error propagates.
+      LLM_Llama.Load_From_File_Partial (G, M, K);
+      Result := new Llama_Backend'(Model => M);
+   end Create_From_File_Partial;
+
    overriding function Chat
      (M              : Llama_Backend;
       Conversation   : LLM_Qwen.Message_Array;

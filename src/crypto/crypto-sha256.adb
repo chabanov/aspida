@@ -1,12 +1,16 @@
 ---------------------------------------------------------------------
 -- Crypto.SHA256 body — FIPS 180-4
+--
+-- Compress is the shared 64-byte block step used by both Hash (one-shot) and
+-- Context (streaming). The round arithmetic is unchanged from the original
+-- proved Hash; only the driver changed (Hash now calls Compress per block),
+-- so the existing proof obligations carry over.
 ---------------------------------------------------------------------
 
 with Interfaces; use Interfaces;
 
 package body Crypto.SHA256 with SPARK_Mode => On is
 
-   type Words8  is array (0 .. 7) of U32;
    type Words64 is array (0 .. 63) of U32;
 
    Init_H : constant Words8 :=
@@ -48,9 +52,54 @@ package body Crypto.SHA256 with SPARK_Mode => On is
       or Shift_Left (U32 (A (A'First + Offset + 1)), 16)
       or Shift_Left (U32 (A (A'First + Offset + 2)), 8)
       or U32 (A (A'First + Offset + 3)))
-   with Pre => A'Last >= A'First
-               and then A'Last - A'First >= 3
-               and then Offset <= A'Last - A'First - 3;
+     with Pre => A'Last >= A'First
+                 and then A'Last - A'First >= 3
+                 and then Offset <= A'Last - A'First - 3;
+
+   --  Compress one 64-byte block into the working state H. The rounds are the
+   --  exact arithmetic of the original Hash; Hash and Context both call this so
+   --  there is one implementation of the compression function.
+   procedure Compress (H : in out Words8; Block : Byte_Array)
+     with Pre => Block'Length = Block_Size
+   is
+      W : Words64 := [others => 0];
+      A, B, C, D, E, F, G, Hh, T1, T2 : U32;
+   begin
+      for T in 0 .. 15 loop
+         W (T) := Load_BE32 (Block, 4 * T);
+      end loop;
+      for T in 16 .. 63 loop
+         W (T) := Sm_S1 (W (T - 2)) + W (T - 7)
+                + Sm_S0 (W (T - 15)) + W (T - 16);
+      end loop;
+
+      A := H (0); B := H (1); C := H (2); D := H (3);
+      E := H (4); F := H (5); G := H (6); Hh := H (7);
+
+      for T in 0 .. 63 loop
+         T1 := Hh + Big_S1 (E) + Ch (E, F, G) + K (T) + W (T);
+         T2 := Big_S0 (A) + Maj (A, B, C);
+         Hh := G; G := F; F := E; E := D + T1;
+         D := C; C := B; B := A; A := T1 + T2;
+      end loop;
+
+      H (0) := H (0) + A; H (1) := H (1) + B; H (2) := H (2) + C;
+      H (3) := H (3) + D; H (4) := H (4) + E; H (5) := H (5) + F;
+      H (6) := H (6) + G; H (7) := H (7) + Hh;
+   end Compress;
+
+   --  Emit the 8 working words as the 32-byte digest (big-endian per word).
+   function To_Digest (H : Words8) return Digest is
+      Result : Digest := [others => 0];
+   begin
+      for I in 0 .. 7 loop
+         Result (4 * I)     := U8 (Shift_Right (H (I), 24) and 16#FF#);
+         Result (4 * I + 1) := U8 (Shift_Right (H (I), 16) and 16#FF#);
+         Result (4 * I + 2) := U8 (Shift_Right (H (I), 8)  and 16#FF#);
+         Result (4 * I + 3) := U8 (H (I) and 16#FF#);
+      end loop;
+      return Result;
+   end To_Digest;
 
    function Hash (M : Byte_Array) return Digest is
       Bit_Len : constant U64 := U64 (M'Length) * 8;
@@ -74,7 +123,6 @@ package body Crypto.SHA256 with SPARK_Mode => On is
         (GNATprove, False_Positive, "range check might fail",
          "M'Length is far below Natural'Last for the small inputs used.");
       H       : Words8 := Init_H;
-      Result  : Digest := [others => 0];
    begin
       --  Pad: message || 0x80 || zeros || 64-bit big-endian bit length.
       for I in M'Range loop
@@ -85,7 +133,8 @@ package body Crypto.SHA256 with SPARK_Mode => On is
          Padded (Padded'Last - I) := U8 (Shift_Right (Bit_Len, 8 * I) and 16#FF#);
       end loop;
 
-      --  Process each 64-byte block.
+      --  Process each 64-byte block via the shared Compress step (one
+      --  implementation of the compression function, used by Hash and Context).
       declare
          N_Blocks : constant Natural := Padded'Length / 64;
          pragma Annotate
@@ -93,42 +142,12 @@ package body Crypto.SHA256 with SPARK_Mode => On is
             "Padded'Length is bounded by the Hash input bound (see above).");
       begin
          for Blk in 0 .. N_Blocks - 1 loop
-            declare
-               W : Words64 := [others => 0];
-               A, B, C, D, E, F, G, Hh, T1, T2 : U32;
-            begin
-               for T in 0 .. 15 loop
-                  W (T) := Load_BE32 (Padded, Blk * 64 + 4 * T);
-               end loop;
-               for T in 16 .. 63 loop
-                  W (T) := Sm_S1 (W (T - 2)) + W (T - 7)
-                         + Sm_S0 (W (T - 15)) + W (T - 16);
-               end loop;
-
-               A := H (0); B := H (1); C := H (2); D := H (3);
-               E := H (4); F := H (5); G := H (6); Hh := H (7);
-
-               for T in 0 .. 63 loop
-                  T1 := Hh + Big_S1 (E) + Ch (E, F, G) + K (T) + W (T);
-                  T2 := Big_S0 (A) + Maj (A, B, C);
-                  Hh := G; G := F; F := E; E := D + T1;
-                  D := C; C := B; B := A; A := T1 + T2;
-               end loop;
-
-               H (0) := H (0) + A; H (1) := H (1) + B; H (2) := H (2) + C;
-               H (3) := H (3) + D; H (4) := H (4) + E; H (5) := H (5) + F;
-               H (6) := H (6) + G; H (7) := H (7) + Hh;
-            end;
+            Compress (H, Padded (Padded'First + Blk * 64
+                                 .. Padded'First + Blk * 64 + 63));
          end loop;
       end;
 
-      for I in 0 .. 7 loop
-         Result (4 * I)     := U8 (Shift_Right (H (I), 24) and 16#FF#);
-         Result (4 * I + 1) := U8 (Shift_Right (H (I), 16) and 16#FF#);
-         Result (4 * I + 2) := U8 (Shift_Right (H (I), 8)  and 16#FF#);
-         Result (4 * I + 3) := U8 (H (I) and 16#FF#);
-      end loop;
-      return Result;
+      return To_Digest (H);
    end Hash;
 
    procedure HMAC (Key, Msg : Byte_Array; Mac : out Digest) is
@@ -166,5 +185,93 @@ package body Crypto.SHA256 with SPARK_Mode => On is
       --  Scrub the key-derived block and pads; they reveal the HMAC key.
       Wipe (K0); Wipe (I_Pad); Wipe (O_Pad);
    end HMAC;
+
+   ------------------------------------------------------------------
+   --  Incremental streaming (Context)
+   ------------------------------------------------------------------
+
+   procedure Init (Ctx : out Context) is
+   begin
+      Ctx := (H => Init_H, Buf => [others => 0], Buf_Len => 0, Bit_Len => 0);
+   end Init;
+
+   ------------------------------------------------------------------
+   --  Incremental streaming (Context). SPARK_Mode => Off: correctness
+   --  rests on reusing the proved Compress step and on a bit-identical
+   --  cross-check against Hash in test_weight_pin. See spec comment.
+   ------------------------------------------------------------------
+
+   procedure Update (Ctx : in out Context; Data : Byte_Array)
+     with SPARK_Mode => Off
+   is
+      --  Walk Data by a zero-based offset Off (bytes consumed so far). The
+      --  three loops top off the partial Buf, then compress whole blocks
+      --  straight from Data, then park the 0..63-byte tail in Buf. Buf_Len
+      --  is back in 0..Block_Size-1 at every loop top (it transiently reaches
+      --  Block_Size then resets to 0), so Buf is never indexed out of bounds.
+      Off : Natural := 0;
+   begin
+      Ctx.Bit_Len := Ctx.Bit_Len + U64 (Data'Length) * 8;
+
+      while Off < Data'Length and then Ctx.Buf_Len > 0 loop
+         Ctx.Buf (Ctx.Buf_Len) := Data (Data'First + Off);
+         Ctx.Buf_Len := Ctx.Buf_Len + 1;
+         Off := Off + 1;
+         if Ctx.Buf_Len = Block_Size then
+            Compress (Ctx.H, Ctx.Buf);
+            Ctx.Buf_Len := 0;
+         end if;
+      end loop;
+
+      while Off + Block_Size <= Data'Length loop
+         Compress (Ctx.H, Data (Data'First + Off
+                                 .. Data'First + Off + Block_Size - 1));
+         Off := Off + Block_Size;
+      end loop;
+
+      while Off < Data'Length loop
+         Ctx.Buf (Ctx.Buf_Len) := Data (Data'First + Off);
+         Ctx.Buf_Len := Ctx.Buf_Len + 1;
+         Off := Off + 1;
+      end loop;
+   end Update;
+
+   procedure Final (Ctx : in out Context; D : out Digest)
+     with SPARK_Mode => Off
+   is
+      --  Build the final padding from the pending Buf: Buf[0..Buf_Len-1] ||
+      --  0x80 || zeros || 64-bit big-endian Bit_Len. One or two blocks. Buf_Len
+      --  is 0..63 by construction (Update only ever leaves 0..63 pending), so
+      --  every index below is in bounds (Buf is 0..63, Pad is 0..127, Total is
+      --  64 or 128).
+      Pad : Byte_Array (0 .. 2 * Block_Size - 1) := [others => 0];
+      N   : constant Natural := Ctx.Buf_Len;   --  pending bytes, 0..63
+      Zeros : constant Natural := (64 - ((N + 9) mod 64)) mod 64;
+      Total  : constant Natural := N + 1 + Zeros + 8;   --  64 or 128
+      N_Blk  : constant Natural := Total / 64;
+      H      : Words8 := Ctx.H;
+   begin
+      --  Pending bytes.
+      for I in 0 .. N - 1 loop
+         Pad (I) := Ctx.Buf (I);
+      end loop;
+      Pad (N) := 16#80#;
+      --  64-bit big-endian bit length in the last 8 bytes of the final block.
+      for I in 0 .. 7 loop
+         Pad (Total - 1 - I) := U8 (Shift_Right (Ctx.Bit_Len, 8 * I) and 16#FF#);
+      end loop;
+
+      for Blk in 0 .. N_Blk - 1 loop
+         Compress (H, Pad (Blk * 64 .. Blk * 64 + 63));
+      end loop;
+
+      D := To_Digest (H);
+
+      --  Scrub the buffer/state so a stale Context cannot leak partial data.
+      Ctx.H := [others => 0];
+      Wipe (Ctx.Buf);
+      Ctx.Buf_Len := 0;
+      Ctx.Bit_Len := 0;
+   end Final;
 
 end Crypto.SHA256;

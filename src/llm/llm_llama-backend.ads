@@ -2,6 +2,7 @@
 --  Model_Backend protocol (thin forwarding wrapper).
 with LLM_Backend;
 with LLM_Qwen;
+with LLM_GGUF;  --  H19: Create_From_File takes an already-open GGUF_File
 
 package LLM_Llama.Backend is
 
@@ -9,6 +10,25 @@ package LLM_Llama.Backend is
 
    --  Load the model and return it as a class-wide backend handle.
    function Create (Path : String) return LLM_Backend.Backend_Access;
+
+   --  H19 (weight-streaming): build the backend from an ALREADY-OPEN GGUF_File
+   --  whose byte source may be a Remote_AEAD_Source. LLM_Llama.Load_From_File
+   --  reads the tensors and closes G (freeing the source); the backend then
+   --  owns the model. Procedure (out result) because Ada forbids in-out
+   --  function parameters.
+   procedure Create_From_File
+     (G      : in out LLM_GGUF.GGUF_File;
+      Result : out LLM_Backend.Backend_Access);
+
+   --  H19 Phase 7 partial-warm: build the backend from a heap-allocated
+   --  GGUF_File, loading only the head + first K blocks eagerly and streaming
+   --  the rest in the background. Takes ownership of G (the model keeps it
+   --  alive for the fetcher; the caller must NOT close or free G). On failure
+   --  G is freed and Model_Load_Error is raised.
+   procedure Create_From_File_Partial
+     (G      : LLM_GGUF.GGUF_Ptr;
+      K      : Positive;
+      Result : out LLM_Backend.Backend_Access);
 
    overriding function Chat
      (M              : Llama_Backend;

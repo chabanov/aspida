@@ -65,6 +65,65 @@ package body LLM_Llama is
    type Block_Arr is array (Positive range <>) of L_Block;
    type Block_Arr_Ptr is access Block_Arr;
 
+   ------------------------------------------------------------------
+   --  H19 Phase 7 partial-warm: per-block "is this layer in RAM yet"
+   --  barrier + the background streamer that fills blocks K+1..N while
+   --  inference runs on the first K. See Llama_Model_Rec below for the
+   --  race-free protocol (Sched reads only after Wait_Ready; the fetcher
+   --  writes only before Mark_Ready; the fetcher never touches
+   --  LLM_Step_Lock).
+   ------------------------------------------------------------------
+   --  STICKY gate + one-shot wake per layer. The fetcher loads layer I,
+   --  flips the sticky Loaded (I) flag, then Set_True's the one-shot Wake
+   --  (I) object to release any forward pass blocked on it. The forward
+   --  pass takes the sticky fast path (Loaded (I) => return) once a layer
+   --  is confirmed in RAM, and only Suspend_Until_True's the wake on the
+   --  first visit — Suspend_Until_True is called OUTSIDE any protected
+   --  lock (it would self-deadlock inside one), so Warm_Barrier is a plain
+   --  limited record. The fetcher signals a mid-stream break by setting
+   --  Failed and Set_True'ing every layer's Wake, so any waiter wakes and
+   --  re-checks Failed -> Fetch_Error.
+   --
+   --  WHY sticky + one-shot instead of a single Suspension_Object per
+   --  layer: Suspend_Until_True RESETS its object to False on return (it
+   --  is a one-shot signal, not a sticky flag — verified empirically: a
+   --  second Suspend on the same object blocks even after Set_True). A
+   --  layer being in RAM is a permanent condition, so the gate must be
+   --  sticky; the wake object is the consumable signal. An earlier draft
+   --  used a protected entry family indexed by Positive, but GNAT
+   --  materializes per-family-index state and a 1 .. Positive'Last family
+   --  elaborates forever; a bounded family would work but imposes an
+   --  artificial layer cap. This design has no cap and reuses the STC
+   --  idiom already used by the scheduler's slot-completion handshake.
+   type Bool_Array is array (Positive range <>) of Boolean;
+   type SO_Array is array (Positive range <>)
+     of Ada.Synchronous_Task_Control.Suspension_Object;
+   type Warm_Barrier (N : Positive) is limited record
+      Loaded : Bool_Array (1 .. N) := [others => False];  --  sticky: layer in RAM
+      Wake   : SO_Array (1 .. N);                          --  one-shot wake signal
+      Failed : Boolean := False;
+      pragma Atomic (Failed);             --  fetcher writes, forward reads
+   end record;
+   type Warm_Ptr is access Warm_Barrier;
+
+   --  Fetcher: layer I is in RAM (set the sticky flag, then wake waiters).
+   procedure Mark_Ready (B : in out Warm_Barrier; I : Positive);
+   --  Fetcher: the stream broke; wake every waiter so it raises Fetch_Error
+   --  instead of blocking on a layer that will never arrive.
+   procedure Fail_Barrier (B : in out Warm_Barrier);
+   --  Forward pass: block until layer I is in RAM; raise Fetch_Error if the
+   --  fetcher failed before I landed. Sticky fast path once loaded.
+   procedure Wait_Ready (B : in out Warm_Barrier; I : Positive);
+
+   --  Re-export the shared heap-GGUF access type under a short local name.
+   subtype GGUF_Ptr is LLM_GGUF.GGUF_Ptr;
+
+   task type Block_Fetcher is
+      entry Init (Mdl : Llama_Model; K_Warm : Positive);
+      entry Shutdown;
+   end Block_Fetcher;
+   type Fetch_Ptr is access Block_Fetcher;
+
    type Llama_Model_Rec is record
       Tok_Emb   : LLM_Weight.Weight;   -- token_embd (lookup)
       Output    : LLM_Weight.Weight;   -- output.weight (tied to Tok_Emb if absent)
@@ -76,7 +135,27 @@ package body LLM_Llama is
       RoPE      : LLM_RoPE.RoPE_Params;
       Tok       : LLM_Tokenizer.Tokenizer;
       Bos, Eos, Eot, SH, EH : Integer := -1;
+      --  H19 Phase 7 partial-warm state. All null/false/0 on the eager path
+      --  (Warm = null => the forward pass skips the per-block Wait entirely).
+      Warm         : Warm_Ptr  := null;  --  per-block ready barrier
+      GGUF         : GGUF_Ptr  := null;  --  kept-alive source for the fetcher
+      Fetcher      : Fetch_Ptr := null;  --  background block streamer
+      Warm_Count   : Natural   := 0;     --  K (layers loaded eagerly)
+      Fetch_Failed : Boolean   := False; --  fetcher hit a transport error
    end record;
+
+   --  Deallocators (declared early so the Block_Fetcher body, the partial-load
+   --  failure handler, and Free can all reference them).
+   procedure Free_Rec is
+     new Ada.Unchecked_Deallocation (Llama_Model_Rec, Llama_Model);
+   procedure Free_Blocks is
+     new Ada.Unchecked_Deallocation (Block_Arr, Block_Arr_Ptr);
+   procedure Free_Warm is
+     new Ada.Unchecked_Deallocation (Warm_Barrier, Warm_Ptr);
+   procedure Free_GGUF is
+     new Ada.Unchecked_Deallocation (LLM_GGUF.GGUF_File, GGUF_Ptr);
+   procedure Free_Fetcher is
+     new Ada.Unchecked_Deallocation (Block_Fetcher, Fetch_Ptr);
 
    --  Model RMS epsilon, set from GGUF at load (Llama-3 = 1e-5). Package-level
    --  because GN has no access to the model record; the server loads one model.
@@ -121,12 +200,130 @@ package body LLM_Llama is
    end Silu;
 
    --------------------------------------------------------------------
+   -- H19 Phase 7: shared tensor readers + per-block loader.
+   --
+   --  Factored out of Load_From_File's nested LQ/LT so the background
+   --  Block_Fetcher can load a layer with the SAME code path as the eager
+   --  load (no duplicated dequant logic to drift). Load_Weight reads a
+   --  named tensor's raw quantized bytes from G and builds a Weight;
+   --  Load_Tensor additionally dequantizes row 0 into a Tensor (matching the
+   --  existing LT behaviour — the Weight's quant bytes are left for the
+   --  caller's Free path, exactly as the eager path did). Load_Block reads
+   --  all 9 tensors of one transformer block.
+   --------------------------------------------------------------------
+
+   procedure Load_Weight
+     (G    : in out GGUF_File;
+      Name : String;
+      W    : out LLM_Weight.Weight)
+   is
+      Info : constant Tensor_Info := Find_Tensor (G, Name);
+      Size : constant Natural := Natural (Tensor_Byte_Size (Info));
+      B    : LLM_Weight.Byte_Data;
+   begin
+      --  Reject an unimplemented quantization up front (else a quantized
+      --  matrix would only fail at first inference, or worse, run garbage).
+      if not LLM_Dequant.Is_Supported (Info.Kind) then
+         raise Model_Load_Error with "weight " & Name
+           & ": unsupported quantization "
+           & LLM_GGUF.GGML_Type'Image (Info.Kind);
+      end if;
+      B := new String (1 .. Size);
+      Read_Tensor_Raw (G, Info, B.all'Address, Size);
+      W := LLM_Weight.From_Quant (Info, B);
+   exception
+      when E : others =>
+         raise Model_Load_Error with "weight " & Name & ": "
+           & Ada.Exceptions.Exception_Message (E);
+   end Load_Weight;
+
+   procedure Load_Tensor
+     (G    : in out GGUF_File;
+      Name : String;
+      T    : out Tensor)
+   is
+      W : LLM_Weight.Weight;
+   begin
+      Load_Weight (G, Name, W);
+      T := LLM_Weight.Get_Row (W, 0);   --  dequant row 0 (matches old LT)
+   end Load_Tensor;
+
+   procedure Load_Block
+     (G      : in out GGUF_File;
+      Prefix : String;
+      Bk     : out L_Block)
+   is
+   begin
+      Load_Tensor (G, Prefix & "attn_norm.weight", Bk.Attn_Norm);
+      Load_Tensor (G, Prefix & "ffn_norm.weight",  Bk.Ffn_Norm);
+      Load_Weight (G, Prefix & "attn_q.weight",      Bk.W_Q);
+      Load_Weight (G, Prefix & "attn_k.weight",      Bk.W_K);
+      Load_Weight (G, Prefix & "attn_v.weight",      Bk.W_V);
+      Load_Weight (G, Prefix & "attn_output.weight", Bk.W_O);
+      Load_Weight (G, Prefix & "ffn_gate.weight",    Bk.W_Gate);
+      Load_Weight (G, Prefix & "ffn_up.weight",      Bk.W_Up);
+      Load_Weight (G, Prefix & "ffn_down.weight",    Bk.W_Down);
+   end Load_Block;
+
+   --------------------------------------------------------------------
+   --  Warm_Barrier primitives: a sticky "loaded" flag + a one-shot wake
+   --  per layer, plus a fail flag. Set_True / Suspend_Until_True carry
+   --  their own acquire/release fence, so a Loaded/Failed write performed
+   --  before Set_True is visible to a task woken by Suspend_Until_True.
+   --  The sticky fast path reads Loaded without a fence, which is safe:
+   --  a layer is only ever Loaded False -> True (once), and the first
+   --  visit that wakes via Suspend carries the fence that publishes it.
+   --------------------------------------------------------------------
+   procedure Mark_Ready (B : in out Warm_Barrier; I : Positive) is
+   begin
+      B.Loaded (I) := True;   --  sticky: layer I is in RAM from here on
+      Ada.Synchronous_Task_Control.Set_True (B.Wake (I));
+   end Mark_Ready;
+
+   procedure Fail_Barrier (B : in out Warm_Barrier) is
+   begin
+      B.Failed := True;
+      for I in 1 .. B.N loop
+         Ada.Synchronous_Task_Control.Set_True (B.Wake (I));
+         --  wake every waiter; each re-checks Failed and raises Fetch_Error
+      end loop;
+   end Fail_Barrier;
+
+   procedure Wait_Ready (B : in out Warm_Barrier; I : Positive) is
+   begin
+      if B.Loaded (I) then
+         return;   --  sticky fast path: layer already in RAM
+      end if;
+      Ada.Synchronous_Task_Control.Suspend_Until_True (B.Wake (I));
+      if B.Failed then
+         raise Fetch_Error;
+      end if;
+      pragma Assert (B.Loaded (I));   --  fetcher sets Loaded before Set_True
+   end Wait_Ready;
+
+   --------------------------------------------------------------------
    -- Load
    --------------------------------------------------------------------
 
    function Load (Path : String) return Llama_Model is
-      M : constant Llama_Model := new Llama_Model_Rec;
       G : GGUF_File;
+      M : Llama_Model;
+   begin
+      Open (G, Path);
+      if not Is_Open (G) then
+         raise Model_Load_Error with "cannot open GGUF file: " & Path;
+      end if;
+      --  Load_From_File reads the tensors and closes G (freeing the source).
+      Load_From_File (G, M);
+      return M;
+   end Load;
+
+   ---------------------------------------------------------------------
+   -- Load_From_File — the tensor-reading core, factored out of Load so the
+   -- H19 weight-streaming path can feed an already-open GGUF_File (one whose
+   -- byte source is a Remote_AEAD_Source). See spec.
+   ---------------------------------------------------------------------
+   procedure Load_From_File (G : in out GGUF_File; M : out Llama_Model) is
 
       function MI (Key : String; D : Integer) return Integer is
          V : constant String := Metadata (G, "llama." & Key);
@@ -141,24 +338,12 @@ package body LLM_Llama is
       exception when others => return D; end MF;
 
       function LQ (Name : String) return LLM_Weight.Weight is
-         Info : constant Tensor_Info := Find_Tensor (G, Name);
-         Size : constant Natural := Natural (Tensor_Byte_Size (Info));
-         B    : LLM_Weight.Byte_Data;
+         --  Thin wrapper over the shared Load_Weight so the eager head load
+         --  and the Phase 7 fetcher use one dequant code path.
+         W : LLM_Weight.Weight;
       begin
-         --  Reject an unimplemented quantization up front (else a quantized
-         --  matrix would only fail at first inference, or worse, run garbage).
-         if not LLM_Dequant.Is_Supported (Info.Kind) then
-            raise Model_Load_Error with "weight " & Name
-              & ": unsupported quantization "
-              & LLM_GGUF.GGML_Type'Image (Info.Kind);
-         end if;
-         B := new String (1 .. Size);
-         Read_Tensor_Raw (G, Info, B.all'Address, Size);
-         return LLM_Weight.From_Quant (Info, B);
-      exception
-         when E : others =>
-            raise Model_Load_Error with "weight " & Name & ": "
-              & Ada.Exceptions.Exception_Message (E);
+         Load_Weight (G, Name, W);
+         return W;
       end LQ;
 
       function Has (Name : String) return Boolean is
@@ -174,11 +359,8 @@ package body LLM_Llama is
 
       RoPE_Base : Float;
    begin
-      Ada.Text_IO.Put_Line ("Loading Llama (dense) model from " & Path & " ...");
-      Open (G, Path);
-      if not Is_Open (G) then
-         raise Model_Load_Error with "cannot open GGUF file: " & Path;
-      end if;
+      M := new Llama_Model_Rec;
+      Ada.Text_IO.Put_Line ("Loading Llama (dense) model from open GGUF source ...");
       if Metadata (G, "general.architecture") /= "llama" then
          raise Model_Load_Error with "not a 'llama' architecture model";
       end if;
@@ -204,18 +386,9 @@ package body LLM_Llama is
       M.Blocks := new Block_Arr (1 .. M.N_Blocks);
       for I in 1 .. M.N_Blocks loop
          declare
-            P  : constant String := "blk." & Img (I - 1) & ".";
             Bk : L_Block;
          begin
-            Bk.Attn_Norm := LT (P & "attn_norm.weight");
-            Bk.Ffn_Norm  := LT (P & "ffn_norm.weight");
-            Bk.W_Q := LQ (P & "attn_q.weight");
-            Bk.W_K := LQ (P & "attn_k.weight");
-            Bk.W_V := LQ (P & "attn_v.weight");
-            Bk.W_O := LQ (P & "attn_output.weight");
-            Bk.W_Gate := LQ (P & "ffn_gate.weight");
-            Bk.W_Up   := LQ (P & "ffn_up.weight");
-            Bk.W_Down := LQ (P & "ffn_down.weight");
+            Load_Block (G, "blk." & Img (I - 1) & ".", Bk);
             M.Blocks (I) := Bk;
          end;
       end loop;
@@ -274,17 +447,263 @@ package body LLM_Llama is
         & "/" & Img (M.N_KV) & " head_dim=" & Img (M.Head_Dim)
         & " ffn=" & Img (M.FFN) & " vocab=" & Img (M.Vocab)
         & (if M.Has_Freqs then " rope_freqs" else ""));
-      return M;
-   end Load;
+   exception
+      --  On any mid-load failure, ensure G (and its byte source) is freed —
+      --  the success path closes G above; a partial load must not orphan it.
+      when others =>
+         if Is_Open (G) then
+            Close (G);
+         end if;
+         raise;
+   end Load_From_File;
+
+   ---------------------------------------------------------------------
+   -- Load_From_File_Partial — H19 Phase 7 partial-model warm.
+   --
+   --  Loads the head + the first K transformer blocks EAGERLY, then (if
+   --  K < block_count) hands the still-open GGUF source to a background
+   --  Block_Fetcher that streams blocks K+1..N into RAM in ascending order
+   --  while inference runs on the first K. The forward pass blocks per-layer
+   --  via M.Warm.Wait only if it out-runs the fetcher (race-free: the fetcher
+   --  writes M.Blocks(I) BEFORE M.Warm.Mark(I); the forward pass reads
+   --  M.Blocks(I) only AFTER M.Warm.Wait(I) returns; protected-object
+   --  rendezvous supplies the happens-before edge).
+   --
+   --  Takes ownership of the heap-allocated G: the model keeps it alive
+   --  (M.GGUF) for the fetcher, which closes + frees it when all blocks are
+   --  in RAM (or on a fetch failure). On a mid-load failure G is closed +
+   --  freed here and Model_Load_Error is raised. K is clamped to 1..
+   --  block_count; K >= block_count degenerates to the eager full load (all
+   --  blocks read here, source closed, no fetcher started).
+   ---------------------------------------------------------------------
+   procedure Load_From_File_Partial
+     (G : GGUF_Ptr; M : out Llama_Model; K : Positive)
+   is
+
+      function MI (Key : String; D : Integer) return Integer is
+         V : constant String := Metadata (G.all, "llama." & Key);
+      begin
+         return (if V = "" then D else Integer'Value (V));
+      exception when others => return D; end MI;
+
+      function MF (Key : String; D : Float) return Float is
+         V : constant String := Metadata (G.all, "llama." & Key);
+      begin
+         return (if V = "" then D else Float'Value (V));
+      exception when others => return D; end MF;
+
+      function LQ (Name : String) return LLM_Weight.Weight is
+         W : LLM_Weight.Weight;
+      begin
+         Load_Weight (G.all, Name, W);
+         return W;
+      end LQ;
+
+      function Has (Name : String) return Boolean is
+      begin
+         declare Unused : constant Tensor_Info := Find_Tensor (G.all, Name); begin
+            pragma Unreferenced (Unused);
+            return True;
+         end;
+      exception when others => return False;
+      end Has;
+
+      function LT (Name : String) return Tensor is (LLM_Weight.Get_Row (LQ (Name), 0));
+
+      RoPE_Base : Float;
+      K_Eff     : Integer;   --  clamped warm layer count
+   begin
+      M := new Llama_Model_Rec;
+      --  Take ownership of the heap GGUF source at entry so the failure
+      --  handler can always close + free it uniformly.
+      M.GGUF := G;
+
+      Ada.Text_IO.Put_Line
+        ("Loading Llama (dense) model from open GGUF source (partial warm) ...");
+      if Metadata (G.all, "general.architecture") /= "llama" then
+         raise Model_Load_Error with "not a 'llama' architecture model";
+      end if;
+
+      M.Dim      := MI ("embedding_length", 4096);
+      M.N_Blocks := MI ("block_count", 32);
+      M.N_Heads  := MI ("attention.head_count", 32);
+      M.N_KV     := MI ("attention.head_count_kv", M.N_Heads);
+      M.FFN      := MI ("feed_forward_length", 11008);
+      M.Ctx      := MI ("context_length", 8192);
+      M.Head_Dim := MI ("rope.dimension_count", M.Dim / M.N_Heads);
+      RoPE_Base  := MF ("rope.freq_base", 500_000.0);
+      RMS_Eps    := MF ("attention.layer_norm_rms_epsilon", 1.0e-5);
+
+      M.Tok_Emb  := LQ ("token_embd.weight");
+      M.Out_Norm := LT ("output_norm.weight");
+      M.Output   := (if Has ("output.weight") then LQ ("output.weight") else M.Tok_Emb);
+      M.Vocab    := LLM_Weight.Rows (M.Output);
+      M.Has_Freqs := Has ("rope_freqs.weight");
+      if M.Has_Freqs then M.Rope_Freqs := LT ("rope_freqs.weight"); end if;
+
+      --  Clamp K to a valid warm range. K_Eff >= block_count => degenerate
+      --  eager full load (handled below: all blocks read here, no fetcher).
+      K_Eff := Integer'Max (1, Integer'Min (K, M.N_Blocks));
+
+      M.Blocks := new Block_Arr (1 .. M.N_Blocks);
+      if K_Eff < M.N_Blocks then
+         M.Warm := new Warm_Barrier (M.N_Blocks);
+      end if;
+
+      --  Eagerly load the first K_Eff blocks; mark each ready so a forward
+      --  pass starting at once never waits on these.
+      for I in 1 .. K_Eff loop
+         declare
+            Bk : L_Block;
+         begin
+            Load_Block (G.all, "blk." & Img (I - 1) & ".", Bk);
+            M.Blocks (I) := Bk;
+         end;
+         if M.Warm /= null then
+            Mark_Ready (M.Warm.all, I);
+         end if;
+      end loop;
+
+      M.Head_Dim := LLM_Weight.Rows (M.Blocks (1).W_Q) / M.N_Heads;
+      M.RoPE := LLM_RoPE.Create_Qwen_RoPE (M.Head_Dim, RoPE_Base, M.Ctx);
+      LLM_RoPE.Set_Interleaved (M.RoPE);
+      if M.Has_Freqs and then not Ada.Environment_Variables.Exists ("ASPIDA_NO_FF") then
+         LLM_RoPE.Set_Freq_Factors (M.RoPE, M.Rope_Freqs);
+      end if;
+      declare
+         Kind   : constant String := Metadata (G.all, "llama.rope.scaling.type");
+         Factor : constant Float  := MF ("rope.scaling.factor", 1.0);
+      begin
+         if Kind = "linear" and then Factor > 1.0 then
+            LLM_RoPE.Set_Linear_Scale (M.RoPE, Factor);
+         elsif Kind = "yarn" and then Factor > 1.0 then
+            LLM_RoPE.Set_Yarn_Scale
+              (M.RoPE, Factor,
+               N_Ctx_Orig => MI ("rope.scaling.original_context_length",
+                                 M.Ctx / Integer'Max (1, Integer (Factor))));
+         end if;
+         if Ada.Environment_Variables.Exists ("ASPIDA_ROPE_NTK") then
+            begin
+               LLM_RoPE.Set_NTK_Scale
+                 (M.RoPE,
+                  Float'Value (Ada.Environment_Variables.Value ("ASPIDA_ROPE_NTK")));
+            exception when others => null;
+            end;
+         end if;
+      end;
+
+      M.Tok := LLM_Tokenizer.Create;
+      LLM_Tokenizer.Load_From_GGUF (M.Tok, G.all);
+      begin M.Bos := Integer'Value (Metadata (G.all, "tokenizer.ggml.bos_token_id"));
+      exception when others => M.Bos := LLM_Tokenizer.Token_To_Id (M.Tok, "<|begin_of_text|>"); end;
+      begin M.Eos := Integer'Value (Metadata (G.all, "tokenizer.ggml.eos_token_id"));
+      exception when others => M.Eos := LLM_Tokenizer.Token_To_Id (M.Tok, "<|end_of_text|>"); end;
+      M.Eot := LLM_Tokenizer.Token_To_Id (M.Tok, "<|eot_id|>");
+      M.SH  := LLM_Tokenizer.Token_To_Id (M.Tok, "<|start_header_id|>");
+      M.EH  := LLM_Tokenizer.Token_To_Id (M.Tok, "<|end_header_id|>");
+
+      --  Hand the still-open source to a background fetcher for the remaining
+      --  blocks, OR (degenerate) close it now and serve a fully-loaded model.
+      if K_Eff < M.N_Blocks then
+         M.Warm_Count := K_Eff;
+         M.Fetcher := new Block_Fetcher;
+         M.Fetcher.Init (M, K_Eff);
+         Ada.Text_IO.Put_Line
+           ("  llama partial-warm: " & Img (K_Eff) & "/" & Img (M.N_Blocks)
+            & " layers hot; streaming the rest in the background");
+      else
+         --  Degenerate eager full load: free the source now (the record is
+         --  freed by Free later; no fetcher reads it).
+         Close (M.GGUF.all);
+         Ada.Text_IO.Put_Line ("  llama partial-warm: K >= block_count, full load");
+      end if;
+
+      Ada.Text_IO.Put_Line ("  llama: dim=" & Img (M.Dim)
+        & " layers=" & Img (M.N_Blocks) & " heads=" & Img (M.N_Heads)
+        & "/" & Img (M.N_KV) & " head_dim=" & Img (M.Head_Dim)
+        & " ffn=" & Img (M.FFN) & " vocab=" & Img (M.Vocab)
+        & (if M.Has_Freqs then " rope_freqs" else ""));
+   exception
+      --  Fail-loud, no source leak. The fetcher is the LAST thing started, so
+      --  on any mid-load failure it isn't running and we may safely close +
+      --  free M.GGUF ourselves. The partially-built model record (some blocks,
+      --  head weights, Warm) is leaked, matching Load_From_File's failure
+      --  semantics (load failure is fatal; the caller gets Model_Load_Error).
+      when others =>
+         if M /= null then
+            if M.Fetcher /= null then
+               begin M.Fetcher.Shutdown; exception when others => null; end;
+               while not M.Fetcher'Terminated loop delay 0.001; end loop;
+               Free_Fetcher (M.Fetcher);
+            end if;
+            if M.GGUF /= null then
+               if Is_Open (M.GGUF.all) then Close (M.GGUF.all); end if;
+               Free_GGUF (M.GGUF);
+               M.GGUF := null;
+            end if;
+            if M.Warm /= null then Free_Warm (M.Warm); end if;
+         end if;
+         raise;
+   end Load_From_File_Partial;
+
+   ---------------------------------------------------------------------
+   -- Block_Fetcher task body — streams blocks K+1..N in the background.
+   --  Marks each ready as it lands; on a transport/dequant error fails the
+   --  barrier (so a forward pass waiting on a not-yet-loaded layer raises
+   --  Fetch_Error instead of hanging). Closes + frees M.GGUF on the way out
+   --  (both success and failure), then parks on Shutdown for Free's
+   --  deterministic rendezvous.
+   ---------------------------------------------------------------------
+   task body Block_Fetcher is
+      --  Local copies of the Init rendezvous values. The accept's formals
+      --  MUST match the entry declaration's names (Mdl, K_Warm) and are `in`,
+      --  so we copy them into differently-named locals to use below.
+      M_Model : Llama_Model;
+      M_K     : Positive;
+   begin
+      accept Init (Mdl : Llama_Model; K_Warm : Positive) do
+         M_Model := Mdl;
+         M_K     := K_Warm;
+      end Init;
+
+      for I in M_K + 1 .. M_Model.N_Blocks loop
+         begin
+            declare
+               Bk : L_Block;
+            begin
+               Load_Block (M_Model.GGUF.all, "blk." & Img (I - 1) & ".", Bk);
+               M_Model.Blocks (I) := Bk;
+            end;
+            Mark_Ready (M_Model.Warm.all, I);
+         exception
+            when others =>
+               --  Stream broke mid-fetch. Fail-loud: wake every waiter so the
+               --  forward pass raises Fetch_Error rather than hanging on a
+               --  layer that will never arrive. Leave remaining blocks empty.
+               M_Model.Fetch_Failed := True;
+               Fail_Barrier (M_Model.Warm.all);
+               exit;
+         end;
+      end loop;
+
+      --  Sole reader of M_Model.GGUF is done; close the source and drop our
+      --  handle so Free's GGUF guard becomes a no-op (Free checks M.GGUF).
+      if M_Model.GGUF /= null then
+         if Is_Open (M_Model.GGUF.all) then
+            Close (M_Model.GGUF.all);
+         end if;
+         Free_GGUF (M_Model.GGUF);
+         M_Model.GGUF := null;
+      end if;
+
+      --  Park until Free calls Shutdown — gives Free a deterministic
+      --  "fetcher quiescent" handshake before it frees M.Blocks / the rec.
+      accept Shutdown;
+   end Block_Fetcher;
 
    --------------------------------------------------------------------
    --  Free — full teardown for Phase 1b LRU eviction.
    --------------------------------------------------------------------
-   procedure Free_Rec is
-     new Ada.Unchecked_Deallocation (Llama_Model_Rec, Llama_Model);
-   procedure Free_Blocks is
-     new Ada.Unchecked_Deallocation (Block_Arr, Block_Arr_Ptr);
-
    --  Drop a weight's GPU mirror (if any) THEN its host bytes, in that order:
    --  the host address is the device cache key and must be valid for the free.
    procedure Drop_Weight (W : in out LLM_Weight.Weight) is
@@ -297,6 +716,45 @@ package body LLM_Llama is
    begin
       if M = null then
          return;   --  idempotent
+      end if;
+
+      --  H19 Phase 7 teardown: stop the background fetcher first. It may be
+      --  mid-Read_Tensor_Raw on M.GGUF — we must NOT free M.GGUF / M.Blocks
+      --  out from under it. Rendezvous: call Shutdown (the fetcher's last
+      --  accept), then wait for the task to actually terminate before freeing
+      --  anything it could touch. Wrapped: a fetcher that already finished its
+      --  loop and is blocked on accept Shutdown returns normally; one that died
+      --  on a fetch error has already set M.Fetch_Failed and may reject the
+      --  rendezvous — the handler lets us proceed to the terminated-poll.
+      if M.Fetcher /= null then
+         begin
+            M.Fetcher.Shutdown;
+         exception
+            when others => null;
+         end;
+         --  The fetcher task closes + nulls M.GGUF itself on its way out (both
+         --  on the success path and the Fail path), so by the time it is
+         --  Terminated M.GGUF is null. Poll rather than abort: aborting a task
+         --  mid-Read_Tensor_Raw could leave the channel in a half-read state.
+         while not M.Fetcher'Terminated loop
+            delay 0.001;
+         end loop;
+         Free_Fetcher (M.Fetcher);
+      end if;
+
+      --  The fetcher normally closes + nulls M.GGUF. Guard anyway: if Free is
+      --  called on a model whose fetcher never started (Warm = null eager
+      --  degenerate path that still set M.GGUF), or the fetcher crashed before
+      --  its close, M.GGUF may still hold an open source — close + free it.
+      if M.GGUF /= null then
+         if Is_Open (M.GGUF.all) then
+            Close (M.GGUF.all);
+         end if;
+         Free_GGUF (M.GGUF);
+      end if;
+
+      if M.Warm /= null then
+         Free_Warm (M.Warm);
       end if;
 
       if M.Blocks /= null then
@@ -380,6 +838,14 @@ package body LLM_Llama is
       T_Step := Ada.Real_Time.Clock;
       if Dbg then Dump ("  emb pos=" & Pos'Image & " tok=" & Tok'Image, H); end if;
       for Lr in 1 .. M.N_Blocks loop
+         --  H19 Phase 7 partial-warm: block until layer Lr is in RAM. On the
+         --  eager path M.Warm is null and this is a no-op. On the partial path
+         --  the declarative part below reads M.Blocks (Lr) (via the renames +
+         --  the X initializer), so the Wait MUST precede it. Raises
+         --  Fetch_Error if the background streamer failed before Lr landed.
+         if M.Warm /= null then
+            Wait_Ready (M.Warm.all, Lr);
+         end if;
          declare
             B : L_Block renames M.Blocks (Lr);
             X : constant Tensor := GN (H, B.Attn_Norm);
@@ -603,6 +1069,10 @@ package body LLM_Llama is
       end loop;
 
       for Lr in 1 .. M.N_Blocks loop
+         --  H19 Phase 7 partial-warm: same per-block gate as Forward_Step.
+         if M.Warm /= null then
+            Wait_Ready (M.Warm.all, Lr);
+         end if;
          declare
             Blk : L_Block renames M.Blocks (Lr);
             X   : constant Tensor := RMSNorm_Batch (H, Blk.Attn_Norm, B, D);

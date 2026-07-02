@@ -240,6 +240,18 @@ test-weights-real: ## Validate GGUF load + dequant on real tensors (needs model)
 	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
 	./obj/test_weights_real
 
+.PHONY: test-weight
+test-weight: ## H19 weight-streaming: remote-sourced GGUF read byte-identical to local (needs svgdata/student.gguf)
+	MACOSX_DEPLOYMENT_TARGET=26.5 $(GPRBUILD) -P tests/weight_tests.gpr $(GPR_FLAGS)
+	./obj/test_weight_stream
+	./obj/test_weight_cache
+	./obj/test_weight_disk
+	./obj/test_weight_pin
+	./obj/test_weight_prefetch
+	./obj/test_weight_parity
+	./obj/test_weight_egress
+	./obj/test_weight_partial
+
 .PHONY: prove
 prove: ## SPARK: full AoRTE+functional proof of crypto root, ChaCha20, SHA-256, HKDF & PBKDF2; flow for the rest
 	$(GNATPROVE) -P crypto.gpr $(GPR_FLAGS) \
@@ -250,6 +262,10 @@ prove: ## SPARK: full AoRTE+functional proof of crypto root, ChaCha20, SHA-256, 
 .PHONY: prove-flow
 prove-flow: ## SPARK flow analysis (init/deps/aliasing) over the whole crypto library
 	$(GNATPROVE) -P crypto.gpr $(GPR_FLAGS) --mode=flow -j0
+
+.PHONY: prove-egress
+prove-egress: ## H19 Phase 6: SPARK flow analysis of the client egress encoder (LLM_Weight_Proto)
+	$(GNATPROVE) -P server.gpr $(GPR_FLAGS) -u src/server/llm_weight_proto.adb --mode=flow -j0
 
 # ══════════════════════════════════════════════════════════════════════
 #  CLEAN

@@ -19,10 +19,14 @@
 
 with Ada.Containers.Vectors;
 with Ada.Strings.Unbounded;
-with Interfaces;  -- for u32, u64
-with System;       -- for System.Address
+with Interfaces;       -- for u32, u64
+with LLM_Byte_Source;  -- random-access byte source (local file today, remote H19 later)
+with System;           -- for System.Address
 
 package LLM_GGUF is
+
+   --  `=` / `/=` on the byte-source access (used by Open_From_Source's Pre).
+   use type LLM_Byte_Source.Byte_Source_Access;
 
    --  Raised when an untrusted GGUF file is structurally invalid: a tensor
    --  whose declared size overflows or runs past the end of the file, an
@@ -90,6 +94,14 @@ package LLM_GGUF is
    -- Complete GGUF file representation
    type GGUF_File is limited private;
 
+   --  H19 Phase 7 partial-warm: a heap-allocated GGUF_File the model can keep
+   --  alive for a background block-fetcher to stream layers K+1..N. Shared by
+   --  the engine (allocates), the backend (passes through), and the model
+   --  (holds + frees). Visible because GGUF_File is opaque (limited private):
+   --  only this unit can create/destroy the record, but callers hold access
+   --  values to keep one alive past the load call.
+   type GGUF_Ptr is access all GGUF_File;
+
    --------------------------------------------------------------------
    -- API
    --------------------------------------------------------------------
@@ -99,6 +111,18 @@ package LLM_GGUF is
    -- Read_Tensor_Raw on demand (memory-mapped style).
    procedure Open (File : out GGUF_File; Path : String)
      with Pre => Path'Length > 0;
+
+   --  H19 (weight-streaming): parse a GGUF from an ALREADY-OPEN byte source
+   --  (a Remote_AEAD_Source over the Secure_Channel, or any Byte_Source).
+   --  Takes ownership of Src: on success the GGUF_File owns it (Close frees
+   --  it); on a parse failure Src is freed and Malformed_GGUF is raised; on a
+   --  bad-magic / absurd-count header Src is freed and File.Is_Open is left
+   --  False (matching Open's silent-return for a non-GGUF / hostile header).
+   --  This is the seam that lets the engine load a model whose bytes arrive
+   --  over the encrypted channel instead of from a local file, with no change
+   --  to the parser or any backend.
+   procedure Open_From_Source (File : out GGUF_File; Src : LLM_Byte_Source.Byte_Source_Access)
+     with Pre => Src /= null;
 
    -- File status
    function Is_Open (File : GGUF_File) return Boolean;
@@ -195,8 +219,13 @@ private
       Merges        : Str_Vectors.Vector;  -- tokenizer.ggml.merges
       Alignment_Val : U64 := 32;  -- default alignment
       Data_Start    : U64 := 0;   -- byte offset where tensor data begins
-      File_Size     : U64 := 0;   -- total file length in bytes (from lseek)
-      FD            : Integer := -1;  -- POSIX file descriptor (via C import)
+      File_Size     : U64 := 0;   -- total byte length (from the Byte_Source)
+      --  The byte source behind on-demand tensor reads. Today a
+      --  Local_File_Source (POSIX fd); H19 will swap in a Remote_AEAD_Source
+      --  (byte-range fetch over the Secure_Channel + local cache) with no
+      --  change to the parser or any backend. Owned by the GGUF_File: Close
+      --  frees it (closes the fd / connection and deallocates the access).
+      Source        : LLM_Byte_Source.Byte_Source_Access := null;
    end record;
 
 end LLM_GGUF;

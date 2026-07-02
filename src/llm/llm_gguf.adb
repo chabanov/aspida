@@ -1,35 +1,25 @@
 ---------------------------------------------------------------------
--- LLM_GGUF body — GGUF v3 parser with POSIX I/O
+-- LLM_GGUF body — GGUF v3 parser, now source-agnostic
+--
+-- All byte I/O (sequential header parse + random tensor reads) is routed
+-- through a LLM_Byte_Source.Byte_Source. Today that is always a
+-- Local_File_Source (POSIX fd + lseek + read, implemented in LLM_Byte_Source);
+-- H19 will swap in a Remote_AEAD_Source with no change here. The POSIX thin
+-- bindings and the short-read loop moved to llm_byte_source.adb verbatim.
 ---------------------------------------------------------------------
 
 with Ada.Text_IO;
 with Ada.Exceptions;
-with System.Storage_Elements;
+--  Interfaces and LLM_Byte_Source are withed by the spec, so they are visible
+--  in the body without a redundant with clause here.
 
 package body LLM_GGUF is
 
    use Ada.Strings.Unbounded;
+   use LLM_Byte_Source;  --  makes Byte_Source_Access's predefined = directly visible
 
-   --------------------------------------------------------------------
-   -- POSIX I/O imports (thin bindings to libSystem)
-   --------------------------------------------------------------------
-   type C_Int is new Integer;
-   type C_Size is mod 2**64;
-   type C_Off is new Long_Long_Integer;
-
-   function C_Open  (Path : String; Flags : C_Int; Mode : C_Int) return C_Int
-     with Import, Convention => C, External_Name => "open";
-   function C_Read  (FD : C_Int; Buf : System.Address; Count : C_Size) return C_Int
-     with Import, Convention => C, External_Name => "read";
-   function C_LSeek (FD : C_Int; Offset : C_Off; Whence : C_Int) return C_Off
-     with Import, Convention => C, External_Name => "lseek";
-   function C_Close (FD : C_Int) return C_Int
-     with Import, Convention => C, External_Name => "close";
-
-   O_RDONLY : constant C_Int := 0;
-   SEEK_SET : constant C_Int := 0;
-   SEEK_CUR : constant C_Int := 1;
-   SEEK_END : constant C_Int := 2;
+   --  Shorthand for the byte-source access the file holds.
+   subtype Source_Access is LLM_Byte_Source.Byte_Source_Access;
 
    --  Sanity caps on GGUF metadata sizes. A hostile or truncated file could
    --  otherwise advertise a multi-gigabyte string / millions of tensors and
@@ -40,91 +30,79 @@ package body LLM_GGUF is
    Max_Tensor_Count : constant U64 := 16_384;      -- tensor descriptors
    Max_Array_Len    : constant U64 := 1_048_576;   -- metadata array elements
 
-   --  Explicitly discard the return code of a side-effecting POSIX call
-   --  (close/lseek) whose result we intentionally ignore.
-   procedure Ignore (Unused : C_Int)  is null;
-   procedure Ignore (Unused : C_Off)  is null;
-
    --------------------------------------------------------------------
-   -- Binary reader helpers
+   -- Binary reader helpers (all routed through the Byte_Source cursor)
    --------------------------------------------------------------------
 
-   --  Read exactly Count bytes, looping over short reads (read() may legally
-   --  return fewer bytes than requested — at EOF, on a signal, or on a pipe).
-   --  Advances the destination address by the bytes already read.
-   procedure Read_Exact (FD : C_Int; Addr : System.Address; Count : Natural) is
-      use System.Storage_Elements;
-      Remaining : Natural := Count;
-      Cur       : System.Address := Addr;
-      N         : C_Int;
+   --  Read exactly Count bytes at the source's cursor, advancing it. The
+   --  source's Malformed_Source (short read) is translated to the
+   --  Constraint_Error the parser historically raised, so Open's exception
+   --  handler wraps it into Malformed_GGUF unchanged.
+   procedure Read_Exact (S : Source_Access; Addr : System.Address; Count : Natural) is
    begin
-      while Remaining > 0 loop
-         N := C_Read (FD, Cur, C_Size (Remaining));
-         if N <= 0 then
-            raise Constraint_Error with "Short read from GGUF file";
-         end if;
-         Remaining := Remaining - Natural (N);
-         Cur := Cur + Storage_Offset (N);
-      end loop;
+      S.Read_Seq (Addr, Count);
+   exception
+      when Malformed_Source =>
+         raise Constraint_Error with "Short read from GGUF file";
    end Read_Exact;
 
    type U8_T  is mod 2 ** 8;
-   function Read_U8 (FD : C_Int) return U8_T is
+   function Read_U8 (S : Source_Access) return U8_T is
       V : U8_T := 0;
    begin
-      Read_Exact (FD, V'Address, 1);
+      Read_Exact (S, V'Address, 1);
       return V;
    end Read_U8;
 
    type U16_T is mod 2 ** 16;
-   function Read_U16 (FD : C_Int) return U16_T is
+   function Read_U16 (S : Source_Access) return U16_T is
       V : U16_T := 0;
    begin
-      Read_Exact (FD, V'Address, 2);
+      Read_Exact (S, V'Address, 2);
       return V;
    end Read_U16;
 
-   function Read_U32 (FD : C_Int) return U32 is
+   function Read_U32 (S : Source_Access) return U32 is
       V : U32 := 0;
    begin
-      Read_Exact (FD, V'Address, 4);
+      Read_Exact (S, V'Address, 4);
       return V;
    end Read_U32;
 
-   function Read_U64 (FD : C_Int) return U64 is
+   function Read_U64 (S : Source_Access) return U64 is
       V : U64 := 0;
    begin
-      Read_Exact (FD, V'Address, 8);
+      Read_Exact (S, V'Address, 8);
       return V;
    end Read_U64;
 
-   function Read_F32 (FD : C_Int) return Float is
+   function Read_F32 (S : Source_Access) return Float is
       V : Float := 0.0;
    begin
-      Read_Exact (FD, V'Address, 4);
+      Read_Exact (S, V'Address, 4);
       return V;
    end Read_F32;
 
-   function Read_Bool (FD : C_Int) return Boolean is
+   function Read_Bool (S : Source_Access) return Boolean is
    begin
       --  GGUF BOOL is a single byte (not a 32-bit word) — reading 4 would
       --  desync the cursor and corrupt every later metadata entry.
-      return Read_U8 (FD) /= 0;
+      return Read_U8 (S) /= 0;
    end Read_Bool;
 
-   function Read_String (FD : C_Int) return String is
-      Len : constant U64 := Read_U64 (FD);
+   function Read_String (S : Source_Access) return String is
+      Len : constant U64 := Read_U64 (S);
    begin
       if Len > Max_String_Len then
          raise Constraint_Error with "GGUF string length out of range";
       end if;
       declare
-         S : String (1 .. Natural (Len));
+         S2 : String (1 .. Natural (Len));
       begin
          if Len > 0 then
-            Read_Exact (FD, S'Address, Natural (Len));
+            Read_Exact (S, S2'Address, Natural (Len));
          end if;
-         return S;
+         return S2;
       end;
    end Read_String;
 
@@ -158,44 +136,44 @@ package body LLM_GGUF is
       return GGUF_Value_Type'Val (Code);
    end To_Value_Type;
 
-   function Read_Metadata_Value (FD : C_Int; VT : GGUF_Value_Type) return String is
+   function Read_Metadata_Value (S : Source_Access; VT : GGUF_Value_Type) return String is
       V_Str : Unbounded_String;
    begin
       case VT is
          --  Small scalars are 1 or 2 bytes on disk; reading 4 would desync the
          --  file cursor and corrupt every subsequent metadata entry.
-         when GGUF_TYPE_U8   => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U8 (FD))));
+         when GGUF_TYPE_U8   => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U8 (S))));
          when GGUF_TYPE_I8   =>
             declare
-               B : constant U8_T := Read_U8 (FD);
+               B : constant U8_T := Read_U8 (S);
             begin
                V_Str := To_Unbounded_String (Integer'Image
                  (if B >= 128 then Integer (B) - 256 else Integer (B)));
             end;
-         when GGUF_TYPE_U16  => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U16 (FD))));
+         when GGUF_TYPE_U16  => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U16 (S))));
          when GGUF_TYPE_I16  =>
             declare
-               H : constant U16_T := Read_U16 (FD);
+               H : constant U16_T := Read_U16 (S);
             begin
                V_Str := To_Unbounded_String (Integer'Image
                  (if H >= 32768 then Integer (H) - 65536 else Integer (H)));
             end;
-         when GGUF_TYPE_U32  => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U32 (FD))));
-         when GGUF_TYPE_I32  => V_Str := To_Unbounded_String (Integer'Image (Integer (Read_U32 (FD))));
-         when GGUF_TYPE_F32  => V_Str := To_Unbounded_String (Float'Image (Read_F32 (FD)));
-         when GGUF_TYPE_BOOL => V_Str := To_Unbounded_String (Boolean'Image (Read_Bool (FD)));
-         when GGUF_TYPE_STR  => V_Str := To_Unbounded_String (Read_String (FD));
-         when GGUF_TYPE_U64  => V_Str := To_Unbounded_String (U64'Image (Read_U64 (FD)));
+         when GGUF_TYPE_U32  => V_Str := To_Unbounded_String (U64'Image (U64 (Read_U32 (S))));
+         when GGUF_TYPE_I32  => V_Str := To_Unbounded_String (Integer'Image (Integer (Read_U32 (S))));
+         when GGUF_TYPE_F32  => V_Str := To_Unbounded_String (Float'Image (Read_F32 (S)));
+         when GGUF_TYPE_BOOL => V_Str := To_Unbounded_String (Boolean'Image (Read_Bool (S)));
+         when GGUF_TYPE_STR  => V_Str := To_Unbounded_String (Read_String (S));
+         when GGUF_TYPE_U64  => V_Str := To_Unbounded_String (U64'Image (Read_U64 (S)));
          when GGUF_TYPE_I64  =>
             declare
-               V : constant U64 := Read_U64 (FD);
+               V : constant U64 := Read_U64 (S);
             begin
                V_Str := To_Unbounded_String (U64'Image (V));
             end;
          when GGUF_TYPE_ARR =>
             declare
-               Arr_Type : constant GGUF_Value_Type := To_Value_Type (Read_U32 (FD));
-               Arr_Len  : constant U64 := Read_U64 (FD);
+               Arr_Type : constant GGUF_Value_Type := To_Value_Type (Read_U32 (S));
+               Arr_Len  : constant U64 := Read_U64 (S);
             begin
                if Arr_Len > Max_Array_Len then
                   raise Constraint_Error with "GGUF array length out of range";
@@ -203,7 +181,7 @@ package body LLM_GGUF is
                V_Str := To_Unbounded_String ("[");
                for I in 1 .. Natural (Arr_Len) loop
                   if I > 1 then Append (V_Str, ", "); end if;
-                  Append (V_Str, Read_Metadata_Value (FD, Arr_Type));
+                  Append (V_Str, Read_Metadata_Value (S, Arr_Type));
                end loop;
                Append (V_Str, "]");
             end;
@@ -317,39 +295,55 @@ package body LLM_GGUF is
    --------------------------------------------------------------------
 
    procedure Open (File : out GGUF_File; Path : String) is
-      FD     : C_Int;
-      Magic  : String (1 .. 4);
-      Version : U32;
-      N_Tensors : U64;
-      N_Meta    : U64;
+      Src : Source_Access;
    begin
-      -- Open file via POSIX. C's open() needs a NUL-terminated string; an Ada
-      -- String is not, so append the terminator explicitly (passing a bare Ada
-      -- String relied on whatever byte followed it in memory — it happened to
-      -- work for a string literal but not for an env-var value).
-      FD := C_Open (Path & Character'Val (0), O_RDONLY, 0);
-      if FD < 0 then
+      --  Open the byte source. Open_Source returns null (rather than raising)
+      --  on a missing / unreadable file, mirroring the historical semantics;
+      --  an actual read error during the parse below raises via Read_Exact.
+      Src := LLM_Byte_Source.Open_Source (Path);
+      if Src = null then
          Ada.Text_IO.Put_Line ("ERROR: cannot open " & Path);
          return;
       end if;
+      --  Hand ownership to Open_From_Source, which parses the header and
+      --  stores the source in File (freed on Close / on a parse failure).
+      Open_From_Source (File, Src);
+   end Open;
+
+   --------------------------------------------------------------------
+   -- Open_From_Source — parse the GGUF header from an already-open source
+   --------------------------------------------------------------------
+
+   procedure Open_From_Source (File : out GGUF_File; Src : Source_Access) is
+      Source     : Source_Access renames Src;  --  keep the parse body readable
+      Magic      : String (1 .. 4);
+      Version    : U32;
+      N_Tensors  : U64;
+      N_Meta     : U64;
+   begin
+      --  Take ownership of the source up front so EVERY failure path (a bad
+      --  magic, an absurd count, or a mid-parse exception) frees it via
+      --  Close (File). This also fixes a latent leak in the old Open, where a
+      --  short read before File.Source was assigned would orphan the source.
+      File.Source := Source;
 
       -- Read magic "GGUF"
-      Read_Exact (FD, Magic'Address, 4);
+      Read_Exact (Source, Magic'Address, 4);
       if Magic /= "GGUF" then
          Ada.Text_IO.Put_Line ("ERROR: not a GGUF file");
-         Ignore (C_Close (FD));
+         Close (File);
          return;
       end if;
 
       -- Version
-      Version := Read_U32 (FD);
+      Version := Read_U32 (Source);
       if Version /= 2 and Version /= 3 then
          Ada.Text_IO.Put_Line ("GGUF version" & U32'Image (Version) & " (expected v2 or v3)");
       end if;
 
       -- Tensor count + metadata count
-      N_Tensors := Read_U64 (FD);
-      N_Meta    := Read_U64 (FD);
+      N_Tensors := Read_U64 (Source);
+      N_Meta    := Read_U64 (Source);
 
       --  Reject an absurd count before allocating / looping. A hostile header
       --  could otherwise force a multi-million-iteration parse (DoS).
@@ -358,14 +352,14 @@ package body LLM_GGUF is
            ("ERROR: GGUF header reports" & U64'Image (N_Tensors)
             & " tensors /" & U64'Image (N_Meta)
             & " metadata (exceeds sanity cap)");
-         Ignore (C_Close (FD));
+         Close (File);
          return;
       end if;
 
       File.Is_Open := True;
-      File.Path := To_Unbounded_String (Path);
       File.Version := Version;
-      File.FD := Integer (FD);
+      --  File.Source was assigned at the top; the path is unknown for a
+      --  remote source, so File.Path stays empty (it is only a debug label).
 
       Ada.Text_IO.Put_Line ("GGUF: version" & U32'Image (Version) &
         ", tensors:" & U64'Image (N_Tensors) &
@@ -374,8 +368,8 @@ package body LLM_GGUF is
       -- Parse metadata key-value pairs
       for I in 1 .. Natural (N_Meta) loop
          declare
-            Key  : constant String := Read_String (FD);
-            VT_Int : constant U32   := Read_U32 (FD);
+            Key  : constant String := Read_String (Source);
+            VT_Int : constant U32   := Read_U32 (Source);
             VT   : constant GGUF_Value_Type := To_Value_Type (VT_Int);
             M    : Metadata_Entry;
             Val  : Unbounded_String;
@@ -388,8 +382,8 @@ package body LLM_GGUF is
                --  containing commas/brackets survives intact.
                declare
                   Arr_Type : constant GGUF_Value_Type :=
-                    To_Value_Type (Read_U32 (FD));
-                  Arr_Len  : constant U64 := Read_U64 (FD);
+                    To_Value_Type (Read_U32 (Source));
+                  Arr_Len  : constant U64 := Read_U64 (Source);
                begin
                   if Arr_Len > Max_Array_Len then
                      raise Constraint_Error
@@ -397,7 +391,7 @@ package body LLM_GGUF is
                   end if;
                   for J in 1 .. Natural (Arr_Len) loop
                      declare
-                        S : constant String := Read_Metadata_Value (FD, Arr_Type);
+                        S : constant String := Read_Metadata_Value (Source, Arr_Type);
                      begin
                         if Key = "tokenizer.ggml.tokens" then
                            File.Tokens.Append (To_Unbounded_String (S));
@@ -410,7 +404,7 @@ package body LLM_GGUF is
                     ("[array:" & Natural'Image (Natural (Arr_Len)) & " ]");
                end;
             else
-               Val := To_Unbounded_String (Read_Metadata_Value (FD, VT));
+               Val := To_Unbounded_String (Read_Metadata_Value (Source, VT));
             end if;
 
             M.Key   := To_Unbounded_String (Key);
@@ -456,8 +450,8 @@ package body LLM_GGUF is
       for I in 1 .. Natural (N_Tensors) loop
          declare
             Info : Tensor_Info;
-            Name : constant String := Read_String (FD);
-            ND   : constant U32 := Read_U32 (FD);
+            Name : constant String := Read_String (Source);
+            ND   : constant U32 := Read_U32 (Source);
          begin
             --  Dims is a 4-element array; a hostile ND > 4 would index out of
             --  bounds in the dim loop below. Reject before reading any dims.
@@ -472,7 +466,7 @@ package body LLM_GGUF is
 
             -- Read dimension array (GGUF stores n_dims followed by that many u64 values)
             for D in 1 .. Natural (ND) loop
-               Info.Dims (D) := Read_U64 (FD);
+               Info.Dims (D) := Read_U64 (Source);
             end loop;
             -- Zero remaining dims
             for D in Natural (ND) + 1 .. 4 loop
@@ -480,8 +474,8 @@ package body LLM_GGUF is
             end loop;
 
             -- Read GGML type + offset
-            Info.Kind := To_GGML_Type (Read_U32 (FD));
-            Info.Offset := Read_U64 (FD);
+            Info.Kind := To_GGML_Type (Read_U32 (Source));
+            Info.Offset := Read_U64 (Source);
 
             --  Compute the validated, overflow-checked byte size ONCE here and
             --  store it; this is the single source of truth consumed by every
@@ -497,33 +491,29 @@ package body LLM_GGUF is
       -- Tensor data begins at the next alignment boundary after the tensor
       -- info section. Per-tensor Info.Offset values are relative to this point.
       declare
-         Pos : constant U64 := U64 (C_LSeek (FD, 0, SEEK_CUR));
+         Pos : constant U64 := U64 (Source.Cursor);
          A   : constant U64 := File.Alignment_Val;
       begin
          File.Data_Start := ((Pos + A - 1) / A) * A;
       end;
 
-      --  Determine the real file length once (seek to end, then restore). Used
-      --  to validate that every tensor's [Data_Start + Offset, + Byte_Size)
-      --  range actually lies within the file — a hostile descriptor could
-      --  otherwise advertise an offset/size that reads past EOF (OOB) or, near
-      --  2^63, produce a negative C_Off in Read_Tensor_Raw.
-      declare
-         End_Pos : constant C_Off := C_LSeek (FD, 0, SEEK_END);
-      begin
-         if End_Pos < 0 then
-            raise Malformed_GGUF with "cannot determine GGUF file size";
-         end if;
-         File.File_Size := U64 (End_Pos);
-         Ignore (C_LSeek (FD, C_Off (File.Data_Start), SEEK_SET));
-      end;
+      --  Determine the real source length once (the Byte_Source probed it at
+      --  Open; querying it does not move the cursor). Used to validate that
+      --  every tensor's [Data_Start + Offset, + Byte_Size) range actually lies
+      --  within the source — a hostile descriptor could otherwise advertise an
+      --  offset/size that reads past the end (OOB).
+      File.File_Size := U64 (Source.Byte_Length);
 
-      --  Validate every tensor against the file length using checked 64-bit
-      --  arithmetic (Checked_Add rejects overflow in the addition itself). The
-      --  read offset C_Off conversion must also stay non-negative.
+      --  Restore the cursor to the aligned data start, so a sequential read
+      --  after the header (if any) begins there. Random tensor reads below do
+      --  their own Seek, so this is for parity only.
+      Source.Seek (Interfaces.Unsigned_64 (File.Data_Start));
+
+      --  Validate every tensor against the source length using checked 64-bit
+      --  arithmetic (Checked_Add rejects overflow in the addition itself).
       for I in 1 .. Natural (File.Tensors.Length) loop
          declare
-            T   : constant Tensor_Info := File.Tensors (I);
+            T       : constant Tensor_Info := File.Tensors (I);
             Abs_Off : constant U64 := Checked_Add (File.Data_Start, T.Offset);
             End_Off : constant U64 := Checked_Add (Abs_Off, T.Byte_Size);
          begin
@@ -534,13 +524,6 @@ package body LLM_GGUF is
                       & U64'Image (End_Off) & " bytes, file is"
                       & U64'Image (File.File_Size) & ")";
             end if;
-            --  Abs_Off <= File_Size <= C_Off'Last here (a real file length is
-            --  far below 2^63), so the C_Off conversion in Read_Tensor_Raw is
-            --  guaranteed non-negative; assert the invariant defensively.
-            if Abs_Off > U64 (C_Off'Last) then
-               raise Malformed_GGUF
-                 with "GGUF tensor offset out of addressable range";
-            end if;
          end;
       end loop;
 
@@ -548,8 +531,9 @@ package body LLM_GGUF is
         " tensors, alignment=" & U64'Image (File.Alignment_Val));
    exception
       --  Any failure mid-parse (malformed header, short read, overflow) must
-      --  not leak the file descriptor opened above and must not surface as a
-      --  raw Constraint_Error. Close the fd and re-raise as Malformed_GGUF.
+      --  not leak the byte source (owned by File since the top of this body)
+      --  and must not surface as a raw Constraint_Error. Close+free the source
+      --  and re-raise as Malformed_GGUF.
       when Malformed_GGUF =>
          Close (File);
          raise;
@@ -557,7 +541,7 @@ package body LLM_GGUF is
          Close (File);
          raise Malformed_GGUF
            with "GGUF parse error: " & Ada.Exceptions.Exception_Message (E);
-   end Open;
+   end Open_From_Source;
 
    --------------------------------------------------------------------
    -- Accessors
@@ -649,20 +633,19 @@ package body LLM_GGUF is
       Buffer : System.Address;
       Buf_Size : Natural)
    is
-      FD  : constant C_Int := C_Int (File.FD);
       --  Info.Offset is relative to the aligned data-section start. Use checked
-      --  64-bit arithmetic and bound the read against the file length so a
+      --  64-bit arithmetic and bound the read against the source length so a
       --  malformed tensor (validated in Open, but re-checked here defensively)
-      --  can never read past EOF or convert to a negative C_Off.
+      --  can never read past the end. The Byte_Source.Seek additionally rejects
+      --  an offset past the length.
       Abs_Off : constant U64 := Checked_Add (File.Data_Start, Info.Offset);
       End_Off : constant U64 := Checked_Add (Abs_Off, U64 (Buf_Size));
-      Off     : constant C_Off := C_Off (Abs_Off);
    begin
       if File.File_Size /= 0 and then End_Off > File.File_Size then
          raise Malformed_GGUF with "Read_Tensor_Raw past end of file";
       end if;
-      Ignore (C_LSeek (FD, Off, SEEK_SET));
-      Read_Exact (FD, Buffer, Buf_Size);
+      File.Source.Seek (Interfaces.Unsigned_64 (Abs_Off));
+      Read_Exact (File.Source, Buffer, Buf_Size);
    end Read_Tensor_Raw;
 
    procedure Read_Tensor_Range
@@ -672,20 +655,17 @@ package body LLM_GGUF is
       Buffer      : System.Address;
       Buf_Size    : Natural)
    is
-      FD  : constant C_Int := C_Int (File.FD);
-      --  Checked 64-bit arithmetic + file-length bound (see Read_Tensor_Raw):
-      --  the unchecked U64 -> C_Off conversion could otherwise go negative near
-      --  2^63, and an over-range Byte_Offset could read past EOF.
+      --  Checked 64-bit arithmetic + source-length bound (see Read_Tensor_Raw):
+      --  an over-range Byte_Offset must read past the end loud, not silently.
       Abs_Off : constant U64 :=
         Checked_Add (Checked_Add (File.Data_Start, Info.Offset), Byte_Offset);
       End_Off : constant U64 := Checked_Add (Abs_Off, U64 (Buf_Size));
-      Off     : constant C_Off := C_Off (Abs_Off);
    begin
       if File.File_Size /= 0 and then End_Off > File.File_Size then
          raise Malformed_GGUF with "Read_Tensor_Range past end of file";
       end if;
-      Ignore (C_LSeek (FD, Off, SEEK_SET));
-      Read_Exact (FD, Buffer, Buf_Size);
+      File.Source.Seek (Interfaces.Unsigned_64 (Abs_Off));
+      Read_Exact (File.Source, Buffer, Buf_Size);
    end Read_Tensor_Range;
 
    --  Validated byte size, computed once in Open and stored in Info.Byte_Size.
@@ -711,37 +691,35 @@ package body LLM_GGUF is
 
    procedure Close (File : in out GGUF_File) is
    begin
-      if File.FD >= 0 then
-         Ignore (C_Close (C_Int (File.FD)));
-         File.FD := -1;
-      end if;
+      --  Free_Source dispatches Close (releases the fd / connection) and then
+      --  deallocates the access; idempotent on null. After this File.Source is
+      --  null and the underlying resource is released exactly once.
+      LLM_Byte_Source.Free_Source (File.Source);
       File.Is_Open := False;
       File.Tensors.Clear;
       File.Meta.Clear;
    end Close;
 
    function Is_GGUF (Path : String) return Boolean is
-      FD : C_Int;
+      S     : Source_Access;
       Magic : String (1 .. 4);
+      Ok    : Boolean := False;
    begin
-      --  C's open() needs a NUL-terminated string; an Ada String is not, so
-      --  append the terminator explicitly (see Open above for the same fix —
-      --  passing a bare Ada String read past the boundary until a random 0).
-      FD := C_Open (Path & Character'Val (0), O_RDONLY, 0);
-      if FD < 0 then
+      --  Open the source; null means missing / unreadable (not a GGUF).
+      S := LLM_Byte_Source.Open_Source (Path);
+      if S = null then
          return False;
       end if;
       declare
-         N : C_Int;
       begin
-         N := C_Read (FD, Magic'Address, 4);
-         if N /= 4 then
-            Ignore (C_Close (FD));
-            return False;
-         end if;
+         S.Read_Seq (Magic'Address, 4);
+         Ok := Magic = "GGUF";
+      exception
+         when others =>
+            Ok := False;   --  short read (< 4 bytes): not a GGUF
       end;
-      Ignore (C_Close (FD));
-      return Magic = "GGUF";
+      LLM_Byte_Source.Free_Source (S);
+      return Ok;
    end Is_GGUF;
 
 end LLM_GGUF;

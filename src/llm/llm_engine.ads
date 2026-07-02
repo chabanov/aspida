@@ -13,14 +13,44 @@
 with LLM_Qwen;
 with LLM_Backend;
 with LLM_Sampler;
+with LLM_Byte_Source;  --  H19: Load_From_Source takes a Byte_Source_Access
 
 package LLM_Engine is
+
+   --  `=` / `/=` on the byte-source access (used by Load_From_Source's Pre).
+   use type LLM_Byte_Source.Byte_Source_Access;
 
    type Engine is private;
 
    Model_Load_Error : exception;
 
    function Load (Path : String) return Engine;
+
+   --  H19 (weight-streaming): load a model whose bytes arrive over the
+   --  encrypted channel (a Remote_AEAD_Source) instead of from a local file.
+   --  Opens the GGUF on the source ONCE, detects general.architecture from
+   --  the parsed metadata, and dispatches to the matching backend's
+   --  Create_From_File (which reads the tensors and closes the file, freeing
+   --  the source). The inference path is reused unchanged — only the weight
+   --  source differs from Load. Src is consumed (freed) on both success and
+   --  failure. Today only the llama architecture implements Create_From_File;
+   --  other arches raise Model_Load_Error with a clear "not yet implemented"
+   --  message (adding them is one Create_From_File per backend).
+   function Load_From_Source
+     (Src : LLM_Byte_Source.Byte_Source_Access) return Engine
+     with Pre => Src /= null;
+
+   --  H19 Phase 7 partial-model warm: like Load_From_Source but loads only the
+   --  head + first K transformer blocks eagerly and streams blocks K+1..N in
+   --  the background while inference runs — bounding time-to-first-token for a
+   --  remote (encrypted-channel) source. The engine can start Chat at once;
+   --  the forward pass blocks per-layer only if it out-runs the fetcher. K is
+   --  clamped by the backend to 1 .. block_count (K >= block_count degenerates
+   --  to the eager full load). Src is consumed (freed) on both success and
+   --  failure. Today only the llama architecture implements the partial path.
+   function Load_From_Source_Partial
+     (Src : LLM_Byte_Source.Byte_Source_Access; K : Positive) return Engine
+     with Pre => Src /= null;
 
    --  Tear down an engine and free everything its backend owns (Phase 1b LRU
    --  eviction): dispatches to the backend's Release, then deallocates the
