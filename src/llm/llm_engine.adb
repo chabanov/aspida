@@ -189,13 +189,21 @@ package body LLM_Engine is
                     "Load_From_Source_Partial not yet implemented for architecture '"
                     & Arch & "' (needs a Create_From_File_Partial in its backend)";
                end if;
-               --  Transfers ownership of G to the backend (the model keeps it
-               --  alive for the fetcher). On success G is the backend's; on a
-               --  backend failure G has already been freed by the backend
-               --  (Load_From_File_Partial's handler frees M.GGUF), so we must
-               --  NOT double-free: null our handle after the dispatch.
-               R.Make_From_File_Partial (G, K, Impl);
-               G := null;   --  ownership transferred (success or backend-freed)
+               --  Ownership of G transfers to the backend the instant we
+               --  dispatch: on success the model keeps it alive (M.GGUF) for
+               --  the fetcher; on a backend failure Load_From_File_Partial's
+               --  handler frees M.GGUF (== this same pointer) and re-raises.
+               --  Either way the engine must NOT touch G afterwards, so null
+               --  our handle FIRST and dispatch on a local copy. If we nulled
+               --  only after the call (the old code), a backend exception
+               --  would skip the assignment and leave G dangling for the
+               --  `when others` Cleanup to double-free / use-after-free.
+               declare
+                  Owned : constant LLM_GGUF.GGUF_Ptr := G;
+               begin
+                  G := null;   --  ownership handed off; Cleanup is now a no-op
+                  R.Make_From_File_Partial (Owned, K, Impl);
+               end;
                return (Impl => Impl);
             end if;
          end loop;
@@ -207,8 +215,9 @@ package body LLM_Engine is
    exception
       when others =>
          --  A failure before the dispatch (or an unsupported arch) leaves us
-         --  owning G — free it. A backend failure already freed G and nulled
-         --  our handle, so Cleanup is a no-op there.
+         --  owning G — free it. Once we dispatch, G is already null (we hand
+         --  ownership off before the call), so a backend failure that frees
+         --  M.GGUF and re-raises lands here with Cleanup as a safe no-op.
          Cleanup;
          raise;
    end Load_From_Source_Partial;

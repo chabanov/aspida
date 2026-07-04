@@ -20,6 +20,7 @@ package body LLM_Weight_Cache is
    use Crypto;                       --  spec withs it
    use type Interfaces.Unsigned_8;   --  '=' on bytes
    use type Interfaces.Unsigned_32;  --  arithmetic on Key_Len
+   use type Interfaces.Unsigned_64;  --  '/=' on the bound chunk index
 
    procedure Free is new Ada.Unchecked_Deallocation (Crypto.Byte_Array, Byte_Array_Access);
 
@@ -69,6 +70,29 @@ package body LLM_Weight_Cache is
       or Interfaces.Shift_Left (U32 (A (A'First + Off + 1)), 16)
       or Interfaces.Shift_Left (U32 (A (A'First + Off + 2)), 8)
       or U32 (A (A'First + Off + 3)));
+
+   procedure Put_BE64
+     (A : in out Crypto.Byte_Array; Off : Natural; V : Interfaces.Unsigned_64)
+   is
+      use Interfaces;
+   begin
+      for I in 0 .. 7 loop
+         A (A'First + Off + I) :=
+           U8 (Shift_Right (V, (7 - I) * 8) and 16#FF#);
+      end loop;
+   end Put_BE64;
+
+   function Get_BE64
+     (A : Crypto.Byte_Array; Off : Natural) return Interfaces.Unsigned_64
+   is
+      use Interfaces;
+      R : Unsigned_64 := 0;
+   begin
+      for I in 0 .. 7 loop
+         R := Shift_Left (R, 8) or Unsigned_64 (A (A'First + Off + I));
+      end loop;
+      return R;
+   end Get_BE64;
 
    function Open
      (Dir       : String;
@@ -129,7 +153,7 @@ package body LLM_Weight_Cache is
          PT : constant Crypto.Byte_Array := At_Rest.Load (Path, C.Pass.all);
          K  : constant String := To_String (C.Key);
       begin
-         --  Parse [Key_Len BE32][Key bytes][Chunk bytes].
+         --  Parse [Key_Len BE32][Key bytes][Index BE64][Chunk bytes].
          if PT'Length < 4 then
             raise Cache_Error with "chunk blob too short";
          end if;
@@ -137,8 +161,11 @@ package body LLM_Weight_Cache is
          declare
             K_Len : constant Crypto.U32 := Get_BE32 (PT, 0);
          begin
-            if Natural (K_Len) > PT'Length - 4 then
-               raise Cache_Error with "chunk blob key length out of range";
+            --  Header must fit: 4 (Key_Len) + Key + 8 (Index).
+            if Natural (K_Len) > PT'Length - 4
+              or else Natural (K_Len) + 8 > PT'Length - 4
+            then
+               raise Cache_Error with "chunk blob header out of range";
             end if;
 
             --  A key mismatch means this blob belongs to a different model
@@ -154,13 +181,21 @@ package body LLM_Weight_Cache is
                end if;
             end loop;
 
+            --  The AEAD already authenticates the bytes; this rejects a chunk
+            --  file that was renamed/swapped to a different index's path (the
+            --  index lives in the filename, which is NOT authenticated). A
+            --  mismatch is a miss, so the caller refetches the correct chunk.
+            if Get_BE64 (PT, 4 + K'Length) /= Index then
+               raise Cache_Miss with "chunk cached under a different index";
+            end if;
+
             declare
-               Chunk_Len : constant Natural := PT'Length - 4 - K'Length;
+               Chunk_Len : constant Natural := PT'Length - 4 - K'Length - 8;
                D         : constant Byte_Array_Access :=
                  new Crypto.Byte_Array (0 .. Chunk_Len - 1);
             begin
                for I in 0 .. Chunk_Len - 1 loop
-                  D (I) := PT (4 + K'Length + I);
+                  D (I) := PT (4 + K'Length + 8 + I);
                end loop;
                return D;
             end;
@@ -188,7 +223,11 @@ package body LLM_Weight_Cache is
    is
       Path : constant String := Chunk_Path (C, Index);
       K    : constant String := To_String (C.Key);
-      PT   : Crypto.Byte_Array (0 .. 3 + K'Length + Data'Length);
+      --  Authenticated plaintext: [Key_Len BE32][Key][Index BE64][Chunk].
+      --  Binding the chunk index inside the AEAD (not just the filename) means
+      --  a swapped/renamed chunk file fails the index check on Load and is
+      --  treated as a miss rather than served at the wrong offset.
+      PT   : Crypto.Byte_Array (0 .. 3 + K'Length + 8 + Data'Length);
    begin
       if not C.On then
          return;   --  disabled: no-op (in-memory cache still holds the chunk)
@@ -198,8 +237,9 @@ package body LLM_Weight_Cache is
       for I in K'Range loop
          PT (4 + (I - K'First)) := Crypto.U8 (Character'Pos (K (I)));
       end loop;
+      Put_BE64 (PT, 4 + K'Length, Index);
       for I in Data'Range loop
-         PT (4 + K'Length + (I - Data'First)) := Data (I);
+         PT (4 + K'Length + 8 + (I - Data'First)) := Data (I);
       end loop;
 
       At_Rest.Save (Path, C.Pass.all, PT);

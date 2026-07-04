@@ -23,7 +23,8 @@ project Weight_Tests is
    for Main use ("test_weight_stream.adb", "test_weight_cache.adb",
                  "test_weight_disk.adb", "test_weight_pin.adb",
                  "test_weight_prefetch.adb", "test_weight_parity.adb",
-                 "test_weight_egress.adb", "test_weight_partial.adb");
+                 "test_weight_egress.adb", "test_weight_partial.adb",
+                 "test_weight_concurrent.adb");
 
    package Compiler is
       for Default_Switches ("Ada") use Shared.Ada_O3;

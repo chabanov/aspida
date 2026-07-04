@@ -11,8 +11,13 @@
 -- never silent cross-model corruption.
 --
 -- Cache_Key today is an opaque string (the model id); Phase 4 will pass the
--- attested model hash instead, so the key becomes trustworthy. The storage
--- layer is unchanged by that.
+-- attested model HASH instead, so the key becomes trustworthy. Until then the
+-- cache binds the key and the chunk index into every blob, but NOT the model's
+-- content/version: if an operator republishes a *different* model under the
+-- same id, a warm client can still unseal and serve the stale bytes (the key
+-- matches). Fail-loud on a content change requires the attested hash — that is
+-- the Phase-4 upgrade, and it is a key-derivation change only; the storage
+-- layer below is unchanged by it.
 --
 -- Opt-in: a cache with an empty Dir or empty Pass is disabled (Has -> False,
 -- Store -> no-op); the in-memory chunk cache in Remote_AEAD_Source still
@@ -21,7 +26,10 @@
 --
 -- File layout: <Dir>/<Sanitized_Key>/chunk_<Index>.enc, where the sealed
 -- blob is At_Rest's format wrapping plaintext = [Key_Len BE32][Key bytes]
--- [Chunk bytes]. A tampered file → At_Rest.Decrypt_Error → Cache_Error.
+-- [Index BE64][Chunk bytes]. Both the key and the chunk index are inside the
+-- AEAD, so a blob read under the wrong key OR moved to a different index's
+-- filename fails loud (Cache_Miss); a tampered file → Decrypt_Error →
+-- Cache_Error.
 ---------------------------------------------------------------------
 
 with Ada.Strings.Unbounded;

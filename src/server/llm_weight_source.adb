@@ -8,6 +8,7 @@
 -- range from a local Byte_Source via absolute offset and returns the bytes.
 ---------------------------------------------------------------------
 
+with Ada.Containers;
 with Ada.Environment_Variables;
 with Ada.Unchecked_Deallocation;
 with Crypto;
@@ -28,6 +29,16 @@ package body LLM_Weight_Source is
    ------------------------------------------------------------------
    -- Client side
    ------------------------------------------------------------------
+
+   --  Hash a chunk index for the in-memory Chunk_Maps cache. Chunk indices are
+   --  dense (0, 1, 2, ...), so the identity hash (mod the map's bucket count)
+   --  distributes them perfectly with no clustering.
+   function Hash_U64
+     (K : Interfaces.Unsigned_64) return Ada.Containers.Hash_Type is
+   begin
+      return Ada.Containers.Hash_Type
+        (K mod Interfaces.Unsigned_64 (Ada.Containers.Hash_Type'Last));
+   end Hash_U64;
 
    --  Read an environment variable, returning Default when unset. Used for
    --  the opt-in cache knobs so an unset var leaves the on-disk cache off.
@@ -97,13 +108,12 @@ package body LLM_Weight_Source is
      (S     : in out Remote_AEAD_Source;
       Index : Interfaces.Unsigned_64) return Byte_Array_Access
    is
+      Existing : constant Chunk_Maps.Cursor := S.Cache.Find (Index);
    begin
-      --  Tier 1: in-memory cache.
-      for E of S.Cache loop
-         if E.Index = Index then
-            return E.Data;
-         end if;
-      end loop;
+      --  Tier 1: in-memory cache (O(1) hashed lookup).
+      if Chunk_Maps.Has_Element (Existing) then
+         return Chunk_Maps.Element (Existing);
+      end if;
 
       --  Tier 2: on-disk AEAD-sealed cache. D is an access type (default null),
       --  so the Load call lives in the statement part — that is what makes the
@@ -118,7 +128,7 @@ package body LLM_Weight_Source is
             D : Byte_Array_Access;
          begin
             D := LLM_Weight_Cache.Load (S.Disk, Index);
-            S.Cache.Append (Chunk_Cache_Entry'(Index => Index, Data => D));
+            S.Cache.Insert (Index, D);
             return D;
          exception
             when LLM_Weight_Cache.Cache_Miss =>
@@ -161,7 +171,7 @@ package body LLM_Weight_Source is
                for I in 0 .. Natural (Count) - 1 loop
                   D (I) := Resp (Resp'First + 1 + I);
                end loop;
-               S.Cache.Append (Chunk_Cache_Entry'(Index => Index, Data => D));
+               S.Cache.Insert (Index, D);
 
                --  Record this outbound (tier-3) fetch in the opt-in log. This
                --  is the only place a genuine channel fetch happens, so the log
@@ -189,15 +199,31 @@ package body LLM_Weight_Source is
       end;
    end Fetch_Chunk;
 
-   overriding procedure Read_Seq
+   --  Positional read from the chunk cache: serve Count bytes starting at the
+   --  absolute Off, fetching any missing chunk on demand. Does NOT touch S.Pos,
+   --  so it composes for both the cursor-based Read_Seq and any positional
+   --  caller. (The remote source is not shared across tasks — the client owns
+   --  it for its session — but implementing the positional primitive keeps the
+   --  interface uniform and lets a caller read a range without a seek.)
+   overriding procedure Read_At_Pos
      (S     : in out Remote_AEAD_Source;
+      Off   : Interfaces.Unsigned_64;
       Addr  : System.Address;
       Count : Natural)
    is
       Remaining : Natural          := Count;
       Cur       : System.Address   := Addr;
-      Cur_Pos   : Interfaces.Unsigned_64 := S.Pos;
+      Cur_Pos   : Interfaces.Unsigned_64 := Off;
    begin
+      --  Fail loud on an out-of-range request (honouring the interface
+      --  contract), matching Local_File_Source, rather than surfacing it as a
+      --  Fetch_Chunk failure or a Constraint_Error on the tail chunk.
+      if Off > S.Len
+        or else Interfaces.Unsigned_64 (Count) > S.Len - Off
+      then
+         raise LLM_Byte_Source.Malformed_Source
+           with "positional read past end of stream";
+      end if;
       while Remaining > 0 loop
          declare
             Chunk_Index : constant Interfaces.Unsigned_64 := Cur_Pos / Chunk_Size;
@@ -228,6 +254,15 @@ package body LLM_Weight_Source is
             Remaining := Remaining - Take;
          end;
       end loop;
+   end Read_At_Pos;
+
+   overriding procedure Read_Seq
+     (S     : in out Remote_AEAD_Source;
+      Addr  : System.Address;
+      Count : Natural)
+   is
+   begin
+      Read_At_Pos (S, S.Pos, Addr, Count);
       S.Pos := S.Pos + Interfaces.Unsigned_64 (Count);
    end Read_Seq;
 
@@ -259,16 +294,16 @@ package body LLM_Weight_Source is
    overriding procedure Close (S : in out Remote_AEAD_Source) is
       procedure Free is new Ada.Unchecked_Deallocation
         (Crypto.Byte_Array, Byte_Array_Access);
-      E : Chunk_Cache_Entry;
+      D : Byte_Array_Access;
    begin
       --  Release only the owned chunk buffers; the channel + transport are
       --  caller-owned and left open. The disk cache is closed (password
       --  wiped) but its sealed files persist for the next session. Idempotent.
-      while not S.Cache.Is_Empty loop
-         E := S.Cache.Last_Element;
-         S.Cache.Delete_Last;
-         Free (E.Data);
+      for C in S.Cache.Iterate loop
+         D := Chunk_Maps.Element (C);
+         Free (D);
       end loop;
+      S.Cache.Clear;
       LLM_Weight_Cache.Close (S.Disk);
    end Close;
 
@@ -380,12 +415,16 @@ package body LLM_Weight_Source is
                      Secure_Channel.Send_Message
                        (Ch, Trans, LLM_Weight_Proto.Encode_WErr ("count out of range"));
                   else
-                     --  read the range from the local model and reply WData
+                     --  Read the range from the local model and reply WData.
+                     --  Positional read (Read_At_Pos), NOT Seek + Read_Seq:
+                     --  serving concurrent clients from ONE shared Model source
+                     --  must not race on a single mutable cursor. pread on the
+                     --  underlying fd is atomic w.r.t. the offset, so N clients
+                     --  read disjoint ranges of the immutable GGUF in parallel.
                      declare
                         Buf : Crypto.Byte_Array (0 .. Natural (Count) - 1);
                      begin
-                        Model.Seek (Off);
-                        Model.Read_Seq (Buf'Address, Natural (Count));
+                        Model.Read_At_Pos (Off, Buf'Address, Natural (Count));
                         Secure_Channel.Send_Message
                           (Ch, Trans, LLM_Weight_Proto.Encode_WData (Buf));
                      end;

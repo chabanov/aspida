@@ -24,6 +24,12 @@ package body LLM_Byte_Source is
      with Import, Convention => C, External_Name => "open";
    function C_Read  (FD : C_Int; Buf : System.Address; Count : C_Size) return C_Int
      with Import, Convention => C, External_Name => "read";
+   --  pread: positional read at an absolute offset that does NOT use or move
+   --  the fd's file-offset. POSIX guarantees it is atomic w.r.t. the offset,
+   --  so concurrent tasks sharing one fd never race on the cursor.
+   function C_PRead (FD : C_Int; Buf : System.Address; Count : C_Size;
+                     Offset : C_Off) return C_Int
+     with Import, Convention => C, External_Name => "pread";
    function C_LSeek (FD : C_Int; Offset : C_Off; Whence : C_Int) return C_Off
      with Import, Convention => C, External_Name => "lseek";
    function C_Close (FD : C_Int) return C_Int
@@ -149,6 +155,40 @@ package body LLM_Byte_Source is
       Ignore (C_LSeek (C_Int (S.FD), C_Off (Off), SEEK_SET));
       S.Pos := Off;
    end Seek;
+
+   --  Positional read via pread: reads Count bytes at absolute Off without
+   --  using or moving the fd cursor, so several tasks can read one shared
+   --  read-only fd (e.g. the weight server serving concurrent clients from one
+   --  GGUF) with no cursor race. Loops over short reads exactly like Read_Seq.
+   overriding procedure Read_At_Pos
+     (S     : in out Local_File_Source;
+      Off   : Interfaces.Unsigned_64;
+      Addr  : System.Address;
+      Count : Natural)
+   is
+      use System.Storage_Elements;
+      Remaining : Natural        := Count;
+      Cur       : System.Address := Addr;
+      Cur_Off   : Interfaces.Unsigned_64 := Off;
+      N         : C_Int;
+   begin
+      --  Fail loud on an out-of-range request (matching Seek's discipline) so
+      --  a hostile offset/count never reads past the file into adjacent bytes.
+      if Off > S.Len
+        or else Interfaces.Unsigned_64 (Count) > S.Len - Off
+      then
+         raise Malformed_Source with "positional read past end of byte source";
+      end if;
+      while Remaining > 0 loop
+         N := C_PRead (C_Int (S.FD), Cur, C_Size (Remaining), C_Off (Cur_Off));
+         if N <= 0 then
+            raise Malformed_Source with "short pread from byte source";
+         end if;
+         Remaining := Remaining - Natural (N);
+         Cur     := Cur + Storage_Offset (N);
+         Cur_Off := Cur_Off + Interfaces.Unsigned_64 (N);
+      end loop;
+   end Read_At_Pos;
 
    overriding procedure Close (S : in out Local_File_Source) is
    begin

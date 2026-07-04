@@ -32,6 +32,7 @@
 ---------------------------------------------------------------------
 
 with Ada.Containers.Vectors;
+with Ada.Containers.Hashed_Maps;
 with Ada.Strings.Unbounded;
 with Interfaces;
 with System;
@@ -80,6 +81,12 @@ package LLM_Weight_Source is
       Addr  : System.Address;
       Count : Natural);
 
+   overriding procedure Read_At_Pos
+     (S     : in out Remote_AEAD_Source;
+      Off   : Interfaces.Unsigned_64;
+      Addr  : System.Address;
+      Count : Natural);
+
    overriding function Byte_Length
      (S : Remote_AEAD_Source) return Interfaces.Unsigned_64;
 
@@ -120,9 +127,11 @@ package LLM_Weight_Source is
    ------------------------------------------------------------------
 
    --  Serve Tag_WReq records addressed to Model (a local Byte_Source — e.g. a
-   --  Local_File_Source opened on the GGUF). Each request reads its range
-   --  via absolute offset (Seek + Read_Seq on Model) and replies Tag_WData;
-   --  per-request failures reply Tag_WErr and the loop continues.
+   --  Local_File_Source opened on the GGUF). Each request reads its range with
+   --  a positional read (Model.Read_At_Pos, backed by pread) and replies
+   --  Tag_WData; per-request failures reply Tag_WErr and the loop continues.
+   --  The positional read carries the offset in the syscall and never touches
+   --  a shared cursor, so serving concurrent clients from one Model is safe.
    --
    --  Max_Requests bounds the run: 0 = serve until a transport/handshake
    --  exception (the production mode — a socket close ends the loop); >0 =
@@ -142,13 +151,28 @@ private
    --  cache returns the same access type, so a disk-loaded chunk drops straight
    --  into the in-memory vector with no copy).
    subtype Byte_Array_Access is LLM_Weight_Cache.Byte_Array_Access;
+   --  Make the predefined "=" on the access type directly visible so the
+   --  Hashed_Maps instantiation below (which needs "=" on Element_Type for
+   --  its default Element equality) resolves it.
+   use type LLM_Weight_Cache.Byte_Array_Access;
 
-   type Chunk_Cache_Entry is record
-      Index : Interfaces.Unsigned_64;   --  chunk number (Offset / Chunk_Size)
-      Data  : Byte_Array_Access;         --  owned chunk bytes (0-based)
-   end record;
+   --  In-memory chunk cache keyed by chunk index. A hashed map gives O(1)
+   --  lookup on the hot path: during inference the GGUF parser drives one
+   --  Fetch_Chunk per chunk read, and after Prefetch_All the whole model is
+   --  resident (tens of thousands of chunks for a multi-GB model). A linear
+   --  vector scan per Fetch_Chunk would make the streamed load O(N^2); the map
+   --  keeps it O(N). The map OWNS each Byte_Array_Access value and frees it on
+   --  Close. Memory footprint is unchanged from the vector (one buffer per
+   --  resident chunk) — this fixes only the lookup cost, not residency, since
+   --  the oblivious Prefetch_All intentionally keeps every chunk in RAM.
+   function Hash_U64
+     (K : Interfaces.Unsigned_64) return Ada.Containers.Hash_Type;
 
-   package Chunk_Vectors is new Ada.Containers.Vectors (Positive, Chunk_Cache_Entry);
+   package Chunk_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Interfaces.Unsigned_64,
+      Element_Type    => Byte_Array_Access,
+      Hash            => Hash_U64,
+      Equivalent_Keys => Interfaces."=");
 
    --  Outbound-fetch log: the chunk index of every successful tier-3 (channel)
    --  fetch, in order. Off by default (Log_On = False); Enable_Fetch_Log flips
@@ -169,7 +193,7 @@ private
       Model_ID : Ada.Strings.Unbounded.Unbounded_String;
       Len      : Interfaces.Unsigned_64 := 0;
       Pos      : Interfaces.Unsigned_64 := 0;
-      Cache    : Chunk_Vectors.Vector;
+      Cache    : Chunk_Maps.Map;
       --  Opt-in on-disk AEAD-sealed chunk cache. Disabled by default (Open
       --  leaves it disabled unless ASPIDA_WEIGHT_CACHE_DIR/PASS are set).
       Disk     : LLM_Weight_Cache.Weight_Cache;

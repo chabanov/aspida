@@ -251,6 +251,7 @@ test-weight: ## H19 weight-streaming: remote-sourced GGUF read byte-identical to
 	./obj/test_weight_parity
 	./obj/test_weight_egress
 	./obj/test_weight_partial
+	./obj/test_weight_concurrent
 
 .PHONY: prove
 prove: ## SPARK: full AoRTE+functional proof of crypto root, ChaCha20, SHA-256, HKDF & PBKDF2; flow for the rest

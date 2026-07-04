@@ -327,6 +327,13 @@ package body LLM_GGUF is
       --  short read before File.Source was assigned would orphan the source.
       File.Source := Source;
 
+      --  Parse from the start of the source regardless of where its cursor
+      --  currently sits. A caller may have consumed the source before handing
+      --  it over — e.g. LLM_Weight_Pin.Hash_Source reads the whole thing to
+      --  verify a pinned digest and leaves the cursor at EOF — and the magic
+      --  read below must not pick up from that stale position.
+      Source.Seek (0);
+
       -- Read magic "GGUF"
       Read_Exact (Source, Magic'Address, 4);
       if Magic /= "GGUF" then
@@ -506,8 +513,19 @@ package body LLM_GGUF is
 
       --  Restore the cursor to the aligned data start, so a sequential read
       --  after the header (if any) begins there. Random tensor reads below do
-      --  their own Seek, so this is for parity only.
-      Source.Seek (Interfaces.Unsigned_64 (File.Data_Start));
+      --  their own Seek, so this is for parity only — and MUST stay tolerant:
+      --  a valid metadata-only / zero-tensor GGUF (or one written without
+      --  trailing alignment padding) has an aligned Data_Start that rounds up
+      --  past the physical end, and a strict Seek would reject it. Swallow the
+      --  past-EOF case (the old lseek-and-discard behaviour); a genuinely
+      --  short file is still caught by the per-tensor End_Off > File_Size
+      --  bound below.
+      begin
+         Source.Seek (Interfaces.Unsigned_64 (File.Data_Start));
+      exception
+         when LLM_Byte_Source.Malformed_Source =>
+            null;
+      end;
 
       --  Validate every tensor against the source length using checked 64-bit
       --  arithmetic (Checked_Add rejects overflow in the addition itself).

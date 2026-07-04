@@ -83,6 +83,20 @@ package LLM_Byte_Source is
    procedure Prefetch_All
      (S : in out Byte_Source) is null;
 
+   --  Read Count bytes at absolute offset Off WITHOUT using or moving the
+   --  cursor — a positional read. This is the concurrency-safe primitive the
+   --  weight server needs: N clients can read ranges of ONE immutable source
+   --  in parallel with no shared mutable cursor to race on. Local_File_Source
+   --  implements it with pread (genuinely lock-free across tasks sharing one
+   --  fd); Remote_AEAD_Source implements it over its chunk cache without
+   --  touching S.Pos. Raises Malformed_Source on a short read or an
+   --  out-of-range Off/Count.
+   procedure Read_At_Pos
+     (S     : in out Byte_Source;
+      Off   : Interfaces.Unsigned_64;
+      Addr  : System.Address;
+      Count : Natural) is abstract;
+
    ------------------------------------------------------------------
    -- Concrete class-wide helpers (non-dispatching, call the primitives)
    ------------------------------------------------------------------
@@ -127,6 +141,12 @@ package LLM_Byte_Source is
    overriding procedure Seek
      (S   : in out Local_File_Source;
       Off : Interfaces.Unsigned_64);
+
+   overriding procedure Read_At_Pos
+     (S     : in out Local_File_Source;
+      Off   : Interfaces.Unsigned_64;
+      Addr  : System.Address;
+      Count : Natural);
 
    overriding procedure Close (S : in out Local_File_Source);
 
