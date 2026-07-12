@@ -170,7 +170,18 @@ beyond for batched serving (the `_wb` batched kernels already exist).
 | per-matvec MoE (start) | 2.12 | 1.00× |
 | + resident MoE experts (Increment 1) | 2.61 | 1.23× |
 | + dense LM head on GPU | 3.20 | 1.51× |
-| + resident delta-net recurrence (Increment 2) | **7.18** | **3.39×** |
+| + resident delta-net recurrence (Increment 2) | 7.18 | 3.39× |
+| + F32 router → GPU dense (the 57 ms/token hidden CPU cost) | 15.14 | 7.1× |
+| + fused MoE (30 launches → 2 kernels) | 17.45 | 8.2× |
+| + WHOLE delta-net layer resident (1 H2D + 1 D2H) | 23.66 | 11.2× |
+| + WHOLE full-attn layer resident (KV on device, RoPE port) | **58.81** | **27.7×** |
+
+**47 % of the 124 tok/s ollama reference.** Remaining ~14.3 ms/token wall:
+MoE.Forward internals ~3.6 ms (router-call overhead 0.8 + experts 2.7), attention
+~3 ms steady, LM head ~1.5–2 ms (1.2 GB f32 read — f16 would halve it), CPU
+norms/residuals/Ada tensor copies ~2.4 ms, sampler + E2EE proxy ~1.5 ms.
+**Phase C (the resident chain + CUDA graph) collapses the per-layer H2D/D2H
+(72/token) and the CPU between-ops — the remaining structural lever to 124.**
 
 Per-token breakdown flips as each hot spot falls:
 - at 3.20 tok/s (0.312 s): attention/delta-net 0.163 s (**52%**), MoE 0.083 s,
