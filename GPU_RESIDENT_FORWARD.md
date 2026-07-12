@@ -165,26 +165,31 @@ for prefill, per-op occupancy tuning. Push toward the ~124 tok/s baseline and
 beyond for batched serving (the `_wb` batched kernels already exist).
 
 ### Progress so far (RTX 6000 Ada, Hura Q4_K_M, measured)
-| Step | tok/s | note |
+| Step | tok/s | cumulative |
 |---|---|---|
-| per-matvec MoE (start) | 2.12 | GPU ~4% |
-| + resident MoE experts (Increment 1) | 2.61 | |
-| + dense LM head on GPU | 3.20 | **1.51× cumulative** |
+| per-matvec MoE (start) | 2.12 | 1.00× |
+| + resident MoE experts (Increment 1) | 2.61 | 1.23× |
+| + dense LM head on GPU | 3.20 | 1.51× |
+| + resident delta-net recurrence (Increment 2) | **7.18** | **3.39×** |
 
-Per-token breakdown at 3.20 tok/s (0.312 s): **attention/delta-net 0.163 s
-(52%)**, MoE 0.083 s (27%), LM head 0.004 s (1%), rest ~0.062 s (norms / embed /
-sampling / E2EE proxy). GPU util still ~4% — the engine is CPU/serial-bound.
+Per-token breakdown flips as each hot spot falls:
+- at 3.20 tok/s (0.312 s): attention/delta-net 0.163 s (**52%**), MoE 0.083 s,
+  LM head 0.004 s, rest ~0.062 s.
+- at 7.18 tok/s (0.139 s): **MoE 0.086 s (62%)**, attention 0.0255 s (delta-net
+  now on GPU), LM head 0.004 s, rest ~0.023 s. Output verified coherent.
 
-**Honest parity read.** The incremental offloads (MoE, LM head) buy ~1.5× and
-top out in single digits, because between the GPU ops the activation still
-round-trips host↔device, the delta-net recurrence + full-attn softmax run on the
-CPU, and every op is a separate launch under a per-token E2EE proxy hop.
-**Reaching 124 tok/s requires Increment 3 — the fully resident forward** (hidden
-state + KV + delta state never leave VRAM, all ops on-device, one CUDA-graph
-replay per token), very likely plus Increment 4's tensor-core quant GEMM (MMQ).
-That is a major rewrite of the decode path in CUDA, not another point offload.
-Increment 2 (resident attention/delta-net) is the next and biggest single lever
-(52%) and the natural bridge into Increment 3.
+**Next lever: the MoE (now 62%).** ~1000 tiny expert matvec launches/token,
+serialised on the default stream and under-occupying the GPU — batch the 8
+selected experts into one kernel per projection (gate/up/down) and/or CUDA-graph
+the layer. Then the resident full-attn KV cache (9 layers, still CPU softmax).
+
+**Honest parity read.** Point offloads have already delivered 3.39× and each
+flip of the profile exposes the next. Single-digit → tens of tok/s is in reach
+with the MoE batching + full-attn. **Reaching 124 tok/s still wants Increment 3 —
+the fully resident forward** (hidden state + KV + delta state never leave VRAM,
+all ops on-device, one CUDA-graph replay per token) + likely Increment 4's
+tensor-core quant GEMM (MMQ). The resident-state pattern proven for delta-net
+S_All is the template for the KV cache and the full resident forward.
 
 ### Targets (honest)
 - Increment 1 alone: expect a **multi-× jump** from 2.2 tok/s (MoE is ~28/38 of
