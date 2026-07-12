@@ -56,9 +56,30 @@ package body LLM_Sampler is
       procedure Free is new Ada.Unchecked_Deallocation (Bool_Arr, Bool_Ptr);
 
       N      : constant Integer := Numel (Logits);
-      L      : Float_Ptr := new Float_Arr (1 .. N);  -- logits, then probs
+      L      : Float_Ptr := null;  -- logits, then probs (allocated lazily below)
       Result : Integer := 0;
    begin
+      --  Fast greedy path: temperature <= 0 with no repeat penalty is the common
+      --  case. Argmax straight over the logits tensor — skips the ~1MB heap
+      --  buffer and the element-wise copy that cost ~1ms/token at vocab = 248k.
+      if S.P.Temperature <= 0.0 and then S.P.Repeat_Penalty = 1.0 then
+         declare
+            --  Overlay the contiguous logit data directly (the forward pass
+            --  wrote vocab floats to Data_Address) — a raw scan, no per-element
+            --  Get_Flat accessor call across a 248k vocab.
+            type Flat_View is array (1 .. N) of Float;
+            LV   : Flat_View with Import, Address => LLM_Tensor.Data_Address (Logits);
+            Best : Integer := 1;
+            Bv   : Float := LV (1);
+         begin
+            for I in 2 .. N loop
+               if LV (I) > Bv then Bv := LV (I); Best := I; end if;
+            end loop;
+            return Best - 1;
+         end;
+      end if;
+
+      L := new Float_Arr (1 .. N);
       for I in 1 .. N loop L (I) := Get_Flat (Logits, I); end loop;
 
       --  Repetition penalty (llama.cpp convention): divide positive logits,

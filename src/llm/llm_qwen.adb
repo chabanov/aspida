@@ -843,6 +843,14 @@ package body LLM_Qwen is
       Produced : Natural := 0;       -- generated tokens (completion_tokens)
       Hit_Stop : Boolean := False;   -- stopped on a stop token, not the cap
 
+      --  Per-token host-tail profiler (env ASPIDA_TAIL_PROF): sampling vs stream.
+      Tail_Prof : constant Boolean :=
+        Ada.Environment_Variables.Exists ("ASPIDA_TAIL_PROF");
+      Acc_Smp, Acc_Emt : Ada.Real_Time.Time_Span := Ada.Real_Time.Time_Span_Zero;
+      Tail_N : Natural := 0;
+      use type Ada.Real_Time.Time;
+      use type Ada.Real_Time.Time_Span;
+
       --  Per-layer decode state (KV cache for full-attn, recurrent state +
       --  conv window for delta-net), threaded across tokens. One forward
       --  step costs O(1) matmuls instead of recomputing the sequence.
@@ -871,7 +879,6 @@ package body LLM_Qwen is
       --  One forward step under the shared step lock, released between steps
       --  (incl. on exception) so concurrent generations interleave per token.
       function Decode (Embed_Row : Integer) return Tensor is
-         use type Ada.Real_Time.Time;
          H  : Tensor := New_Tensor ([1, Dim]);
          TS : Ada.Real_Time.Time;
       begin
@@ -992,10 +999,27 @@ package body LLM_Qwen is
          declare
             Win : constant Natural :=
               Integer'Min (N_Hist, Integer'Max (0, Params.Repeat_Last_N));
+            T_Smp : constant Ada.Real_Time.Time :=
+              (if Tail_Prof then Ada.Real_Time.Clock else Ada.Real_Time.Time_First);
             Tid : constant Integer := LLM_Sampler.Next
               (Smp, Last_Logits, Hist (N_Hist - Win + 1 .. N_Hist));
             Best_Row : constant Integer := Tid + 1;   -- 1-based embedding row
          begin
+            if Tail_Prof then
+               Acc_Smp := Acc_Smp + (Ada.Real_Time.Clock - T_Smp);
+               Tail_N := Tail_N + 1;
+               if Tail_N mod 50 = 0 then
+                  Ada.Text_IO.Put_Line
+                    (Ada.Text_IO.Standard_Error,
+                     "[TAILPROF] sample avg" & Float'Image
+                       (Float (Ada.Real_Time.To_Duration (Acc_Smp))
+                        / Float (Tail_N) * 1000.0)
+                     & " ms | stream avg" & Float'Image
+                       (Float (Ada.Real_Time.To_Duration (Acc_Emt))
+                        / Float (Tail_N) * 1000.0)
+                     & " ms (n=" & Natural'Image (Tail_N) & ")");
+               end if;
+            end if;
             exit when Best_Row < 1 or else Best_Row > M.Vocab_Sz;
             if Tid = Stop1 or else Tid = Stop2 then         -- natural stop
                Hit_Stop := True;
@@ -1006,7 +1030,16 @@ package body LLM_Qwen is
             begin
                Append (Out_Buf, Piece);
                if Sink /= null then            -- stream this token now
-                  Sink.Emit (Piece);
+                  declare
+                     T_Emt : constant Ada.Real_Time.Time :=
+                       (if Tail_Prof then Ada.Real_Time.Clock
+                        else Ada.Real_Time.Time_First);
+                  begin
+                     Sink.Emit (Piece);
+                     if Tail_Prof then
+                        Acc_Emt := Acc_Emt + (Ada.Real_Time.Clock - T_Emt);
+                     end if;
+                  end;
                end if;
             end;
             Produced := Produced + 1;
