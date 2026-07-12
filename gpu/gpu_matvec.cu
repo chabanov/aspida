@@ -320,6 +320,39 @@ __global__ void k_q2k_wb(const uint8_t* __restrict__ w, const float* __restrict_
   for(int b=0;b<B;++b){ float a=warp_reduce(acc[b]); if(lane==0) y[b*out+row]=a; }
 }
 
+// ---- Q8_0 (kind 5): 34-byte blocks of 32 values [f16 d | int8 qs[32]],
+//      w[i] = d * qs[i]. Block size 32 == warp width -> one value per lane.
+//      Matches the CPU oracle Dequant_Q8_0. Used by the prod model (Hura
+//      Q8_0 served on ollama). ----
+__global__ void k_q8_0_w(const uint8_t *__restrict__ w, const float *__restrict__ x,
+                         float *__restrict__ y, int in, int out) {
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (row >= out) return;
+    int nb = in / 32; size_t bpr = (size_t) nb * 34;
+    const uint8_t *r = w + (size_t) row * bpr; float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t *blk = r + (size_t) b * 34; float d = f16(blk);
+        const int8_t *qs = (const int8_t *) (blk + 2);
+        acc += d * (float) qs[lane] * x[b * 32 + lane];
+    }
+    acc = warp_reduce(acc); if (lane == 0) y[row] = acc;
+}
+__global__ void k_q8_0_wb(const uint8_t *__restrict__ w, const float *__restrict__ x,
+                          float *__restrict__ y, int in, int out, int B) {
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (row >= out) return;
+    int nb = in / 32; size_t bpr = (size_t) nb * 34;
+    const uint8_t *r = w + (size_t) row * bpr; float acc[MAXB];
+    for (int b = 0; b < B; ++b) acc[b] = 0.f;
+    for (int blk = 0; blk < nb; ++blk) {
+        const uint8_t *bl = r + (size_t) blk * 34; float d = f16(bl);
+        const int8_t *qs = (const int8_t *) (bl + 2);
+        float wv = d * (float) qs[lane]; int i = blk * 32 + lane;
+        for (int b = 0; b < B; ++b) acc[b] += wv * x[(size_t) b * in + i];
+    }
+    for (int b = 0; b < B; ++b) { float a = warp_reduce(acc[b]); if (lane == 0) y[(size_t) b * out + row] = a; }
+}
+
 #include <cstdlib>
 
 //  Shared weight VRAM cache: each distinct host weight pointer is uploaded
@@ -495,6 +528,7 @@ static inline void launch_matvec(const uint8_t *dw, int kind, int in, int out,
     else if (kind == 1) k_q6k_sk<<<out, SKW * 32>>>(dw, dx, dy, in, out);
     else if (kind == 2) k_q5k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
     else if (kind == 3) k_q3k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
+    else if (kind == 5) k_q8_0_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
     else                k_q2k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
 }
 
@@ -596,9 +630,19 @@ __device__ __forceinline__ float wrow_q2k(const uint8_t *r, const float *x, int 
   acc = warp_reduce(acc);
   return __shfl_sync(0xffffffffu, acc, 0);
 }
+__device__ __forceinline__ float wrow_q8_0(const uint8_t *r, const float *x, int in, int lane) {
+  int nb = in / 32; float acc = 0.f;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t *blk = r + (size_t) b * 34; float d = f16(blk);
+    const int8_t *qs = (const int8_t *) (blk + 2);
+    acc += d * (float) qs[lane] * x[b * 32 + lane];
+  }
+  acc = warp_reduce(acc);
+  return __shfl_sync(0xffffffffu, acc, 0);
+}
 // Bytes per 256-value super-block, by kind code.
 __host__ __device__ __forceinline__ int kq_bpb(int kind) {
-  return kind == 0 ? 144 : kind == 1 ? 210 : kind == 2 ? 176 : kind == 3 ? 110 : 84;
+  return kind == 0 ? 144 : kind == 1 ? 210 : kind == 2 ? 176 : kind == 3 ? 110 : kind == 5 ? 272 : 84;
 }
 // Warp-cooperative dot of one quant row (branch is warp-uniform).
 __device__ __forceinline__ float wrow(const uint8_t *r, int kind, const float *x, int in, int lane) {
@@ -607,6 +651,7 @@ __device__ __forceinline__ float wrow(const uint8_t *r, int kind, const float *x
     case 1:  return wrow_q6k(r, x, in, lane);
     case 2:  return wrow_q5k(r, x, in, lane);
     case 3:  return wrow_q3k(r, x, in, lane);
+    case 5:  return wrow_q8_0(r, x, in, lane);
     default: return wrow_q2k(r, x, in, lane);
   }
 }
@@ -767,6 +812,7 @@ static inline void launch_mv_st(const uint8_t *dw, int kind, int in, int out,
     else if (kind == 2) k_q5k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
     else if (kind == 3) k_q3k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
     else if (kind == 4) k_q2k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
+    else if (kind == 5) k_q8_0_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
     else k_dense_mv<<<(out + WPB - 1) / WPB, TPB, 0, st>>>((const float *) dw, dx, dy, in, out);
 }
 
@@ -1658,6 +1704,7 @@ static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
     else if (kind == 2) k_q5k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
     else if (kind == 3) k_q3k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
     else if (kind == 4) k_q2k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
+    else if (kind == 5) k_q8_0_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
     else                k_dense_mv_b<<<blocks, TPB, 0, st>>>((const float *) dw, dx, dy, in, out, B);
 }
 

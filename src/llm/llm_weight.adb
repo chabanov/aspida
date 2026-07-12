@@ -286,6 +286,7 @@ package body LLM_Weight is
          when LLM_GGUF.GGML_TYPE_Q5_K => return 2;
          when LLM_GGUF.GGML_TYPE_Q3_K => return 3;
          when LLM_GGUF.GGML_TYPE_Q2_K => return 4;
+         when LLM_GGUF.GGML_TYPE_Q8_0 => return 5;   -- prod model (Hura Q8_0)
          when others => return -1;
       end case;
    end Kind_Code;
