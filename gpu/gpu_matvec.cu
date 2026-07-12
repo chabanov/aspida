@@ -7,6 +7,8 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
+#include <cstdio>
+#include <ctime>
 
 __device__ __forceinline__ float f16(const uint8_t *p){ __half h; *reinterpret_cast<uint16_t*>(&h)=(uint16_t)p[0]|((uint16_t)p[1]<<8); return __half2float(h);}
 __device__ __forceinline__ void gsm(const uint8_t*sc,int j,int*d,int*m){ if(j<4){*d=sc[j]&63;*m=sc[j+4]&63;} else {*d=(sc[j+4]&0x0F)|((sc[j-4]>>6)<<4);*m=(sc[j+4]>>4)|((sc[j]>>6)<<4);} }
@@ -576,32 +578,65 @@ extern "C" void aspida_gpu_moe_experts(
     size_t g_bpe = (size_t)(gate_bytes / n_exp), u_bpe = (size_t)(up_bytes / n_exp),
            d_bpe = (size_t)(down_bytes / n_exp);
 
-    cudaMemcpy(dx, x, (size_t) dim * 4, cudaMemcpyHostToDevice);
+    // Segment profiler (env ASPIDA_MOE_PROF): wall time per phase with a sync
+    // after each, accumulated across calls, dumped every 36*20 calls (~20 tok).
+    static int prof = getenv("ASPIDA_MOE_PROF") ? 1 : 0;
+    static double t_h2d = 0, t_gu = 0, t_swi = 0, t_down = 0, t_shared = 0, t_d2h = 0;
+    static long n_calls = 0;
+    struct timespec t0, t1;
+    #define SEG(acc, ...) do { if (prof) { cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t0); } \
+        __VA_ARGS__; \
+        if (prof) { cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t1); \
+            acc += (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9; } } while (0)
+
     int gblk = (dim + 255) / 256, iblk = (intermed + 255) / 256;
+    SEG(t_h2d, {
+        cudaMemcpy(dx, x, (size_t) dim * 4, cudaMemcpyHostToDevice);
+        cudaMemset(d_acc, 0, (size_t) dim * 4);
+    });
 
     // Selected experts — gate/up (3D slice e*bpe) -> SwiGLU -> down -> combine.
-    cudaMemset(d_acc, 0, (size_t) dim * 4);
     for (int k = 0; k < top_k; ++k) {
         int e = top_idx[k];
-        launch_matvec(gdw + (size_t) e * g_bpe, gate_kind, dim, intermed, dx, d_gate);
-        launch_matvec(udw + (size_t) e * u_bpe, up_kind,   dim, intermed, dx, d_up);
-        k_swiglu<<<iblk, 256>>>(d_gate, d_up, d_h, intermed);
-        launch_matvec(ddw + (size_t) e * d_bpe, down_kind, intermed, dim, d_h, d_y);
-        k_axpy<<<gblk, 256>>>(d_acc, top_w[k], d_y, dim);
+        SEG(t_gu, {
+            launch_matvec(gdw + (size_t) e * g_bpe, gate_kind, dim, intermed, dx, d_gate);
+            launch_matvec(udw + (size_t) e * u_bpe, up_kind,   dim, intermed, dx, d_up);
+        });
+        SEG(t_swi, k_swiglu<<<iblk, 256>>>(d_gate, d_up, d_h, intermed));
+        SEG(t_down, {
+            launch_matvec(ddw + (size_t) e * d_bpe, down_kind, intermed, dim, d_h, d_y);
+            k_axpy<<<gblk, 256>>>(d_acc, top_w[k], d_y, dim);
+        });
     }
 
     // Shared expert (+ optional sigmoid gate; gate dot on host over dim).
-    launch_matvec(sgdw, shg_kind, dim, intermed, dx, d_gate);
-    launch_matvec(sudw, shu_kind, dim, intermed, dx, d_up);
-    k_swiglu<<<iblk, 256>>>(d_gate, d_up, d_h, intermed);
-    launch_matvec(sddw, shd_kind, intermed, dim, d_h, d_y);
-    float shared_gate = 1.0f;
-    if (gate_inp_len > 1 && shared_gate_inp) {
-        float gs = 0.f;
-        for (int d = 0; d < dim; ++d) gs += shared_gate_inp[d] * x[d];
-        shared_gate = 1.0f / (1.0f + expf(-gs));
-    }
-    k_axpy<<<gblk, 256>>>(d_acc, shared_gate, d_y, dim);
+    SEG(t_shared, {
+        launch_matvec(sgdw, shg_kind, dim, intermed, dx, d_gate);
+        launch_matvec(sudw, shu_kind, dim, intermed, dx, d_up);
+        k_swiglu<<<iblk, 256>>>(d_gate, d_up, d_h, intermed);
+        launch_matvec(sddw, shd_kind, intermed, dim, d_h, d_y);
+        float shared_gate = 1.0f;
+        if (gate_inp_len > 1 && shared_gate_inp) {
+            float gs = 0.f;
+            for (int d = 0; d < dim; ++d) gs += shared_gate_inp[d] * x[d];
+            shared_gate = 1.0f / (1.0f + expf(-gs));
+        }
+        k_axpy<<<gblk, 256>>>(d_acc, shared_gate, d_y, dim);
+    });
 
-    cudaMemcpy(y, d_acc, (size_t) dim * 4, cudaMemcpyDeviceToHost);
+    SEG(t_d2h, cudaMemcpy(y, d_acc, (size_t) dim * 4, cudaMemcpyDeviceToHost));
+    #undef SEG
+
+    if (prof && ++n_calls % (36 * 20) == 0) {
+        fprintf(stderr,
+            "[MOEPROF] dims: dim=%d intermed=%d top_k=%d kinds g/u/d=%d/%d/%d "
+            "shg/shu/shd=%d/%d/%d bpe g/u/d=%zu/%zu/%zu\n"
+            "[MOEPROF] per-layer-call ms: h2d=%.3f gate+up=%.3f swiglu=%.3f "
+            "down+axpy=%.3f shared=%.3f d2h=%.3f (n=%ld)\n",
+            dim, intermed, top_k, gate_kind, up_kind, down_kind,
+            shg_kind, shu_kind, shd_kind, g_bpe, u_bpe, d_bpe,
+            1e3 * t_h2d / n_calls, 1e3 * t_gu / n_calls, 1e3 * t_swi / n_calls,
+            1e3 * t_down / n_calls, 1e3 * t_shared / n_calls, 1e3 * t_d2h / n_calls,
+            n_calls);
+    }
 }

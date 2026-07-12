@@ -7,6 +7,9 @@
 ---------------------------------------------------------------------
 
 with Ada.Numerics.Generic_Elementary_Functions;
+with Ada.Real_Time;
+with Ada.Text_IO;
+with Ada.Environment_Variables;
 with Interfaces.C;
 with LLM_Tensor; use LLM_Tensor;
 with LLM_Weight; use LLM_Weight;
@@ -18,6 +21,30 @@ with System;
 package body LLM_MoE is
 
    use type System.Address;
+
+   --  Segment profiler (env ASPIDA_PROFILE): router vs routing vs GPU call.
+   MProf_On     : constant Boolean :=
+     Ada.Environment_Variables.Exists ("ASPIDA_PROFILE");
+   MProf_Router : Duration := 0.0;
+   MProf_Route  : Duration := 0.0;
+   MProf_GPU    : Duration := 0.0;
+   MProf_N      : Natural  := 0;
+
+   procedure MProf_Tick is
+   begin
+      MProf_N := MProf_N + 1;
+      if MProf_N >= 36 * 20 then
+         Ada.Text_IO.Put_Line
+           (Ada.Text_IO.Standard_Error,
+            "[MoEPROF-Ada] per-layer ms: router="
+            & Float'Image (Float (MProf_Router) / Float (MProf_N) * 1000.0)
+            & " softmax+topk="
+            & Float'Image (Float (MProf_Route) / Float (MProf_N) * 1000.0)
+            & " gpu_experts="
+            & Float'Image (Float (MProf_GPU) / Float (MProf_N) * 1000.0));
+         MProf_Router := 0.0; MProf_Route := 0.0; MProf_GPU := 0.0; MProf_N := 0;
+      end if;
+   end MProf_Tick;
 
    --  Describe a cached quantized weight for the resident GPU MoE entry.
    function GW (W : LLM_Weight.Weight) return LLM_Qwen_GPU.GPU_Weight is
@@ -99,8 +126,13 @@ package body LLM_MoE is
             end loop;
          end return;
       end Hidden;
+      use type Ada.Real_Time.Time;
+      TS : Ada.Real_Time.Time;
    begin
       --  1. Router logits.
+      if MProf_On then
+         TS := Ada.Real_Time.Clock;
+      end if;
       declare
          RL : constant Tensor := MatVec (M.Gate_Inp_W, X);
       begin
@@ -108,6 +140,11 @@ package body LLM_MoE is
             Router (E) := Get_Flat (RL, E);
          end loop;
       end;
+      if MProf_On then
+         MProf_Router := MProf_Router
+           + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
+         TS := Ada.Real_Time.Clock;
+      end if;
 
       --  2. Softmax (numerically stable).
       declare
@@ -155,6 +192,12 @@ package body LLM_MoE is
          end loop;
       end;
 
+      if MProf_On then
+         MProf_Route := MProf_Route
+           + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
+         TS := Ada.Real_Time.Clock;
+      end if;
+
       --  Increment 1: offload the expensive experts (24 routed + 3 shared
       --  K-quant GEMVs) to the resident GPU kernel, keeping the CPU-computed
       --  routing. One H2D of x + one D2H of the result replaces 27 per-matvec
@@ -186,6 +229,11 @@ package body LLM_MoE is
                   else System.Null_Address),
                Gate_Inp_Len    => Numel (M.Shexp_Gate_Inp_W),
                Y               => Data_Address (Result));
+            if MProf_On then
+               MProf_GPU := MProf_GPU
+                 + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
+               MProf_Tick;
+            end if;
             return Result;
          end;
       end if;

@@ -209,12 +209,26 @@ package body LLM_Weight is
       --  to the pure-Ada path below, so nothing changes when the GPU is absent.
       if LLM_GPU.Available then
          declare
+            use type LLM_GGUF.GGML_Type;
             KC : constant Integer := Kind_Code (W);
          begin
             if KC >= 0 then
                return Y : constant Tensor := New_Tensor ([1, Rows (W)]) do
                   LLM_GPU.MatVec
                     (Raw_Address (W), Raw_Bytes (W), KC, Cols (W), Rows (W),
+                     Data_Address (X), Data_Address (Y));
+               end return;
+            end if;
+            --  F32 GGUF weight (e.g. the MoE router in Q4_K_M — measured
+            --  1.57 ms/layer on the CPU, the single biggest MoE cost): its raw
+            --  bytes are already a row-major [out, in] float matrix, exactly
+            --  what the dense GPU matvec wants. Same resident weight cache.
+            if W.Is_Quant and then W.Info.Kind = LLM_GGUF.GGML_TYPE_F32
+              and then LLM_GPU.Has_Dense
+            then
+               return Y : constant Tensor := New_Tensor ([1, Rows (W)]) do
+                  LLM_GPU.Dense_MatVec
+                    (Raw_Address (W), Raw_Bytes (W), Cols (W), Rows (W),
                      Data_Address (X), Data_Address (Y));
                end return;
             end if;
