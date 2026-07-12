@@ -611,7 +611,19 @@ __global__ void k_dense_mv(const float *__restrict__ w, const float *__restrict_
     if (row >= out) return;
     const float *r = w + (size_t) row * in;
     float acc = 0.f;
-    for (int i = lane; i < in; i += 32) acc += r[i] * x[i];
+    if ((in & 3) == 0 && (((uintptr_t) r) & 15) == 0) {
+        //  Vectorized: 16B loads saturate DRAM far better than 4B strides —
+        //  this is the LM-head hot path (a [vocab, dim] read every token).
+        const float4 *r4 = (const float4 *) r;
+        const float4 *x4 = (const float4 *) x;
+        int n4 = in >> 2;
+        for (int i = lane; i < n4; i += 32) {
+            float4 a = r4[i], b = x4[i];
+            acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+    } else {
+        for (int i = lane; i < in; i += 32) acc += r[i] * x[i];
+    }
     acc = warp_reduce(acc);
     if (lane == 0) y[row] = acc;
 }
@@ -1428,4 +1440,14 @@ extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,
     const int TPB = 256, WPB = TPB / 32;
     k_dense_mv<<<(g_ch_vocab + WPB - 1) / WPB, TPB>>>(g_ch_lm, nx, dlog, dim, g_ch_vocab);
     cudaMemcpy(logits, dlog, (size_t) g_ch_vocab * 4, cudaMemcpyDeviceToHost);
+    static int cprof = getenv("ASPIDA_CHAIN_PROF") ? 1 : 0;
+    if (cprof) {
+        static double acc = 0; static long n = 0;
+        struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+        static struct timespec t0; static int have = 0;
+        if (have) { acc += (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9; n++; }
+        have = 1; t0 = t1;
+        if (n && n % 100 == 0)
+            fprintf(stderr, "[CHAINPROF] wall between forwards avg %.3f ms (n=%ld)\n", 1e3 * acc / n, n);
+    }
 }
