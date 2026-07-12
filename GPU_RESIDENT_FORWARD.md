@@ -125,12 +125,27 @@ prompt (max |Δlogit| below the `--fmad=false` tolerance already used by
 `test_matvec.cu`), and (2) a measured tok/s improvement. Never promote a kernel
 that fails gate 1.
 
-**Increment 1 — Fused resident MoE-FFN decode.** `aspida_gpu_moe_decode`: hidden
-state enters once, stays on device through router GEMV → stable softmax → greedy
-top-8 → 8×(gate,up,down + SwiGLU) → weighted combine → shared expert, returns the
-FFN output once. Collapses **28 round-trips/layer → 1** for all 36 layers — the
-single largest chunk of the GEMVs. Oracle: `LLM_MoE.Forward`. *Expected: the
-biggest single jump, MoE is the bulk of decode compute.*
+**Increment 1 — Fused resident MoE experts. ✅ DONE + MEASURED.**
+`aspida_gpu_moe_experts` (in `gpu_matvec.cu`, bound via `llm_qwen_gpu.ad[sb]`,
+wired in `llm_moe.adb`): the router + softmax + greedy top-8 stay on the CPU
+(tiny, and the router is non-K-quant in Q4_K_M), and the K selected experts
+(gate/up/down 3D slices) + shared expert run on resident device buffers —
+one H2D of x + one D2H of the result replaces 27 activation round-trips.
+Oracle: `LLM_MoE.Forward` (same warp kernels + SwiGLU/gate math); output stays
+coherent. **Measured on RTX 6000 Ada, Hura Q4_K_M, 200-token decode:
+2.12 → 2.61 tok/s (~1.23×).**
+
+**⚠️ KEY EMPIRICAL FINDING — the bottleneck is NOT the matvec round-trips.**
+GPU utilisation stayed **2–4 % in BOTH** the per-matvec and the resident-experts
+runs. Removing the 27 MoE round-trips/layer bought only ~1.23×, so the dominant
+cost is the **CPU-side work between the matvecs**: the delta-net recurrence
+(27/36 layers), the full-attention softmax over the KV cache (9/36 layers), the
+per-matvec attention projections, the RMSNorms, and the **dense-F32 LM head**
+(a ~vocab×dim CPU GEMV every token). This *reprioritises* the roadmap: parity
+comes from making the whole forward resident + moving the LM head onto the GPU,
+not from tuning the MoE. Increments 2–3 are the real levers; Increment 1 is a
+correct, shipped foundation (resident buffers + weight cache + the ABI/binding
+pattern all proven end-to-end).
 
 **Increment 2 — Fused resident attention.** (2a) delta-net block: conv1d+SiLU,
 per-head gated recurrence against resident `S_All`, gated RMSNorm, out-proj —

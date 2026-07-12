@@ -33,26 +33,31 @@ package LLM_Qwen_GPU is
       Kind  : Integer           := -1;
    end record;
 
-   --  Fused MoE FFN decode: y[dim] := MoE(x[dim]).
+   --  Fused MoE experts: y[dim] := combine(selected experts) + shared expert.
    --
-   --  Runs router GEMV -> stable softmax -> greedy top-K -> the K selected
-   --  SwiGLU experts (gate/up/down 3D expert slices) -> weighted combine ->
-   --  shared expert (with optional sigmoid gate), entirely on the device.
+   --  The router GEMV, stable softmax and greedy top-K stay on the CPU (they are
+   --  tiny, and the router is frequently non-K-quant in mixed quants) — the
+   --  caller (LLM_MoE.Forward) computes Top_Idx (0-based expert indices) and the
+   --  renormalised Top_W, then this runs ONLY the expensive part on the device
+   --  with the activation resident: the K selected SwiGLU experts (gate/up/down
+   --  3D slices) -> weighted combine -> shared expert (optional sigmoid gate).
    --  Gate/Up expert blocks are 3D [n_experts, intermed, dim]; Down is
    --  [n_experts, dim, intermed]; per-expert byte stride = Bytes / N_Experts.
    --
-   --  Shared_Gate_Inp is the dense-F32 gate-input vector (length Dim) or a
-   --  null address with Gate_Inp_Len <= 1 when the layer has no shared gate.
+   --  Top_Idx points at a C int[Top_K] (0-based), Top_W at a C float[Top_K].
+   --  Shared_Gate_Inp is the dense gate-input vector (length Dim) or a null
+   --  address with Gate_Inp_Len <= 1 when the layer has no shared gate.
    --
-   --  Precondition (caller): every GPU_Weight.Kind >= 0 and Available. If any
-   --  weight is non-K-quant the caller must use the CPU path instead.
-   procedure MoE_Decode
+   --  Precondition (caller): every expert/shared GPU_Weight.Kind >= 0 and
+   --  Available. If any is non-K-quant the caller must use the CPU path.
+   procedure MoE_Experts
      (X               : System.Address;   -- [Dim] f32 host in
       Dim             : Integer;
-      N_Experts       : Integer;
       Top_K           : Integer;
       Intermed        : Integer;
-      Router          : GPU_Weight;
+      N_Experts       : Integer;
+      Top_Idx         : System.Address;   -- C int[Top_K], 0-based
+      Top_W           : System.Address;   -- C float[Top_K]
       Gate_Exp        : GPU_Weight;
       Up_Exp          : GPU_Weight;
       Down_Exp        : GPU_Weight;

@@ -23,9 +23,9 @@ package body LLM_Qwen_GPU is
 
    RTLD_NOW : constant int := 2;
 
-   --  void aspida_gpu_moe_decode(const float* x, int dim, int n_exp, int top_k,
-   --      int intermed,
-   --      const void* rw, long rb, int rk,
+   --  void aspida_gpu_moe_experts(const float* x, int dim, int top_k,
+   --      int intermed, int n_exp,
+   --      const int* top_idx, const float* top_w,
    --      const void* gw, long gb, int gk,   -- gate expert (3D)
    --      const void* uw, long ub, int uk,   -- up   expert (3D)
    --      const void* dw, long db, int dk,   -- down expert (3D)
@@ -34,8 +34,8 @@ package body LLM_Qwen_GPU is
    --      const void* sdw,long sdb,int sdk,  -- shared down (2D)
    --      const float* sgi, int sgi_len, float* y);
    type MoE_Fn is access procedure
-     (X : System.Address; Dim, N_Exp, Top_K, Intermed : int;
-      RW : System.Address; RB : Interfaces.C.long; RK : int;
+     (X : System.Address; Dim, Top_K, Intermed, N_Exp : int;
+      Top_Idx : System.Address; Top_W : System.Address;
       GW : System.Address; GB : Interfaces.C.long; GK : int;
       UW : System.Address; UB : Interfaces.C.long; UK : int;
       DW : System.Address; DB : Interfaces.C.long; DK : int;
@@ -80,7 +80,7 @@ package body LLM_Qwen_GPU is
                return;
             end if;
             declare
-               CS : chars_ptr := New_String ("aspida_gpu_moe_decode");
+               CS : chars_ptr := New_String ("aspida_gpu_moe_experts");
                A  : System.Address;
             begin
                A := C_dlsym (H, CS);
@@ -104,13 +104,14 @@ package body LLM_Qwen_GPU is
       return Fn /= null;
    end Available;
 
-   procedure MoE_Decode
+   procedure MoE_Experts
      (X               : System.Address;
       Dim             : Integer;
-      N_Experts       : Integer;
       Top_K           : Integer;
       Intermed        : Integer;
-      Router          : GPU_Weight;
+      N_Experts       : Integer;
+      Top_Idx         : System.Address;
+      Top_W           : System.Address;
       Gate_Exp        : GPU_Weight;
       Up_Exp          : GPU_Weight;
       Down_Exp        : GPU_Weight;
@@ -121,8 +122,8 @@ package body LLM_Qwen_GPU is
       Gate_Inp_Len    : Integer;
       Y               : System.Address) is
    begin
-      Fn (X, int (Dim), int (N_Experts), int (Top_K), int (Intermed),
-          Router.Addr,      Interfaces.C.long (Router.Bytes),      int (Router.Kind),
+      Fn (X, int (Dim), int (Top_K), int (Intermed), int (N_Experts),
+          Top_Idx, Top_W,
           Gate_Exp.Addr,    Interfaces.C.long (Gate_Exp.Bytes),    int (Gate_Exp.Kind),
           Up_Exp.Addr,      Interfaces.C.long (Up_Exp.Bytes),      int (Up_Exp.Kind),
           Down_Exp.Addr,    Interfaces.C.long (Down_Exp.Bytes),    int (Down_Exp.Kind),
@@ -130,6 +131,6 @@ package body LLM_Qwen_GPU is
           Shared_Up.Addr,   Interfaces.C.long (Shared_Up.Bytes),   int (Shared_Up.Kind),
           Shared_Down.Addr, Interfaces.C.long (Shared_Down.Bytes), int (Shared_Down.Kind),
           Shared_Gate_Inp,  int (Gate_Inp_Len), Y);
-   end MoE_Decode;
+   end MoE_Experts;
 
 end LLM_Qwen_GPU;

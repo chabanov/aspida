@@ -385,3 +385,111 @@ extern "C" void aspida_gpu_matmul(const void *w, long wbytes, int kind,
     else                k_q2k_wb<<<blocks, TPB>>>(dw, dxb, dyb, in_dim, out_dim, batch);
     cudaMemcpy(y, dyb, (size_t) ny * 4, cudaMemcpyDeviceToHost);
 }
+
+// =====================================================================
+// Increment 1 — fused resident MoE FFN decode (declared in qwen_resident.cu;
+// implemented here where the K-quant warp kernels + g_wcache live).
+// See GPU_RESIDENT_FORWARD.md. Router GEMV -> softmax/top-k (on host, matching
+// LLM_MoE.Forward) -> K SwiGLU experts -> weighted combine -> shared expert,
+// every matvec on RESIDENT device buffers. Per MoE layer: one H2D of x, one
+// tiny D2H of the router logits, one D2H of the result — vs the 28 activation
+// round-trips of the per-matvec path. Same warp kernels => matches the
+// per-matvec GPU MoE to fp precision; the softmax/top-k/SwiGLU/gate math
+// mirrors LLM_MoE exactly.
+// =====================================================================
+#include <cmath>
+
+__global__ void k_swiglu(const float *__restrict__ g, const float *__restrict__ u,
+                         float *__restrict__ h, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    float a = g[i]; h[i] = (a / (1.0f + expf(-a))) * u[i];   // silu(gate)*up
+}
+__global__ void k_axpy(float *__restrict__ acc, float w,
+                       const float *__restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+    acc[i] += w * y[i];
+}
+
+// Launch the right warp-per-row K-quant matvec into a DEVICE buffer:
+//   y[out] = W[out,in] . x[in].  No host copy — dx/dy are device-resident.
+static inline void launch_matvec(const uint8_t *dw, int kind, int in, int out,
+                                 const float *dx, float *dy) {
+    const int TPB = 256, WPB = TPB / 32; int blocks = (out + WPB - 1) / WPB;
+    if (kind == 0)      k_q4k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
+    else if (kind == 1) k_q6k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
+    else if (kind == 2) k_q5k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
+    else if (kind == 3) k_q3k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
+    else                k_q2k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
+}
+
+// Router + stable-softmax + greedy top-k stay on the CPU (they are tiny, and
+// the router is often non-K-quant in mixed quants like Q4_K_M): LLM_MoE.Forward
+// computes top_idx (0-based) + renormalised top_w and hands them here. This
+// kernel does ONLY the expensive part — the 3D routed experts and the 2D shared
+// expert (all K-quant), fully on resident device buffers.
+extern "C" void aspida_gpu_moe_experts(
+    const float *x, int dim, int top_k, int intermed, int n_exp,
+    const int *top_idx, const float *top_w,
+    const void *gate_w, long gate_bytes, int gate_kind,
+    const void *up_w,   long up_bytes,   int up_kind,
+    const void *down_w, long down_bytes, int down_kind,
+    const void *shg_w,  long shg_bytes,  int shg_kind,
+    const void *shu_w,  long shu_bytes,  int shu_kind,
+    const void *shd_w,  long shd_bytes,  int shd_kind,
+    const float *shared_gate_inp, int gate_inp_len,
+    float *y) {
+    // Resident scratch, grown-only across tokens/layers.
+    static float *dx = nullptr, *d_gate = nullptr, *d_up = nullptr,
+                 *d_h = nullptr, *d_y = nullptr, *d_acc = nullptr;
+    static int cdim = 0, cint = 0;
+    if (dim > cdim) {
+        if (dx) cudaFree(dx);   cudaMalloc(&dx,   (size_t) dim * 4);
+        if (d_y) cudaFree(d_y); cudaMalloc(&d_y,  (size_t) dim * 4);
+        if (d_acc) cudaFree(d_acc); cudaMalloc(&d_acc, (size_t) dim * 4);
+        cdim = dim;
+    }
+    if (intermed > cint) {
+        if (d_gate) cudaFree(d_gate); cudaMalloc(&d_gate, (size_t) intermed * 4);
+        if (d_up) cudaFree(d_up);     cudaMalloc(&d_up,   (size_t) intermed * 4);
+        if (d_h) cudaFree(d_h);       cudaMalloc(&d_h,    (size_t) intermed * 4);
+        cint = intermed;
+    }
+
+    uint8_t *gdw = upload_weight(gate_w, gate_bytes);
+    uint8_t *udw = upload_weight(up_w, up_bytes);
+    uint8_t *ddw = upload_weight(down_w, down_bytes);
+    uint8_t *sgdw = upload_weight(shg_w, shg_bytes);
+    uint8_t *sudw = upload_weight(shu_w, shu_bytes);
+    uint8_t *sddw = upload_weight(shd_w, shd_bytes);
+    size_t g_bpe = (size_t)(gate_bytes / n_exp), u_bpe = (size_t)(up_bytes / n_exp),
+           d_bpe = (size_t)(down_bytes / n_exp);
+
+    cudaMemcpy(dx, x, (size_t) dim * 4, cudaMemcpyHostToDevice);
+    int gblk = (dim + 255) / 256, iblk = (intermed + 255) / 256;
+
+    // Selected experts — gate/up (3D slice e*bpe) -> SwiGLU -> down -> combine.
+    cudaMemset(d_acc, 0, (size_t) dim * 4);
+    for (int k = 0; k < top_k; ++k) {
+        int e = top_idx[k];
+        launch_matvec(gdw + (size_t) e * g_bpe, gate_kind, dim, intermed, dx, d_gate);
+        launch_matvec(udw + (size_t) e * u_bpe, up_kind,   dim, intermed, dx, d_up);
+        k_swiglu<<<iblk, 256>>>(d_gate, d_up, d_h, intermed);
+        launch_matvec(ddw + (size_t) e * d_bpe, down_kind, intermed, dim, d_h, d_y);
+        k_axpy<<<gblk, 256>>>(d_acc, top_w[k], d_y, dim);
+    }
+
+    // Shared expert (+ optional sigmoid gate; gate dot on host over dim).
+    launch_matvec(sgdw, shg_kind, dim, intermed, dx, d_gate);
+    launch_matvec(sudw, shu_kind, dim, intermed, dx, d_up);
+    k_swiglu<<<iblk, 256>>>(d_gate, d_up, d_h, intermed);
+    launch_matvec(sddw, shd_kind, intermed, dim, d_h, d_y);
+    float shared_gate = 1.0f;
+    if (gate_inp_len > 1 && shared_gate_inp) {
+        float gs = 0.f;
+        for (int d = 0; d < dim; ++d) gs += shared_gate_inp[d] * x[d];
+        shared_gate = 1.0f / (1.0f + expf(-gs));
+    }
+    k_axpy<<<gblk, 256>>>(d_acc, shared_gate, d_y, dim);
+
+    cudaMemcpy(y, d_acc, (size_t) dim * 4, cudaMemcpyDeviceToHost);
+}

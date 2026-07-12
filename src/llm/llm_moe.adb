@@ -7,12 +7,34 @@
 ---------------------------------------------------------------------
 
 with Ada.Numerics.Generic_Elementary_Functions;
+with Interfaces.C;
 with LLM_Tensor; use LLM_Tensor;
 with LLM_Weight; use LLM_Weight;
 with LLM_Pool;
 with LLM_GPU;
+with LLM_Qwen_GPU;
+with System;
 
 package body LLM_MoE is
+
+   use type System.Address;
+
+   --  Describe a cached quantized weight for the resident GPU MoE entry.
+   function GW (W : LLM_Weight.Weight) return LLM_Qwen_GPU.GPU_Weight is
+     (Addr  => Raw_Address (W),
+      Bytes => Raw_Bytes (W),
+      Kind  => Kind_Code (W));
+
+   --  The resident expert kernel only handles K-quant weights. The router
+   --  (Gate_Inp_W) stays on the CPU regardless (it is tiny and frequently
+   --  non-K-quant, e.g. F32/Q8_0 in Q4_K_M), so only the routed experts and
+   --  the shared expert need to be K-quant for the GPU path.
+   function Experts_KQuant (M : MoE_Layer) return Boolean is
+     (Kind_Code (M.Gate_Exp_W) >= 0 and then Kind_Code (M.Up_W) >= 0
+      and then Kind_Code (M.Down_W) >= 0
+      and then Kind_Code (M.Shexp_Gate_W) >= 0
+      and then Kind_Code (M.Shexp_Up_W) >= 0
+      and then Kind_Code (M.Shexp_Down_W) >= 0);
 
    procedure Drop_W (W : in out LLM_Weight.Weight) is
    begin
@@ -132,6 +154,41 @@ package body LLM_MoE is
             Top_W (K) := Top_W (K) / Sum_W;
          end loop;
       end;
+
+      --  Increment 1: offload the expensive experts (24 routed + 3 shared
+      --  K-quant GEMVs) to the resident GPU kernel, keeping the CPU-computed
+      --  routing. One H2D of x + one D2H of the result replaces 27 per-matvec
+      --  activation round-trips. Same warp kernels + SwiGLU/gate math as below.
+      if LLM_Qwen_GPU.Available and then Experts_KQuant (M) then
+         declare
+            Idx0 : array (0 .. Top_K - 1) of Interfaces.C.int;
+         begin
+            for K in 1 .. Top_K loop
+               Idx0 (K - 1) := Interfaces.C.int (Top_Idx (K) - 1);  -- 0-based
+            end loop;
+            LLM_Qwen_GPU.MoE_Experts
+              (X               => Data_Address (X),
+               Dim             => Dim,
+               Top_K           => Top_K,
+               Intermed        => Intermed,
+               N_Experts       => N_Exp,
+               Top_Idx         => Idx0'Address,
+               Top_W           => Top_W (Top_W'First)'Address,
+               Gate_Exp        => GW (M.Gate_Exp_W),
+               Up_Exp          => GW (M.Up_W),
+               Down_Exp        => GW (M.Down_W),
+               Shared_Gate     => GW (M.Shexp_Gate_W),
+               Shared_Up       => GW (M.Shexp_Up_W),
+               Shared_Down     => GW (M.Shexp_Down_W),
+               Shared_Gate_Inp =>
+                 (if Numel (M.Shexp_Gate_Inp_W) > 1
+                  then Data_Address (M.Shexp_Gate_Inp_W)
+                  else System.Null_Address),
+               Gate_Inp_Len    => Numel (M.Shexp_Gate_Inp_W),
+               Y               => Data_Address (Result));
+            return Result;
+         end;
+      end if;
 
       --  4. Selected experts — run the (independent) experts across CPUs,
       --     each into its own row of Exp_Y, then reduce.
