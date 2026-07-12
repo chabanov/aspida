@@ -427,7 +427,7 @@ __global__ void k_axpy(float *__restrict__ acc, float w,
 //      occupancy-bound, ~64 warps of 142 SMs' worth). Each warp strides the
 //      quant blocks, warp-reduces its partial, then warp 0 sums the WARPS
 //      partials. out blocks => far higher occupancy for small `out`. ----
-#define SKW 4
+#define SKW 8
 __global__ void k_q4k_sk(const uint8_t *__restrict__ w, const float *__restrict__ x,
                          float *__restrict__ y, int in, int out) {
     int row = blockIdx.x; if (row >= out) return;
@@ -1215,14 +1215,15 @@ extern "C" void aspida_gpu_moe_experts(
 // Exact single-block RMSNorm: thread 0 sums ascending (CPU order), all scale.
 __global__ void k_norm1(const float *__restrict__ x, const float *__restrict__ w,
                         float *__restrict__ y, int n) {
-    __shared__ float rms;
-    if (threadIdx.x == 0) {
-        float ss = 0.f;
-        for (int i = 0; i < n; ++i) ss += x[i] * x[i];
-        rms = sqrtf(ss / (float) n + 1e-6f);
-    }
+    __shared__ float red[256]; __shared__ float rms;
+    int tid = threadIdx.x, nt = blockDim.x;
+    float ls = 0.f;
+    for (int i = tid; i < n; i += nt) ls += x[i] * x[i];
+    red[tid] = ls; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; __syncthreads(); }
+    if (tid == 0) rms = sqrtf(red[0] / (float) n + 1e-6f);
     __syncthreads();
-    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = (x[i] / rms) * w[i];
+    for (int i = tid; i < n; i += nt) y[i] = (x[i] / rms) * w[i];
 }
 
 // Embedding row gather: H = embed[row].
