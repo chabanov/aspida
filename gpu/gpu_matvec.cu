@@ -1592,3 +1592,170 @@ extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,
     }
 }
 
+
+// =====================================================================
+// Phase E — batched (continuous-batching) decode. The single-request chain
+// above is untouched. Here B lanes share one forward: the shared-weight
+// matvecs (projections, router, attn q/k/v/o, final norm, LM head) go through
+// the batched warp kernels (weight read ONCE, B sequence accumulators — the
+// proven throughput win); the stateful/routing parts (delta-net recurrence,
+// full-attn over per-lane KV, MoE expert selection) loop over the B lanes.
+// =====================================================================
+__global__ void k_embed_b(const float *__restrict__ embed, const int *__restrict__ rows,
+                          float *__restrict__ H, int dim, int B) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; int n = dim * B;
+    if (i >= n) return;
+    int b = i / dim, d = i % dim;
+    H[(size_t) b * dim + d] = embed[(size_t) rows[b] * dim + d];
+}
+__global__ void k_norm1_b(const float *__restrict__ x, const float *__restrict__ w,
+                          float *__restrict__ y, int n, int B) {
+    int b = blockIdx.x; if (b >= B) return;
+    const float *xb = x + (size_t) b * n; float *yb = y + (size_t) b * n;
+    __shared__ float red[256]; __shared__ float rms;
+    int tid = threadIdx.x, nt = blockDim.x; float ls = 0.f;
+    for (int i = tid; i < n; i += nt) ls += xb[i] * xb[i];
+    red[tid] = ls; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; __syncthreads(); }
+    if (tid == 0) rms = sqrtf(red[0] / (float) n + 1e-6f);
+    __syncthreads();
+    for (int i = tid; i < n; i += nt) yb[i] = (xb[i] / rms) * w[i];
+}
+// H[b] += res[b] then y[b] = norm(H[b])*w  (fused residual, batched).
+__global__ void k_norm_res_b(float *__restrict__ H, const float *__restrict__ res,
+                             const float *__restrict__ w, float *__restrict__ y, int n, int B) {
+    int b = blockIdx.x; if (b >= B) return;
+    float *Hb = H + (size_t) b * n; const float *rb = res + (size_t) b * n; float *yb = y + (size_t) b * n;
+    __shared__ float red[256]; __shared__ float rms;
+    int tid = threadIdx.x, nt = blockDim.x;
+    for (int i = tid; i < n; i += nt) Hb[i] += rb[i];
+    __syncthreads();
+    float ls = 0.f;
+    for (int i = tid; i < n; i += nt) ls += Hb[i] * Hb[i];
+    red[tid] = ls; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; __syncthreads(); }
+    if (tid == 0) rms = sqrtf(red[0] / (float) n + 1e-6f);
+    __syncthreads();
+    for (int i = tid; i < n; i += nt) yb[i] = (Hb[i] / rms) * w[i];
+}
+// Batched dense F32 matvec: Y[b,out] = W[out,in] . X[b,in], weight read once.
+__global__ void k_dense_mv_b(const float *__restrict__ w, const float *__restrict__ x,
+                             float *__restrict__ y, int in, int out, int B) {
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (row >= out) return;
+    const float *r = w + (size_t) row * in;
+    float acc[MAXB]; for (int b = 0; b < B; ++b) acc[b] = 0.f;
+    for (int i = lane; i < in; i += 32) { float wv = r[i]; for (int b = 0; b < B; ++b) acc[b] += wv * x[(size_t) b * in + i]; }
+    for (int b = 0; b < B; ++b) { float a = warp_reduce(acc[b]); if (lane == 0) y[(size_t) b * out + row] = a; }
+}
+// Batched matvec dispatch (weight read once for B lanes).
+static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
+                               const float *dx, float *dy, int B, cudaStream_t st) {
+    const int TPB = 256, WPB = TPB / 32; int blocks = (out + WPB - 1) / WPB;
+    if (B > MAXB) B = MAXB;
+    if (kind == 0)      k_q4k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
+    else if (kind == 1) k_q6k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
+    else if (kind == 2) k_q5k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
+    else if (kind == 3) k_q3k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
+    else if (kind == 4) k_q2k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
+    else                k_dense_mv_b<<<blocks, TPB, 0, st>>>((const float *) dw, dx, dy, in, out, B);
+}
+
+__global__ void k_axpy_b(float *__restrict__ acc, const float *__restrict__ y, int n, int B) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= (size_t) n * B) return;
+    acc[i] += y[i];
+}
+
+#define BMAX 16
+// Batched scratch (×BMAX of the single-lane buffers).
+static float *Hb=nullptr,*nxb=nullptr,*aob=nullptr,*dlogb=nullptr,*dqkvb=nullptr,
+             *dcqb=nullptr,*darb=nullptr,*dbrb=nullptr,*dzb=nullptr,*dgb=nullptr,
+             *dbb=nullptr,*dorb=nullptr,*dqgb=nullptr,*dktb=nullptr,*dvtb=nullptr,
+             *dqab=nullptr,*dgab=nullptr,*dattb=nullptr,*drlb=nullptr,*dhbb=nullptr;
+static MoeRoute *drouteb=nullptr;
+static int *gb_rows=nullptr,*gb_pos=nullptr;
+static int chb_inited=0;
+static cudaStream_t gb_stream=0;
+
+static void chain_alloc_b(void) {
+    if (chb_inited) return;
+    int dim=g_ch_dim; size_t Bd=(size_t)BMAX;
+    cudaMalloc(&Hb, Bd*dim*4); cudaMalloc(&nxb, Bd*dim*4); cudaMalloc(&aob, Bd*dim*4);
+    cudaMalloc(&dlogb, Bd*g_ch_vocab*4);
+    if (g_mx_qo){ cudaMalloc(&dqkvb, Bd*g_mx_qo*4); cudaMalloc(&dcqb, Bd*g_mx_qo*4); }
+    if (g_mx_nv){ cudaMalloc(&darb, Bd*g_mx_nv*4); cudaMalloc(&dbrb, Bd*g_mx_nv*4);
+                  cudaMalloc(&dgb, Bd*g_mx_nv*4); cudaMalloc(&dbb, Bd*g_mx_nv*4); }
+    if (g_mx_vd){ cudaMalloc(&dzb, Bd*g_mx_vd*4); cudaMalloc(&dorb, Bd*g_mx_vd*4); }
+    if (g_mx_qgd) cudaMalloc(&dqgb, Bd*g_mx_qgd*4);
+    if (g_mx_kvd){ cudaMalloc(&dktb, Bd*g_mx_kvd*4); cudaMalloc(&dvtb, Bd*g_mx_kvd*4); }
+    if (g_mx_att){ cudaMalloc(&dqab, Bd*g_mx_att*4); cudaMalloc(&dgab, Bd*g_mx_att*4);
+                   cudaMalloc(&dattb, Bd*g_mx_att*4); }
+    if (g_mx_nexp) cudaMalloc(&drlb, Bd*g_mx_nexp*4);
+    if (g_mx_hbuf) cudaMalloc(&dhbb, Bd*g_mx_hbuf*4);
+    cudaMalloc(&drouteb, Bd*sizeof(MoeRoute));
+    cudaMalloc(&gb_rows, Bd*4); cudaMalloc(&gb_pos, Bd*4);
+    cudaStreamCreate(&gb_stream);
+    chb_inited=1;
+}
+
+// Batched decode step for B lanes. handles[b*NL + li] = lane b's layer-li state.
+// rows[b], pos[b] = lane b's embedding row and position. logits[b*vocab] out.
+extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int *pos,
+                                               const int *handles, float *logits) {
+    if (B < 1) return; if (B > BMAX) B = BMAX;
+    chain_alloc_b();
+    int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=gb_stream;
+    cudaMemcpy(gb_rows, rows, (size_t)B*4, cudaMemcpyHostToDevice);
+    cudaMemcpy(gb_pos, pos, (size_t)B*4, cudaMemcpyHostToDevice);
+    k_embed_b<<<((size_t)dim*B+255)/256,256,0,st>>>(g_ch_embed, gb_rows, Hb, dim, B);
+    for (int li=0; li<NL; ++li) {
+        ChainLayer &L=g_chain[li];
+        k_norm1_b<<<B,256,0,st>>>(Hb, L.attn_norm, nxb, dim, B);
+        if (!L.is_fattn) {
+            launch_mv_b(L.qkv, L.qkv_k, dim, L.qo, nxb, dqkvb, B, st);
+            launch_mv_b(L.al, L.al_k, dim, L.nv, nxb, darb, B, st);
+            launch_mv_b(L.be, L.be_k, dim, L.nv, nxb, dbrb, B, st);
+            launch_mv_b(L.ga, L.ga_k, dim, L.v_dim, nxb, dzb, B, st);
+            size_t shmem=(size_t)(4*L.khd+2*L.vhd)*4;
+            for (int b=0;b<B;++b) {
+                DnetState ds=g_dnet[handles[b*NL+li]];
+                k_dnet_conv<<<(L.qo+255)/256,256,0,st>>>(dqkvb+(size_t)b*L.qo, ds.hist, L.conv, dcqb+(size_t)b*L.qo, L.qo, L.kernel);
+                k_dnet_gates<<<(L.nv+255)/256,256,0,st>>>(darb+(size_t)b*L.nv, dbrb+(size_t)b*L.nv, L.aw, L.dtw, dgb+(size_t)b*L.nv, dbb+(size_t)b*L.nv, L.nv);
+                k_dnet_recur<<<L.nv,L.khd,shmem,st>>>(ds.S, dcqb+(size_t)b*L.qo, dgb+(size_t)b*L.nv, dbb+(size_t)b*L.nv, dzb+(size_t)b*L.v_dim, L.nw, dorb+(size_t)b*L.v_dim, L.khd,L.vhd,L.q_dim,L.nkh);
+            }
+            launch_mv_b(L.ow, L.ow_k, L.v_dim, dim, dorb, aob, B, st);
+        } else {
+            int kvd=L.nkv*L.hd, att=L.nq*L.hd, qgd=L.nq*2*L.hd;
+            launch_mv_b(L.qw, L.qw_k, dim, qgd, nxb, dqgb, B, st);
+            launch_mv_b(L.kw, L.kw_k, dim, kvd, nxb, dktb, B, st);
+            launch_mv_b(L.vw, L.vw_k, dim, kvd, nxb, dvtb, B, st);
+            for (int b=0;b<B;++b) {
+                FattnState fs=g_fattn[handles[b*NL+li]];
+                k_fattn_prep<<<L.nq+L.nkv,L.hd,(size_t)L.hd*4,st>>>(
+                    dqgb+(size_t)b*qgd, dktb+(size_t)b*kvd, dvtb+(size_t)b*kvd, L.qn, L.kn,
+                    dqab+(size_t)b*att, dgab+(size_t)b*att, fs.K, fs.V,
+                    L.nq,L.nkv,L.hd,kvd, gb_pos+b, L.rd,L.base,L.freq_scale,L.m_scale,
+                    L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total);
+                k_fattn_attend<<<L.nq,256,0,st>>>(dqab+(size_t)b*att, dgab+(size_t)b*att, fs.K, fs.V, fs.scores, dattb+(size_t)b*att,
+                    L.nq,L.nkv,L.hd,kvd, gb_pos+b, fs.max_len);
+            }
+            launch_mv_b(L.fow, L.fow_k, att, dim, dattb, aob, B, st);
+        }
+        k_axpy_b<<<((size_t)dim*B+255)/256,256,0,st>>>(Hb, aob, dim, B);
+        if (L.has_moe) {
+            k_norm1_b<<<B,256,0,st>>>(Hb, L.post_norm, nxb, dim, B);
+            launch_mv_b(L.rw, L.rk, dim, L.n_exp, nxb, drlb, B, st);
+            for (int b=0;b<B;++b) {
+                k_moe_route<<<1,256,0,st>>>(drlb+(size_t)b*L.n_exp, nxb+(size_t)b*dim, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, drouteb+b);
+                int w1=(L.top_k+1)*L.intermed, b1=(w1*32+255)/256, b2=(dim*32+255)/256;
+                k_moe_gu_p<<<b1,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, nxb+(size_t)b*dim, dhbb+(size_t)b*(MOE_MAXK+1)*L.intermed, drouteb+b, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk);
+                k_moe_down_p<<<b2,256,0,st>>>(L.ddw,L.sddw, dhbb+(size_t)b*(MOE_MAXK+1)*L.intermed, aob+(size_t)b*dim, drouteb+b, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk);
+            }
+            k_axpy_b<<<((size_t)dim*B+255)/256,256,0,st>>>(Hb, aob, dim, B);
+        }
+    }
+    k_norm1_b<<<B,256,0,st>>>(Hb, g_ch_fnorm, nxb, dim, B);
+    launch_mv_b((const uint8_t*)g_ch_lm, -1, dim, g_ch_vocab, nxb, dlogb, B, st);
+    cudaMemcpyAsync(logits, dlogb, (size_t)B*g_ch_vocab*4, cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+}

@@ -553,6 +553,7 @@ package body LLM_Qwen is
    --  never leaves VRAM.
    Chain_Tag : System.Address := System.Null_Address;
    Chain_OK  : Boolean := False;
+   Bench_Done : Boolean := False;
 
    procedure Register_Chain (M : Qwen_Model) is
       use type System.Address;
@@ -703,6 +704,68 @@ package body LLM_Qwen is
          Dim => M.Model_Dim, Vocab => M.Vocab_Sz);
       Chain_OK  := Chain_Ready;
       Chain_Tag := Data_Address (M.Token_Emb);
+      --  Phase E: batched-throughput benchmark (env ASPIDA_BENCH_BATCH=B).
+      if Chain_OK and then not Bench_Done
+        and then Ada.Environment_Variables.Exists ("ASPIDA_BENCH_BATCH")
+        and then LLM_Qwen_GPU.Chain_Batch_Available
+      then
+         Bench_Done := True;
+         declare
+            use type Ada.Real_Time.Time;
+            B  : constant Integer :=
+              Integer'Value (Ada.Environment_Variables.Value ("ASPIDA_BENCH_BATCH"));
+            NL : constant Integer := M.N_Blocks;
+            NT : constant Integer := 100;
+            Cap : constant Integer := NT + 8;
+            Handles : array (0 .. B * NL - 1) of Interfaces.C.int := [others => 0];
+            Rows : array (0 .. B - 1) of Interfaces.C.int := [others => 1];
+            Pos  : array (0 .. B - 1) of Interfaces.C.int := [others => 0];
+            Logits : constant Tensor := New_Tensor ([1, B * M.Vocab_Sz]);
+            TS : Ada.Real_Time.Time;
+         begin
+            for Bi in 0 .. B - 1 loop
+               for Li in 1 .. NL loop
+                  declare
+                     Blk : LLM_Qwen_Blk.Qwen_Block renames M.Blocks (Li).all;
+                     Hn  : Integer;
+                  begin
+                     if Blk.Is_Full_Attn then
+                        Hn := LLM_Qwen_GPU.Fattn_New
+                          (Cap, Blk.Full.N_KV_Heads * Blk.Full.Head_Dim, Blk.Full.N_Q_Heads);
+                     else
+                        Hn := LLM_Qwen_GPU.Dnet_New
+                          (Blk.DNet.N_V_Heads, Blk.DNet.Key_Head_Dim,
+                           Blk.DNet.Value_Head_Dim, Blk.DNet.QKV_Out,
+                           Shape (Blk.DNet.Conv_W) (2));
+                     end if;
+                     Handles (Bi * NL + (Li - 1)) := Interfaces.C.int (Hn);
+                  end;
+               end loop;
+            end loop;
+            --  warm
+            LLM_Qwen_GPU.Chain_Forward_Batch
+              (B, Rows'Address, Pos'Address, Handles'Address, Data_Address (Logits));
+            TS := Ada.Real_Time.Clock;
+            for Step in 1 .. NT loop
+               LLM_Qwen_GPU.Chain_Forward_Batch
+                 (B, Rows'Address, Pos'Address, Handles'Address, Data_Address (Logits));
+               for Bi in 0 .. B - 1 loop Pos (Bi) := Interfaces.C.int (Step); end loop;
+            end loop;
+            declare
+               Dt : constant Duration :=
+                 Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
+            begin
+               Ada.Text_IO.Put_Line
+                 (Ada.Text_IO.Standard_Error,
+                  "[BATCH] B=" & Integer'Image (B)
+                  & " steps=" & Integer'Image (NT)
+                  & " wall=" & Float'Image (Float (Dt)) & "s"
+                  & " AGGREGATE_tok_per_s="
+                  & Float'Image (Float (B * NT) / Float (Dt))
+                  & " per_lane=" & Float'Image (Float (NT) / Float (Dt)));
+            end;
+         end;
+      end if;
    end Register_Chain;
 
    function Decode_Tokens

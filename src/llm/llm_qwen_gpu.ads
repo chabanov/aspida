@@ -203,4 +203,12 @@ package LLM_Qwen_GPU is
       Handles   : System.Address;  -- C int[n_layers] state handles
       Logits    : System.Address); -- [Vocab] f32 host out
 
+   --  Batched decode step for B lanes (continuous batching): the shared-weight
+   --  matvecs read each weight once for all B (the throughput win). Rows/Pos
+   --  are C int[B]; Handles is C int[B*n_layers] (lane b's layer-li state);
+   --  Logits is [B*Vocab] host out.
+   function Chain_Batch_Available return Boolean;
+   procedure Chain_Forward_Batch
+     (B : Integer; Rows, Pos, Handles, Logits : System.Address);
+
 end LLM_Qwen_GPU;

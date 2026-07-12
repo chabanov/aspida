@@ -168,6 +168,10 @@ package body LLM_Qwen_GPU is
      with Convention => C;
    function To_CBegin is new Ada.Unchecked_Conversion (System.Address, Chain_Begin_Fn);
 
+   type Chain_Batch_Fn is access procedure
+     (B : int; Rows, Pos, Handles, Logits : System.Address) with Convention => C;
+   function To_CBatch is new Ada.Unchecked_Conversion (System.Address, Chain_Batch_Fn);
+
    Fn       : MoE_Fn := null;
    DNew_Fn  : Dnet_New_Fn := null;
    DStep_Fn : Dnet_Step_Fn := null;
@@ -184,6 +188,7 @@ package body LLM_Qwen_GPU is
    CFwd_Fn   : Chain_Fwd_Fn := null;
    CBegin_Fn : Chain_Begin_Fn := null;
    CEnd_Fn   : Void_Fn := null;
+   CBatch_Fn : Chain_Batch_Fn := null;
 
    protected Init_Guard is
       procedure Run;
@@ -296,6 +301,8 @@ package body LLM_Qwen_GPU is
                if A /= System.Null_Address then CBegin_Fn := To_CBegin (A); end if;
                Look ("aspida_gpu_chain_end", A);
                if A /= System.Null_Address then CEnd_Fn := To_Void (A); end if;
+               Look ("aspida_gpu_chain_forward_batch", A);
+               if A /= System.Null_Address then CBatch_Fn := To_CBatch (A); end if;
             end;
          end;
       end Run;
@@ -579,5 +586,17 @@ package body LLM_Qwen_GPU is
    begin
       CFwd_Fn (int (Embed_Row), int (Pos), Handles, Logits);
    end Chain_Forward;
+
+   function Chain_Batch_Available return Boolean is
+   begin
+      Init;
+      return CBatch_Fn /= null;
+   end Chain_Batch_Available;
+
+   procedure Chain_Forward_Batch
+     (B : Integer; Rows, Pos, Handles, Logits : System.Address) is
+   begin
+      CBatch_Fn (int (B), Rows, Pos, Handles, Logits);
+   end Chain_Forward_Batch;
 
 end LLM_Qwen_GPU;
