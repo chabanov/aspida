@@ -422,13 +422,77 @@ __global__ void k_axpy(float *__restrict__ acc, float w,
     acc[i] += w * y[i];
 }
 
+// ---- Split-K: ONE block per output row, WARPS warps splitting the block loop
+//      so many more warps are resident (the ncu fix: the tiny matvecs were
+//      occupancy-bound, ~64 warps of 142 SMs' worth). Each warp strides the
+//      quant blocks, warp-reduces its partial, then warp 0 sums the WARPS
+//      partials. out blocks => far higher occupancy for small `out`. ----
+#define SKW 4
+__global__ void k_q4k_sk(const uint8_t *__restrict__ w, const float *__restrict__ x,
+                         float *__restrict__ y, int in, int out) {
+    int row = blockIdx.x; if (row >= out) return;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, WARPS = blockDim.x >> 5;
+    int nb = in / 256; size_t bpr = (size_t) nb * 144;
+    const uint8_t *r = w + (size_t) row * bpr;
+    float acc = 0.f;
+    for (int b = warp; b < nb; b += WARPS) {
+        const uint8_t *blk = r + (size_t) b * 144;
+        float d = f16(blk), dm = f16(blk + 2);
+        const uint8_t *sc = blk + 4; const uint8_t *qs = blk + 16; int bs = b * 256;
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            int j = lane + 32 * t, g = j >> 5, l = j & 31;
+            int s1, m1, s2, m2; gsm(sc, 2 * g, &s1, &m1); gsm(sc, 2 * g + 1, &s2, &m2);
+            uint8_t q = qs[j];
+            acc += (d * s1 * (q & 0x0F) - dm * m1) * x[bs + 64 * g + l];
+            acc += (d * s2 * (q >> 4)   - dm * m2) * x[bs + 64 * g + 32 + l];
+        }
+    }
+    acc = warp_reduce(acc);
+    __shared__ float part[32];
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) { float sacc = 0.f; for (int i = 0; i < WARPS; ++i) sacc += part[i]; y[row] = sacc; }
+}
+__global__ void k_q6k_sk(const uint8_t *__restrict__ w, const float *__restrict__ x,
+                         float *__restrict__ y, int in, int out) {
+    int row = blockIdx.x; if (row >= out) return;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, WARPS = blockDim.x >> 5;
+    int nb = in / 256; size_t bpr = (size_t) nb * 210;
+    const uint8_t *r = w + (size_t) row * bpr; int l = lane, is = l / 16;
+    float acc = 0.f;
+    for (int b = warp; b < nb; b += WARPS) {
+        const uint8_t *blk = r + (size_t) b * 210;
+        const uint8_t *ql = blk; const uint8_t *qh = blk + 128;
+        const int8_t *sc = (const int8_t *) (blk + 192); float d = f16(blk + 208); int bs = b * 256;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t *QL = ql + h * 64; const uint8_t *QH = qh + h * 32;
+            const int8_t *SC = sc + h * 8; int base = bs + h * 128;
+            int q1 = (int) ((QL[l] & 0xF)      | (((QH[l] >> 0) & 3) << 4)) - 32;
+            int q2 = (int) ((QL[l + 32] & 0xF) | (((QH[l] >> 2) & 3) << 4)) - 32;
+            int q3 = (int) ((QL[l] >> 4)       | (((QH[l] >> 4) & 3) << 4)) - 32;
+            int q4 = (int) ((QL[l + 32] >> 4)  | (((QH[l] >> 6) & 3) << 4)) - 32;
+            acc += d * SC[is + 0] * q1 * x[base + l];
+            acc += d * SC[is + 2] * q2 * x[base + l + 32];
+            acc += d * SC[is + 4] * q3 * x[base + l + 64];
+            acc += d * SC[is + 6] * q4 * x[base + l + 96];
+        }
+    }
+    acc = warp_reduce(acc);
+    __shared__ float part[32];
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) { float sacc = 0.f; for (int i = 0; i < WARPS; ++i) sacc += part[i]; y[row] = sacc; }
+}
+
 // Launch the right warp-per-row K-quant matvec into a DEVICE buffer:
 //   y[out] = W[out,in] . x[in].  No host copy — dx/dy are device-resident.
 static inline void launch_matvec(const uint8_t *dw, int kind, int in, int out,
                                  const float *dx, float *dy) {
     const int TPB = 256, WPB = TPB / 32; int blocks = (out + WPB - 1) / WPB;
-    if (kind == 0)      k_q4k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
-    else if (kind == 1) k_q6k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
+    if (kind == 0)      k_q4k_sk<<<out, SKW * 32>>>(dw, dx, dy, in, out);
+    else if (kind == 1) k_q6k_sk<<<out, SKW * 32>>>(dw, dx, dy, in, out);
     else if (kind == 2) k_q5k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
     else if (kind == 3) k_q3k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
     else                k_q2k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
@@ -698,8 +762,8 @@ static inline void launch_mv_any(const uint8_t *dw, int kind, int in, int out,
 static inline void launch_mv_st(const uint8_t *dw, int kind, int in, int out,
                                 const float *dx, float *dy, cudaStream_t st) {
     const int TPB = 256, WPB = TPB / 32;
-    if (kind == 0)      k_q4k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
-    else if (kind == 1) k_q6k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
+    if (kind == 0)      k_q4k_sk<<<out, SKW * 32, 0, st>>>(dw, dx, dy, in, out);
+    else if (kind == 1) k_q6k_sk<<<out, SKW * 32, 0, st>>>(dw, dx, dy, in, out);
     else if (kind == 2) k_q5k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
     else if (kind == 3) k_q3k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
     else if (kind == 4) k_q2k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
