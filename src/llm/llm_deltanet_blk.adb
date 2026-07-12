@@ -224,6 +224,17 @@ package body LLM_DeltaNet_Blk is
    -- Incremental decode
    --------------------------------------------------------------------
 
+   --  A projection is GPU-eligible when the resident kernels can read it:
+   --  K-quant (Kind_Code >= 0) or raw F32 (dense kernel, Kind -1).
+   function GPU_OK (W : LLM_Weight.Weight) return Boolean is
+     (Kind_Code (W) >= 0 or else LLM_Weight.Is_F32 (W));
+
+   --  Describe a weight for the resident step (Kind -1 = dense F32 bytes).
+   function GW (W : LLM_Weight.Weight) return LLM_Qwen_GPU.GPU_Weight is
+     (Addr  => Raw_Address (W),
+      Bytes => Raw_Bytes (W),
+      Kind  => Kind_Code (W));
+
    function Init_State (L : DeltaNet_Layer) return DNet_State is
       Kernel : constant Integer := Shape (L.Conv_W) (2);
    begin
@@ -231,10 +242,17 @@ package body LLM_DeltaNet_Blk is
          St.S_All     := New_Tensor ([L.N_V_Heads * L.Key_Head_Dim,
                                       L.Value_Head_Dim]);
          St.Conv_Hist := New_Tensor ([Integer'Max (1, Kernel - 1), L.QKV_Out]);
-         --  Increment 2: keep the recurrent state resident on the device.
-         if LLM_Qwen_GPU.Dnet_Available then
+         --  Phase B: keep the recurrent state AND conv window resident on the
+         --  device, and run the whole layer there — but only when every
+         --  projection is a format the resident kernels read.
+         if LLM_Qwen_GPU.Dnet_Available
+           and then GPU_OK (L.QKV_W) and then GPU_OK (L.Alpha_W)
+           and then GPU_OK (L.Beta_W) and then GPU_OK (L.Gate_W)
+           and then GPU_OK (L.Out_W)
+         then
             St.GPU_Handle := LLM_Qwen_GPU.Dnet_New
-              (L.N_V_Heads, L.Key_Head_Dim, L.Value_Head_Dim);
+              (L.N_V_Heads, L.Key_Head_Dim, L.Value_Head_Dim,
+               L.QKV_Out, Kernel);
          end if;
       end return;
    end Init_State;
@@ -249,7 +267,42 @@ package body LLM_DeltaNet_Blk is
       VHD    : constant Integer := L.Value_Head_Dim;
       Q_Dim  : constant Integer := L.N_K_Heads * KHD;
       Kernel : constant Integer := Shape (L.Conv_W) (2);
+   begin
+      --  Phase B: the whole layer on the device in ONE call — projections,
+      --  conv (resident window), recurrence (resident S_All), out-projection.
+      --  The small dense tensors upload once (cached by host pointer).
+      if St.GPU_Handle >= 0 then
+         return Out_T : constant Tensor := New_Tensor ([1, Dim]) do
+            LLM_Qwen_GPU.Dnet_Step
+              (Handle  => St.GPU_Handle,
+               X       => Data_Address (X),
+               Dim     => Dim,
+               QKV_W   => GW (L.QKV_W),
+               Alpha_W => GW (L.Alpha_W),
+               Beta_W  => GW (L.Beta_W),
+               Gate_W  => GW (L.Gate_W),
+               Out_W   => GW (L.Out_W),
+               Conv_W  => Data_Address (L.Conv_W),
+               Conv_B  => Long_Long_Integer (Numel (L.Conv_W)) * 4,
+               A_W     => Data_Address (L.A_W),
+               A_B     => Long_Long_Integer (Numel (L.A_W)) * 4,
+               Dt_W    => Data_Address (L.Dt_W),
+               Dt_B    => Long_Long_Integer (Numel (L.Dt_W)) * 4,
+               Norm_W  => Data_Address (L.Norm_W),
+               Norm_B  => Long_Long_Integer (Numel (L.Norm_W)) * 4,
+               NV      => NV,
+               KHD     => KHD,
+               VHD     => VHD,
+               QO      => QO,
+               Q_Dim   => Q_Dim,
+               N_K_Heads => L.N_K_Heads,
+               V_Dim   => L.V_Dim,
+               Kernel  => Kernel,
+               Y       => Data_Address (Out_T));
+         end return;
+      end if;
 
+      declare
       QKV   : constant Tensor := MatVec (L.QKV_W, X);   -- [1, QO]
       CQ    : Tensor := New_Tensor ([1, QO]);           -- conv'd + SiLU qkv
       AR    : constant Tensor := MatVec (L.Alpha_W, X);
@@ -258,7 +311,7 @@ package body LLM_DeltaNet_Blk is
       O_Row : Tensor := New_Tensor ([1, L.V_Dim]);
       Beta  : array (1 .. NV) of Float;
       Gate  : array (1 .. NV) of Float;
-   begin
+      begin
       --  1. Causal conv1d + SiLU using the running window: weight tap K maps
       --     to source position (t - Kernel + K); taps < Kernel come from the
       --     history rows, tap Kernel is the current token. Unseen history is
@@ -293,68 +346,47 @@ package body LLM_DeltaNet_Blk is
                           * Softplus (Get_Flat (AR, H) + Get_Flat (L.Dt_W, H)));
       end loop;
 
-      if St.GPU_Handle >= 0 then
-         --  Increment 2: run all heads' recurrence + gated RMSNorm on the
-         --  device against the resident S_All (updated in place). cq/gate/beta/z
-         --  in, o_row out — the big state never leaves VRAM.
-         LLM_Qwen_GPU.Dnet_Recur
-           (Handle    => St.GPU_Handle,
-            CQ        => Data_Address (CQ),
-            Gate      => Gate (Gate'First)'Address,
-            Beta      => Beta (Beta'First)'Address,
-            Z         => Data_Address (Z),
-            Norm_W    => Data_Address (L.Norm_W),
-            O_Row     => Data_Address (O_Row),
-            NV        => NV,
-            KHD       => KHD,
-            VHD       => VHD,
-            QO        => QO,
-            Q_Dim     => Q_Dim,
-            N_K_Heads => L.N_K_Heads,
-            V_Dim     => L.V_Dim);
-      else
-         for H in 1 .. NV loop
+      for H in 1 .. NV loop
+         declare
+            K_Head  : constant Integer := (H - 1) mod L.N_K_Heads + 1;
+            Q_Vec   : Tensor := New_Tensor ([1, KHD]);
+            K_Vec   : Tensor := New_Tensor ([1, KHD]);
+            V_Vec   : Tensor := New_Tensor ([1, VHD]);
+            O_Vec   : Tensor := New_Tensor ([1, VHD]);
+            Base    : constant Integer := (H - 1) * KHD;  -- row offset in S_All
+         begin
+            for D in 1 .. KHD loop
+               Set_Flat (Q_Vec, D, Get (CQ, [1, (K_Head - 1) * KHD + D]));
+               Set_Flat (K_Vec, D, Get (CQ, [1, Q_Dim + (K_Head - 1) * KHD + D]));
+            end loop;
+            for D in 1 .. VHD loop
+               Set_Flat (V_Vec, D, Get (CQ, [1, 2 * Q_Dim + (H - 1) * VHD + D]));
+            end loop;
+
+            --  Advance this head's state in place (rows Base+1..Base+KHD of
+            --  the packed S_All), avoiding an unpack/repack copy per step.
+            LLM_DeltaNet.Step (St.S_All, Q_Vec, K_Vec, V_Vec,
+                               Gate (H), Beta (H), O_Vec, Base => Base);
+
+            --  Gated RMSNorm over VHD dims into the output row.
             declare
-               K_Head  : constant Integer := (H - 1) mod L.N_K_Heads + 1;
-               Q_Vec   : Tensor := New_Tensor ([1, KHD]);
-               K_Vec   : Tensor := New_Tensor ([1, KHD]);
-               V_Vec   : Tensor := New_Tensor ([1, VHD]);
-               O_Vec   : Tensor := New_Tensor ([1, VHD]);
-               Base    : constant Integer := (H - 1) * KHD;  -- row offset in S_All
+               SS : Float := 0.0;
             begin
-               for D in 1 .. KHD loop
-                  Set_Flat (Q_Vec, D, Get (CQ, [1, (K_Head - 1) * KHD + D]));
-                  Set_Flat (K_Vec, D, Get (CQ, [1, Q_Dim + (K_Head - 1) * KHD + D]));
-               end loop;
                for D in 1 .. VHD loop
-                  Set_Flat (V_Vec, D, Get (CQ, [1, 2 * Q_Dim + (H - 1) * VHD + D]));
+                  SS := SS + Get_Flat (O_Vec, D) ** 2;
                end loop;
-
-               --  Advance this head's state in place (rows Base+1..Base+KHD of
-               --  the packed S_All), avoiding an unpack/repack copy per step.
-               LLM_DeltaNet.Step (St.S_All, Q_Vec, K_Vec, V_Vec,
-                                  Gate (H), Beta (H), O_Vec, Base => Base);
-
-               --  Gated RMSNorm over VHD dims into the output row.
                declare
-                  SS : Float := 0.0;
+                  Rms : constant Float := Sqrt (SS / Float (VHD) + 1.0e-6);
                begin
                   for D in 1 .. VHD loop
-                     SS := SS + Get_Flat (O_Vec, D) ** 2;
+                     Set_Flat (O_Row, (H - 1) * VHD + D,
+                          (Get_Flat (O_Vec, D) / Rms) * Get_Flat (L.Norm_W, D)
+                          * Silu (Get_Flat (Z, (H - 1) * VHD + D)));
                   end loop;
-                  declare
-                     Rms : constant Float := Sqrt (SS / Float (VHD) + 1.0e-6);
-                  begin
-                     for D in 1 .. VHD loop
-                        Set_Flat (O_Row, (H - 1) * VHD + D,
-                             (Get_Flat (O_Vec, D) / Rms) * Get_Flat (L.Norm_W, D)
-                             * Silu (Get_Flat (Z, (H - 1) * VHD + D)));
-                     end loop;
-                  end;
                end;
             end;
-         end loop;
-      end if;
+         end;
+      end loop;
 
       --  3. Output projection.
       declare
@@ -365,6 +397,7 @@ package body LLM_DeltaNet_Blk is
             Set_Flat (Out_T, D, Get_Flat (Ot, D));
          end loop;
          return Out_T;
+      end;
       end;
    end Step;
 

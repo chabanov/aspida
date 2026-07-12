@@ -47,23 +47,35 @@ package body LLM_Qwen_GPU is
 
    function To_Fn is new Ada.Unchecked_Conversion (System.Address, MoE_Fn);
 
-   --  int aspida_gpu_dnet_new(int nv, int khd, int vhd)
+   --  int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel)
    type Dnet_New_Fn is access function
-     (NV, KHD, VHD : int) return int
+     (NV, KHD, VHD, QO, Kernel : int) return int
      with Convention => C;
    function To_DNew is new Ada.Unchecked_Conversion (System.Address, Dnet_New_Fn);
 
-   --  void aspida_gpu_dnet_recur(int handle, const float* cq, gate, beta, z,
-   --      norm_w, float* o_row, int nv,khd,vhd,qo,q_dim,n_k_heads,v_dim)
-   type Dnet_Recur_Fn is access procedure
-     (Handle : int; CQ, Gate, Beta, Z, Norm_W, O_Row : System.Address;
-      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim : int)
+   --  void aspida_gpu_dnet_step(int handle, const float* x, int dim,
+   --      qkv_w,b,k, al_w,b,k, be_w,b,k, ga_w,b,k, out_w,b,k,
+   --      conv_w,b, a_w,b, dt_w,b, norm_w,b,
+   --      int nv,khd,vhd,qo,q_dim,n_k_heads,v_dim,kernel, float* out)
+   type Dnet_Step_Fn is access procedure
+     (Handle : int; X : System.Address; Dim : int;
+      QW : System.Address; QB : Interfaces.C.long; QK : int;
+      AW : System.Address; AB : Interfaces.C.long; AK : int;
+      BW : System.Address; BB : Interfaces.C.long; BK : int;
+      GW : System.Address; GB : Interfaces.C.long; GK : int;
+      OW : System.Address; OB : Interfaces.C.long; OK : int;
+      CW : System.Address; CB : Interfaces.C.long;
+      AAW : System.Address; AAB : Interfaces.C.long;
+      DW : System.Address; DB : Interfaces.C.long;
+      NW : System.Address; NB : Interfaces.C.long;
+      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim, Kernel : int;
+      Y : System.Address)
      with Convention => C;
-   function To_DRecur is new Ada.Unchecked_Conversion (System.Address, Dnet_Recur_Fn);
+   function To_DStep is new Ada.Unchecked_Conversion (System.Address, Dnet_Step_Fn);
 
    Fn       : MoE_Fn := null;
    DNew_Fn  : Dnet_New_Fn := null;
-   DRec_Fn  : Dnet_Recur_Fn := null;
+   DStep_Fn : Dnet_Step_Fn := null;
 
    protected Init_Guard is
       procedure Run;
@@ -116,13 +128,13 @@ package body LLM_Qwen_GPU is
                end if;
             end;
             declare
-               CS : chars_ptr := New_String ("aspida_gpu_dnet_recur");
+               CS : chars_ptr := New_String ("aspida_gpu_dnet_step");
                A  : System.Address;
             begin
                A := C_dlsym (H, CS);
                Free (CS);
                if A /= System.Null_Address then
-                  DRec_Fn := To_DRecur (A);
+                  DStep_Fn := To_DStep (A);
                end if;
             end;
          end;
@@ -172,31 +184,50 @@ package body LLM_Qwen_GPU is
    function Dnet_Available return Boolean is
    begin
       Init;
-      return DNew_Fn /= null and then DRec_Fn /= null;
+      return DNew_Fn /= null and then DStep_Fn /= null;
    end Dnet_Available;
 
-   function Dnet_New (NV, KHD, VHD : Integer) return Integer is
+   function Dnet_New (NV, KHD, VHD, QO, Kernel : Integer) return Integer is
    begin
       Init;
       if DNew_Fn = null then
          return -1;
       end if;
-      return Integer (DNew_Fn (int (NV), int (KHD), int (VHD)));
+      return Integer (DNew_Fn (int (NV), int (KHD), int (VHD), int (QO), int (Kernel)));
    end Dnet_New;
 
-   procedure Dnet_Recur
-     (Handle : Integer;
-      CQ     : System.Address;
-      Gate   : System.Address;
-      Beta   : System.Address;
-      Z      : System.Address;
-      Norm_W : System.Address;
-      O_Row  : System.Address;
-      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim : Integer) is
+   procedure Dnet_Step
+     (Handle  : Integer;
+      X       : System.Address;
+      Dim     : Integer;
+      QKV_W   : GPU_Weight;
+      Alpha_W : GPU_Weight;
+      Beta_W  : GPU_Weight;
+      Gate_W  : GPU_Weight;
+      Out_W   : GPU_Weight;
+      Conv_W  : System.Address;
+      Conv_B  : Long_Long_Integer;
+      A_W     : System.Address;
+      A_B     : Long_Long_Integer;
+      Dt_W    : System.Address;
+      Dt_B    : Long_Long_Integer;
+      Norm_W  : System.Address;
+      Norm_B  : Long_Long_Integer;
+      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim, Kernel : Integer;
+      Y       : System.Address) is
    begin
-      DRec_Fn (int (Handle), CQ, Gate, Beta, Z, Norm_W, O_Row,
-               int (NV), int (KHD), int (VHD), int (QO), int (Q_Dim),
-               int (N_K_Heads), int (V_Dim));
-   end Dnet_Recur;
+      DStep_Fn (int (Handle), X, int (Dim),
+                QKV_W.Addr,   Interfaces.C.long (QKV_W.Bytes),   int (QKV_W.Kind),
+                Alpha_W.Addr, Interfaces.C.long (Alpha_W.Bytes), int (Alpha_W.Kind),
+                Beta_W.Addr,  Interfaces.C.long (Beta_W.Bytes),  int (Beta_W.Kind),
+                Gate_W.Addr,  Interfaces.C.long (Gate_W.Bytes),  int (Gate_W.Kind),
+                Out_W.Addr,   Interfaces.C.long (Out_W.Bytes),   int (Out_W.Kind),
+                Conv_W, Interfaces.C.long (Conv_B),
+                A_W,    Interfaces.C.long (A_B),
+                Dt_W,   Interfaces.C.long (Dt_B),
+                Norm_W, Interfaces.C.long (Norm_B),
+                int (NV), int (KHD), int (VHD), int (QO), int (Q_Dim),
+                int (N_K_Heads), int (V_Dim), int (Kernel), Y);
+   end Dnet_Step;
 
 end LLM_Qwen_GPU;

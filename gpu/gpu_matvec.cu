@@ -10,6 +10,15 @@
 #include <cstdio>
 #include <ctime>
 
+// Decode issues thousands of tiny kernels + small blocking copies per token;
+// the default ScheduleAuto wait can take a yield/sleep path that costs ~0.5 ms
+// per implicit sync. Spin-waiting (we own the box, 8 vCPUs, 1 context) makes
+// every blocking copy return as soon as the GPU finishes. Must run before the
+// CUDA context exists -> constructor at dlopen time.
+__attribute__((constructor)) static void aspida_gpu_setflags(void) {
+    cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+}
+
 __device__ __forceinline__ float f16(const uint8_t *p){ __half h; *reinterpret_cast<uint16_t*>(&h)=(uint16_t)p[0]|((uint16_t)p[1]<<8); return __half2float(h);}
 __device__ __forceinline__ void gsm(const uint8_t*sc,int j,int*d,int*m){ if(j<4){*d=sc[j]&63;*m=sc[j+4]&63;} else {*d=(sc[j+4]&0x0F)|((sc[j-4]>>6)<<4);*m=(sc[j+4]>>4)|((sc[j]>>6)<<4);} }
 __device__ void deq_q4k(const uint8_t*b,float*o){ float d=f16(b),dm=f16(b+2); const uint8_t*sc=b+4,*qs=b+16;
@@ -631,14 +640,56 @@ extern "C" void aspida_gpu_dense_matvec(const void *w, long wbytes, int in_dim,
 // Key_Head_Dim == Value_Head_Dim (set in Create), so one thread index serves
 // as both the k and v index.
 // =====================================================================
-static std::vector<float *> g_dnet;   // resident S_All per layer, by handle
+// Per-layer resident delta-net state: the recurrent S_All AND the causal-conv
+// history window both live on the device across tokens.
+struct DnetState { float *S; float *hist; int qo; int kernel; };
+static std::vector<DnetState> g_dnet;
 
-extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd) {
-    float *s; size_t n = (size_t) nv * khd * vhd;
-    if (cudaMalloc(&s, n * 4) != cudaSuccess) return -1;
-    cudaMemset(s, 0, n * 4);
-    g_dnet.push_back(s);
+extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel) {
+    DnetState st; size_t n = (size_t) nv * khd * vhd;
+    if (cudaMalloc(&st.S, n * 4) != cudaSuccess) return -1;
+    cudaMemset(st.S, 0, n * 4);
+    size_t hn = (size_t) (kernel > 1 ? kernel - 1 : 1) * qo;
+    if (cudaMalloc(&st.hist, hn * 4) != cudaSuccess) { cudaFree(st.S); return -1; }
+    cudaMemset(st.hist, 0, hn * 4);
+    st.qo = qo; st.kernel = kernel;
+    g_dnet.push_back(st);
     return (int) g_dnet.size() - 1;
+}
+
+// Matvec with kind >= 0 -> K-quant warp kernel; kind == -1 -> the weight's raw
+// bytes are a dense row-major [out,in] F32 matrix (GGUF F32) -> dense kernel.
+static inline void launch_mv_any(const uint8_t *dw, int kind, int in, int out,
+                                 const float *dx, float *dy) {
+    if (kind >= 0) { launch_matvec(dw, kind, in, out, dx, dy); return; }
+    const int TPB = 256, WPB = TPB / 32;
+    k_dense_mv<<<(out + WPB - 1) / WPB, TPB>>>((const float *) dw, dx, dy, in, out);
+}
+
+// Causal conv1d + SiLU over the resident history window, then advance it.
+// One thread per channel c: cq[c] = silu(qkv[c]*w[c,K-1] + sum_k hist[k,c]*w[c,k]),
+// then shift this channel's history down one row and append qkv[c].
+__global__ void k_dnet_conv(const float *__restrict__ qkv, float *__restrict__ hist,
+                            const float *__restrict__ convw, float *__restrict__ cq,
+                            int qo, int kernel) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x; if (c >= qo) return;
+    float acc = qkv[c] * convw[c * kernel + (kernel - 1)];
+    for (int k = 0; k < kernel - 1; ++k) acc += hist[(size_t) k * qo + c] * convw[c * kernel + k];
+    cq[c] = acc / (1.f + expf(-acc));
+    for (int k = 0; k + 1 < kernel - 1; ++k) hist[(size_t) k * qo + c] = hist[(size_t) (k + 1) * qo + c];
+    if (kernel >= 2) hist[(size_t) (kernel - 2) * qo + c] = qkv[c];
+}
+
+// Per-head decay/beta transform: gate[h] = exp(a[h] * softplus(ar[h] + dt[h])),
+// beta[h] = sigmoid(br[h]). Same softplus branches as the CPU (LLM_DeltaNet_Blk).
+__global__ void k_dnet_gates(const float *__restrict__ ar, const float *__restrict__ br,
+                             const float *__restrict__ a, const float *__restrict__ dt,
+                             float *__restrict__ gate, float *__restrict__ beta, int nv) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x; if (h >= nv) return;
+    float xx = ar[h] + dt[h];
+    float sp = xx > 20.f ? xx : (xx < -20.f ? expf(xx) : logf(1.f + expf(xx)));
+    gate[h] = expf(a[h] * sp);
+    beta[h] = 1.f / (1.f + expf(-br[h]));
 }
 
 __global__ void k_dnet_recur(float *S, const float *cq, const float *gate,
@@ -680,28 +731,67 @@ __global__ void k_dnet_recur(float *S, const float *cq, const float *gate,
     o_row[h * vhd + v] = (osh[v] / rms) * norm_w[v] * (zz / (1.f + expf(-zz)));
 }
 
-extern "C" void aspida_gpu_dnet_recur(int handle, const float *cq, const float *gate,
-    const float *beta, const float *z, const float *norm_w, float *o_row,
-    int nv, int khd, int vhd, int qo, int q_dim, int n_k_heads, int v_dim) {
+// One full delta-net decode layer on the device: h2d(x) -> qkv/alpha/beta/z
+// projections -> causal conv+SiLU (resident hist) -> gate/beta transform ->
+// per-head recurrence + gated RMSNorm (resident S_All) -> out projection ->
+// d2h(out). Replaces ~5 blocking per-matvec round-trips with 1 H2D + 1 D2H.
+// Small dense weights (conv_w/a/dt/norm_w, host F32) ride the resident weight
+// cache keyed by their host pointers, so they upload once.
+extern "C" void aspida_gpu_dnet_step(
+    int handle, const float *x, int dim,
+    const void *qkv_w,  long qkv_b,  int qkv_k,     // rows = qo
+    const void *al_w,   long al_b,   int al_k,      // rows = nv
+    const void *be_w,   long be_b,   int be_k,      // rows = nv
+    const void *ga_w,   long ga_b,   int ga_k,      // rows = v_dim (Z gate)
+    const void *out_w,  long out_b,  int out_k,     // [dim, v_dim]
+    const float *conv_w, long conv_b,                // [qo, kernel] host F32
+    const float *a_w,   long a_b,                    // [nv] host F32
+    const float *dt_w,  long dt_b,                   // [nv] host F32
+    const float *norm_w, long norm_b,                // [vhd] host F32
+    int nv, int khd, int vhd, int qo, int q_dim, int n_k_heads, int v_dim,
+    int kernel, float *out) {
     if (handle < 0 || handle >= (int) g_dnet.size()) return;
-    float *S = g_dnet[handle];
-    static float *dcq = nullptr, *dg = nullptr, *db = nullptr, *dz = nullptr,
-                 *dnw = nullptr, *dor = nullptr;
-    static int c_qo = 0, c_nv = 0, c_vd = 0, c_vhd = 0;
-    if (qo > c_qo)    { if (dcq) cudaFree(dcq); cudaMalloc(&dcq, (size_t) qo * 4);    c_qo = qo; }
-    if (nv > c_nv)    { if (dg) cudaFree(dg); cudaMalloc(&dg, (size_t) nv * 4);
-                        if (db) cudaFree(db); cudaMalloc(&db, (size_t) nv * 4);       c_nv = nv; }
+    DnetState st = g_dnet[handle];
+
+    static float *dx = nullptr, *dqkv = nullptr, *dcq = nullptr, *dar = nullptr,
+                 *dbr = nullptr, *dz = nullptr, *dg = nullptr, *db = nullptr,
+                 *dor = nullptr, *dout = nullptr;
+    static int c_dim = 0, c_qo = 0, c_nv = 0, c_vd = 0;
+    if (dim > c_dim) { if (dx) cudaFree(dx); cudaMalloc(&dx, (size_t) dim * 4);
+                       if (dout) cudaFree(dout); cudaMalloc(&dout, (size_t) dim * 4); c_dim = dim; }
+    if (qo > c_qo)   { if (dqkv) cudaFree(dqkv); cudaMalloc(&dqkv, (size_t) qo * 4);
+                       if (dcq) cudaFree(dcq); cudaMalloc(&dcq, (size_t) qo * 4); c_qo = qo; }
+    if (nv > c_nv)   { if (dar) cudaFree(dar); cudaMalloc(&dar, (size_t) nv * 4);
+                       if (dbr) cudaFree(dbr); cudaMalloc(&dbr, (size_t) nv * 4);
+                       if (dg) cudaFree(dg); cudaMalloc(&dg, (size_t) nv * 4);
+                       if (db) cudaFree(db); cudaMalloc(&db, (size_t) nv * 4); c_nv = nv; }
     if (v_dim > c_vd) { if (dz) cudaFree(dz); cudaMalloc(&dz, (size_t) v_dim * 4);
                         if (dor) cudaFree(dor); cudaMalloc(&dor, (size_t) v_dim * 4); c_vd = v_dim; }
-    if (vhd > c_vhd)  { if (dnw) cudaFree(dnw); cudaMalloc(&dnw, (size_t) vhd * 4);   c_vhd = vhd; }
-    cudaMemcpy(dcq, cq, (size_t) qo * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dg, gate, (size_t) nv * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(db, beta, (size_t) nv * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dz, z, (size_t) v_dim * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(dnw, norm_w, (size_t) vhd * 4, cudaMemcpyHostToDevice);
+
+    uint8_t *dqw = upload_weight(qkv_w, qkv_b);
+    uint8_t *daw = upload_weight(al_w, al_b);
+    uint8_t *dbw = upload_weight(be_w, be_b);
+    uint8_t *dgw = upload_weight(ga_w, ga_b);
+    uint8_t *dow = upload_weight(out_w, out_b);
+    float *dconv = (float *) upload_weight(conv_w, conv_b);
+    float *da    = (float *) upload_weight(a_w, a_b);
+    float *ddt   = (float *) upload_weight(dt_w, dt_b);
+    float *dnw   = (float *) upload_weight(norm_w, norm_b);
+
+    cudaMemcpy(dx, x, (size_t) dim * 4, cudaMemcpyHostToDevice);
+
+    launch_mv_any(dqw, qkv_k, dim, qo, dx, dqkv);
+    launch_mv_any(daw, al_k, dim, nv, dx, dar);
+    launch_mv_any(dbw, be_k, dim, nv, dx, dbr);
+    launch_mv_any(dgw, ga_k, dim, v_dim, dx, dz);
+    k_dnet_conv<<<(qo + 255) / 256, 256>>>(dqkv, st.hist, dconv, dcq, qo, kernel);
+    k_dnet_gates<<<(nv + 255) / 256, 256>>>(dar, dbr, da, ddt, dg, db, nv);
     size_t shmem = (size_t) (4 * khd + 2 * vhd) * 4;
-    k_dnet_recur<<<nv, khd, shmem>>>(S, dcq, dg, db, dz, dnw, dor, khd, vhd, q_dim, n_k_heads);
-    cudaMemcpy(o_row, dor, (size_t) v_dim * 4, cudaMemcpyDeviceToHost);
+    k_dnet_recur<<<nv, khd, shmem>>>(st.S, dcq, dg, db, dz, dnw, dor,
+                                     khd, vhd, q_dim, n_k_heads);
+    launch_mv_any(dow, out_k, v_dim, dim, dor, dout);
+    cudaDeviceSynchronize();   // drain via spin BEFORE the blocking copy
+    cudaMemcpy(out, dout, (size_t) dim * 4, cudaMemcpyDeviceToHost);
 }
 
 // Router + stable-softmax + greedy top-k stay on the CPU (they are tiny, and
@@ -779,6 +869,7 @@ extern "C" void aspida_gpu_moe_experts(
                                         intermed, dim, (long) d_bpe,
                                         down_kind, shd_kind));
 
+    cudaDeviceSynchronize();   // drain via spin BEFORE the blocking copy
     SEG(t_d2h, cudaMemcpy(y, d_acc, (size_t) dim * 4, cudaMemcpyDeviceToHost));
     #undef SEG
 

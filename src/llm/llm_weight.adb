@@ -268,6 +268,12 @@ package body LLM_Weight is
       end if;
    end Raw_Bytes;
 
+   function Is_F32 (W : Weight) return Boolean is
+      use type LLM_GGUF.GGML_Type;
+   begin
+      return W.Is_Quant and then W.Info.Kind = LLM_GGUF.GGML_TYPE_F32;
+   end Is_F32;
+
    function Kind_Code (W : Weight) return Integer is
       use type LLM_GGUF.GGML_Type;
    begin

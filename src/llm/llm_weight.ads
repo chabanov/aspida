@@ -59,6 +59,11 @@ package LLM_Weight is
    function Raw_Bytes   (W : Weight) return Long_Long_Integer;
    function Kind_Code   (W : Weight) return Integer;
 
+   --  True iff this is a still-quantized GGUF tensor whose kind is F32 — its
+   --  raw bytes are then a dense row-major [out, in] float matrix, directly
+   --  usable by the GPU dense kernels (Kind_Code -1 is only GPU-safe if this).
+   function Is_F32 (W : Weight) return Boolean;
+
    --  3D expert weight (row-major [n_experts, out_e, in]); matvec one expert.
    function N_Experts (W : Weight) return Integer;
    function Expert_Out (W : Weight) return Integer;   -- per-expert output dim

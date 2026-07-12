@@ -68,24 +68,43 @@ package LLM_Qwen_GPU is
       Gate_Inp_Len    : Integer;
       Y               : System.Address);  -- [Dim] f32 host out
 
-   --  Resident delta-net recurrence (Increment 2). Dnet_New allocates the
-   --  per-layer recurrent state S_All [NV*KHD, VHD] on the device and returns a
-   --  handle >= 0 (or -1 if unavailable / alloc failed). Dnet_Recur runs one
-   --  decode step's per-head recurrence + gated RMSNorm against that resident
-   --  state — only cq/gate/beta/z go in and o_row comes out; S_All stays on the
-   --  device. Oracle: LLM_DeltaNet.Step + the gated norm in LLM_DeltaNet_Blk.
+   --  Resident delta-net layer (Increment 2 / Phase B). Dnet_New allocates the
+   --  per-layer device state — recurrent S_All [NV*KHD, VHD] AND the causal-
+   --  conv history window [Kernel-1, QO] — and returns a handle >= 0 (or -1 if
+   --  unavailable / alloc failed). Dnet_Step then runs the ENTIRE delta-net
+   --  decode layer on the device in one call: qkv/alpha/beta/z projections,
+   --  causal conv1d + SiLU, per-head decay/beta transform, the gated-delta
+   --  recurrence + gated RMSNorm, and the output projection — 1 H2D of x and
+   --  1 D2H of the result instead of ~5 blocking per-matvec round-trips.
+   --  Oracle: the CPU path in LLM_DeltaNet_Blk.Step.
+   --
+   --  Projection weights are GPU_Weight (Kind >= 0 K-quant, or -1 meaning the
+   --  raw bytes are a dense row-major [out,in] F32 matrix — the caller must
+   --  verify F32 for Kind = -1). The small dense tensors (conv/a/dt/norm) are
+   --  host F32 addresses + byte lengths; they upload once via the resident
+   --  weight cache keyed by host pointer.
    function Dnet_Available return Boolean;
 
-   function Dnet_New (NV, KHD, VHD : Integer) return Integer;
+   function Dnet_New (NV, KHD, VHD, QO, Kernel : Integer) return Integer;
 
-   procedure Dnet_Recur
-     (Handle : Integer;
-      CQ     : System.Address;   -- [QO]    conv'd + SiLU qkv (host)
-      Gate   : System.Address;   -- [NV]    per-head decay
-      Beta   : System.Address;   -- [NV]    per-head beta
-      Z      : System.Address;   -- [V_Dim] gate projection
-      Norm_W : System.Address;   -- [VHD]   dense norm weight
-      O_Row  : System.Address;   -- [V_Dim] output (host)
-      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim : Integer);
+   procedure Dnet_Step
+     (Handle  : Integer;
+      X       : System.Address;   -- [Dim] f32 host in
+      Dim     : Integer;
+      QKV_W   : GPU_Weight;       -- rows = QO
+      Alpha_W : GPU_Weight;       -- rows = NV
+      Beta_W  : GPU_Weight;       -- rows = NV
+      Gate_W  : GPU_Weight;       -- rows = V_Dim
+      Out_W   : GPU_Weight;       -- [Dim, V_Dim]
+      Conv_W  : System.Address;   -- [QO, Kernel] f32 host
+      Conv_B  : Long_Long_Integer;
+      A_W     : System.Address;   -- [NV] f32 host
+      A_B     : Long_Long_Integer;
+      Dt_W    : System.Address;   -- [NV] f32 host
+      Dt_B    : Long_Long_Integer;
+      Norm_W  : System.Address;   -- [VHD] f32 host
+      Norm_B  : Long_Long_Integer;
+      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim, Kernel : Integer;
+      Y       : System.Address);  -- [Dim] f32 host out
 
 end LLM_Qwen_GPU;

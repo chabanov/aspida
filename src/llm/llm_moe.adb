@@ -26,6 +26,7 @@ package body LLM_MoE is
    MProf_On     : constant Boolean :=
      Ada.Environment_Variables.Exists ("ASPIDA_PROFILE");
    MProf_Router : Duration := 0.0;
+   MProf_Tot    : Duration := 0.0;
    MProf_Route  : Duration := 0.0;
    MProf_GPU    : Duration := 0.0;
    MProf_N      : Natural  := 0;
@@ -41,8 +42,10 @@ package body LLM_MoE is
             & " softmax+topk="
             & Float'Image (Float (MProf_Route) / Float (MProf_N) * 1000.0)
             & " gpu_experts="
-            & Float'Image (Float (MProf_GPU) / Float (MProf_N) * 1000.0));
-         MProf_Router := 0.0; MProf_Route := 0.0; MProf_GPU := 0.0; MProf_N := 0;
+            & Float'Image (Float (MProf_GPU) / Float (MProf_N) * 1000.0)
+            & " TOTAL="
+            & Float'Image (Float (MProf_Tot) / Float (MProf_N) * 1000.0));
+         MProf_Router := 0.0; MProf_Route := 0.0; MProf_GPU := 0.0; MProf_Tot := 0.0; MProf_N := 0;
       end if;
    end MProf_Tick;
 
@@ -106,6 +109,7 @@ package body LLM_MoE is
    end Create_MoE;
 
    function Forward (M : MoE_Layer; X : Tensor) return Tensor is
+      TS0      : constant Ada.Real_Time.Time := Ada.Real_Time.Clock;
       Dim      : constant Integer := M.Dim;
       Intermed : constant Integer := M.Intermed;
       N_Exp    : constant Integer := M.N_Experts;
@@ -232,6 +236,8 @@ package body LLM_MoE is
             if MProf_On then
                MProf_GPU := MProf_GPU
                  + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
+               MProf_Tot := MProf_Tot
+                 + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS0);
                MProf_Tick;
             end if;
             return Result;
