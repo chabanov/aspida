@@ -176,6 +176,26 @@ beyond for batched serving (the `_wb` batched kernels already exist).
 | + WHOLE delta-net layer resident (1 H2D + 1 D2H) | 23.66 | 11.2× |
 | + WHOLE full-attn layer resident (KV on device, RoPE port) | **58.81** | **27.7×** |
 | + full resident forward chain (Phase C: H never leaves VRAM) | 56–59 | 27.7× |
+| + F32 router->GPU, fused MoE, resident delta-net+full-attn layers | 58.8 | 27.7× |
+| **Phase D — occupancy tuning (ncu-guided):** | | |
+| + split-K quant matvecs (SKW=8, ncu said occupancy-bound) | 66.5 | 31× |
+| + parallel RMSNorm reduction (was thread-0 serial 2048-sum) | 66.5 | 31× |
+| + parallel k_moe_route (was <<<1,1>>> single thread!) | **79.9** | **37.7×** |
+
+**Phase D verdict (ncu + skip-discriminator).** nsight-compute showed the tiny
+decode matvecs were occupancy/latency-bound (DRAM 5%, ~64 warps of 142 SMs'
+worth), NOT bandwidth-bound — so the fix was MORE resident warps, not MMQ or
+vectorization. Split-K (1 block/row, 8 warps splitting the reduction) + making
+the hidden single-thread/serial kernels parallel (the RMSNorm's thread-0 sum;
+the router's <<<1,1>>>) took 57 -> 80 tok/s (**+40%**), coherent throughout.
+A skip-discriminator (no-op each kernel, measure the delta) then showed the
+layers are now BALANCED — recur ~5%, moe-down ~5%, full-attn ~2%, no single
+target left. The remaining 80 -> 124 is therefore a BROAD sprint: fuse to cut
+the ~350 kernels/token (e.g. residual-add into the matvec write, norm into the
+next kernel), squeeze the matvecs further, and trim the ~2 ms host tail
+(GPU-side argmax instead of a 608 KB logits D2H + CPU scan). No silver bullet —
+many small wins — but 80 tok/s (65% of the 124 ref) is already 37.7x the naive
+start, on our own Ada/SPARK E2EE engine, fully resident and coherent.
 
 **Full resident chain LIVE** (`aspida_gpu_chain_forward`): one call per token —
 embedding gather → 36 layers (norms, delta-net|full-attn, residuals, on-device
