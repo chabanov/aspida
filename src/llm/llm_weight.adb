@@ -6,6 +6,7 @@ with Ada.Environment_Variables;
 with Ada.Text_IO;
 with Ada.Unchecked_Deallocation;
 with LLM_Dequant;
+with LLM_GPU;
 
 package body LLM_Weight is
 
@@ -196,6 +197,29 @@ package body LLM_Weight is
 
    function MatVec (W : Weight; X : Tensor) return Tensor is
    begin
+      --  GPU offload (shared by EVERY backend): when the CUDA shim is loaded
+      --  and this weight is a K-quant it can serve (Kind_Code >= 0 →
+      --  Q4_K/Q5_K/Q6_K/Q3_K/Q2_K), route the still-quantized matvec straight
+      --  to the GPU — bit-exact vs the CPU kernels, ~20x faster, weights
+      --  uploaded to VRAM once and cached by host pointer. Baking it here (not
+      --  a per-backend GMV) makes Qwen/MoE (Hura), Gemma and Llama all
+      --  GPU-accelerated through the one shared matvec. Zero-copy: the tensors'
+      --  contiguous FP32 buffers pass straight to the shim (Float = C float).
+      --  Non-K-quants (Q8_0/F32, Kind_Code < 0) and CPU-only hosts fall through
+      --  to the pure-Ada path below, so nothing changes when the GPU is absent.
+      if LLM_GPU.Available then
+         declare
+            KC : constant Integer := Kind_Code (W);
+         begin
+            if KC >= 0 then
+               return Y : constant Tensor := New_Tensor ([1, Rows (W)]) do
+                  LLM_GPU.MatVec
+                    (Raw_Address (W), Raw_Bytes (W), KC, Cols (W), Rows (W),
+                     Data_Address (X), Data_Address (Y));
+               end return;
+            end if;
+         end;
+      end if;
       if W.Is_Quant then
          if Cache_Enabled and then Natural (W.Info.N_Dims) = 2 then
             declare
@@ -280,6 +304,31 @@ package body LLM_Weight is
             declare
                Start : constant Natural := W.Bytes.all'First + (E - 1) * BPE;
             begin
+               --  GPU offload for the ROUTED-EXPERT matvec — the bulk of a MoE
+               --  model's decode cost (Top_K experts x 3 projections x layers).
+               --  Without this, only the 2D matvecs (attention/deltanet/router)
+               --  hit the GPU while the experts stay on CPU and dominate the
+               --  wall-clock. Each expert E is a contiguous 2D K-quant slice at
+               --  byte offset (E-1)*BPE; pass its start address + dims straight
+               --  to the shim (it caches each distinct expert pointer in VRAM).
+               --  Same [Cols=Dims(1)=in, Rows=Dims(2)=out] convention as MatVec.
+               if LLM_GPU.Available then
+                  declare
+                     KC : constant Integer := Kind_Code (W);
+                  begin
+                     if KC >= 0 then
+                        return Y : constant Tensor :=
+                          New_Tensor ([1, Integer (W.Info.Dims (2))])
+                        do
+                           LLM_GPU.MatVec
+                             (W.Bytes (Start)'Address, Long_Long_Integer (BPE),
+                              KC, Integer (W.Info.Dims (1)),
+                              Integer (W.Info.Dims (2)),
+                              Data_Address (X), Data_Address (Y));
+                        end return;
+                     end if;
+                  end;
+               end if;
                return LLM_Dequant.QMatVec
                  (Sub, W.Bytes (Start .. Start + BPE - 1), X);
             end;

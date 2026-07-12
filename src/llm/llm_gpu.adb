@@ -1,3 +1,4 @@
+with Ada.Text_IO;
 ---------------------------------------------------------------------
 -- LLM_GPU body — dlopen the CUDA shim and dispatch matvec to it.
 ---------------------------------------------------------------------
@@ -79,8 +80,13 @@ package body LLM_GPU is
             H := C_dlopen (CL, RTLD_NOW);
             Free (CL);
             if H = System.Null_Address then
+               Ada.Text_IO.Put_Line
+                 (Ada.Text_IO.Standard_Error,
+                  "[LLM_GPU] dlopen FAILED for '" & Lib & "' — CPU fallback");
                return;
             end if;
+            Ada.Text_IO.Put_Line
+              (Ada.Text_IO.Standard_Error, "[LLM_GPU] shim loaded: " & Lib);
             declare
                CS : chars_ptr := New_String ("aspida_gpu_matvec");
                A  : System.Address;
@@ -89,6 +95,13 @@ package body LLM_GPU is
                Free (CS);
                if A /= System.Null_Address then
                   Fn := To_Fn (A);
+                  Ada.Text_IO.Put_Line
+                    (Ada.Text_IO.Standard_Error,
+                     "[LLM_GPU] aspida_gpu_matvec resolved — GPU offload ACTIVE");
+               else
+                  Ada.Text_IO.Put_Line
+                    (Ada.Text_IO.Standard_Error,
+                     "[LLM_GPU] aspida_gpu_matvec NOT FOUND — CPU fallback");
                end if;
             end;
             declare
