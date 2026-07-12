@@ -175,6 +175,29 @@ beyond for batched serving (the `_wb` batched kernels already exist).
 | + fused MoE (30 launches → 2 kernels) | 17.45 | 8.2× |
 | + WHOLE delta-net layer resident (1 H2D + 1 D2H) | 23.66 | 11.2× |
 | + WHOLE full-attn layer resident (KV on device, RoPE port) | **58.81** | **27.7×** |
+| + full resident forward chain (Phase C: H never leaves VRAM) | 56–59 | 27.7× |
+
+**Full resident chain LIVE** (`aspida_gpu_chain_forward`): one call per token —
+embedding gather → 36 layers (norms, delta-net|full-attn, residuals, on-device
+router+top-k, fused MoE) → final norm → LM head → one D2H of the logits. Hidden
+state, KV/delta state and routing never touch the host. Per-generation device
+states are freed (a real VRAM leak — ~0.5 GB/request — is now closed).
+
+**Where the 56 tok/s goes (measured, cudaEvent split):** chain-internal 14.9 ms
+(embed+36 layers 11.4 ms, final-norm+LM-head 2.3 ms) + ~3 ms host (sampler +
+E2EE proxy). GPU util 92–97 % during compute → NOT host/launch-bound (so a CUDA
+graph buys little).
+
+**Decisive experiment — the layers are MEMORY-bound, not compute-bound.**
+Replacing the entire Q4_K dequant math with a trivial MAC (same loads) changed
+the layer time 11.4 → 11.2 ms — i.e. nothing. The quant kernels wait on memory
+at ~110 GB/s effective of the ~960 GB/s peak. So **MMQ / reduced-precision
+dequant would NOT help** (there is no compute surplus to trade). The lever to
+124 is **memory-level parallelism**: the warp-per-row kernels run a dependent
+accumulator over the block loop (low in-flight requests) — multi-accumulator
+ILP and/or multiple output rows per warp raise MLP toward peak bandwidth
+(headroom ~5×, so parity and beyond is reachable). That is a focused, iterative
+kernel-tuning pass (re-verify coherence each step).
 
 **47 % of the 124 tok/s ollama reference.** Remaining ~14.3 ms/token wall:
 MoE.Forward internals ~3.6 ms (router-call overhead 0.8 + experts 2.7), attention
