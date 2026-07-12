@@ -764,6 +764,51 @@ package body LLM_Qwen is
                   & Float'Image (Float (B * NT) / Float (Dt))
                   & " per_lane=" & Float'Image (Float (NT) / Float (Dt)));
             end;
+
+            --  Correctness: batched(B=1) must equal single-request on the same
+            --  fresh state + input (the batched matvecs reduce to the single-row
+            --  kernels at B=1). Compare the token-0 logits; max abs diff ~ 0.
+            declare
+               HS : array (0 .. NL - 1) of Interfaces.C.int := [others => 0];
+               HB : array (0 .. NL - 1) of Interfaces.C.int := [others => 0];
+               R1 : array (0 .. 0) of Interfaces.C.int := [0 => 0];
+               P0 : array (0 .. 0) of Interfaces.C.int := [0 => 0];
+               LS : constant Tensor := New_Tensor ([1, M.Vocab_Sz]);
+               LB : constant Tensor := New_Tensor ([1, M.Vocab_Sz]);
+               Max_Diff, Max_Mag : Float := 0.0;
+
+               function Fresh (Li : Integer) return Integer is
+                  Blk : LLM_Qwen_Blk.Qwen_Block renames M.Blocks (Li).all;
+               begin
+                  if Blk.Is_Full_Attn then
+                     return LLM_Qwen_GPU.Fattn_New
+                       (Cap, Blk.Full.N_KV_Heads * Blk.Full.Head_Dim, Blk.Full.N_Q_Heads);
+                  else
+                     return LLM_Qwen_GPU.Dnet_New
+                       (Blk.DNet.N_V_Heads, Blk.DNet.Key_Head_Dim,
+                        Blk.DNet.Value_Head_Dim, Blk.DNet.QKV_Out,
+                        Shape (Blk.DNet.Conv_W) (2));
+                  end if;
+               end Fresh;
+            begin
+               for Li in 1 .. NL loop
+                  HS (Li - 1) := Interfaces.C.int (Fresh (Li));
+                  HB (Li - 1) := Interfaces.C.int (Fresh (Li));
+               end loop;
+               LLM_Qwen_GPU.Chain_Begin (HS'Address);
+               LLM_Qwen_GPU.Chain_Forward (0, 0, HS'Address, Data_Address (LS));
+               LLM_Qwen_GPU.Chain_End;
+               LLM_Qwen_GPU.Chain_Forward_Batch
+                 (1, R1'Address, P0'Address, HB'Address, Data_Address (LB));
+               for K in 1 .. M.Vocab_Sz loop
+                  Max_Diff := Float'Max (Max_Diff, abs (Get_Flat (LS, K) - Get_Flat (LB, K)));
+                  Max_Mag  := Float'Max (Max_Mag, abs (Get_Flat (LS, K)));
+               end loop;
+               Ada.Text_IO.Put_Line
+                 (Ada.Text_IO.Standard_Error,
+                  "[BATCH-CHECK] max|logit_single - logit_batch(B=1)| ="
+                  & Float'Image (Max_Diff) & "  (max|logit|=" & Float'Image (Max_Mag) & ")");
+            end;
          end;
       end if;
    end Register_Chain;
