@@ -519,6 +519,23 @@ __global__ void k_q6k_sk(const uint8_t *__restrict__ w, const float *__restrict_
     if (threadIdx.x == 0) { float sacc = 0.f; for (int i = 0; i < WARPS; ++i) sacc += part[i]; y[row] = sacc; }
 }
 
+__global__ void k_q8_0_sk(const uint8_t *__restrict__ w, const float *__restrict__ x,
+                         float *__restrict__ y, int in, int out) {
+    int row = blockIdx.x; if (row >= out) return;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, WARPS = blockDim.x >> 5;
+    int nb = in / 32; size_t bpr = (size_t) nb * 34;
+    const uint8_t *r = w + (size_t) row * bpr; float acc = 0.f;
+    for (int b = warp; b < nb; b += WARPS) {
+        const uint8_t *blk = r + (size_t) b * 34; float d = f16(blk);
+        const int8_t *qs = (const int8_t *) (blk + 2);
+        acc += d * (float) qs[lane] * x[b * 32 + lane];
+    }
+    acc = warp_reduce(acc);
+    __shared__ float part[32];
+    if (lane == 0) part[warp] = acc; __syncthreads();
+    if (threadIdx.x == 0) { float sacc = 0.f; for (int i = 0; i < WARPS; ++i) sacc += part[i]; y[row] = sacc; }
+}
+
 // Launch the right warp-per-row K-quant matvec into a DEVICE buffer:
 //   y[out] = W[out,in] . x[in].  No host copy — dx/dy are device-resident.
 static inline void launch_matvec(const uint8_t *dw, int kind, int in, int out,
@@ -528,7 +545,7 @@ static inline void launch_matvec(const uint8_t *dw, int kind, int in, int out,
     else if (kind == 1) k_q6k_sk<<<out, SKW * 32>>>(dw, dx, dy, in, out);
     else if (kind == 2) k_q5k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
     else if (kind == 3) k_q3k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
-    else if (kind == 5) k_q8_0_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
+    else if (kind == 5) k_q8_0_sk<<<out, SKW * 32>>>(dw, dx, dy, in, out);
     else                k_q2k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
 }
 

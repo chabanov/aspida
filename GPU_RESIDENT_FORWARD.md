@@ -352,3 +352,38 @@ coherence verification. The throughput target is met.
 guided occupancy tuning, single-request) → **135–145 aggregate (continuous
 batching) = past the 124 ollama-Q8 reference**, on aspida's own Ada/SPARK E2EE
 engine, fully resident, coherent.
+
+---
+
+## llama.cpp study — closing the gap to ollama (findings)
+
+Head-to-head on the SAME hardware (RTX 6000 Ada), same model (Hura Q8_0):
+**ollama 131 tok/s vs aspida 70 tok/s (single-request)** — ollama ~1.85x faster
+(the earlier "parity" was aspida-batched vs ollama-single on different HW, an
+unfair comparison; corrected).
+
+Cloned ggml-org/llama.cpp and studied its CUDA quant path (mmvq.cu, vecdotq.cuh,
+quantize.cu). Its core technique: quantize the activation to Q8_1 (int8+scale)
+and compute the dot with `__dp4a` (4 int8 MACs per instruction on integer
+units). Tested it against our approach — **it does NOT help aspida**:
+
+- Microbench (Q8_0 matvec [512,2048], RTX 6000 Ada): float 5.8 us/call vs
+  dp4a 5.7 us/call (matvec only) — identical. dp4a accelerates COMPUTE, but our
+  kernels are MEMORY-bound (ncu: DRAM 5%, compute 14%), so there is no compute
+  surplus to trade. With the activation-quantization step it is 11 us (2x worse).
+- Q8_0 was missing the split-K occupancy fix the K-quants have; added it
+  (k_q8_0_sk) for consistency, but it is neutral for Q8_0 — Q8_0 reads ~2x the
+  bytes of Q4_K (34 B / 32 vals) so it is bandwidth-bound, not occupancy-bound.
+
+**The real gap is weight-read memory-bandwidth efficiency** (~290 GB/s here vs
+~420 GB/s in ollama, of ~960 peak). Root cause: the Q8_0 block is 34 bytes
+(f16 d + 32 int8), so consecutive blocks are 34-B strided — misaligned to 128-B
+cache lines, hurting coalescing. llama.cpp mitigates this with aligned int loads
+(`get_int_b2`) and years of per-kernel memory tuning. Matching it is a deep,
+specialized memory-access effort (aligned vectorized loads, repacking, flash-
+attention) — not a single lever, and the obvious ones (dp4a compute, occupancy)
+do not apply because our bottleneck is DRAM bandwidth on a misaligned layout.
+
+Honest standing: aspida is ~70% of ollama's pure-forward speed on Q8_0, plus
+E2EE channel + SPARK-proven correctness that ollama does not have. Full raw-speed
+parity with llama.cpp is a major specialized kernel-tuning project.
