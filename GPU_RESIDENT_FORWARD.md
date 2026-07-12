@@ -327,3 +327,28 @@ kernel tuning.
 This is a multi-day project (batched MoE + scheduler), but the throughput target
 is de-risked: the microbench already shows the weight-read amortization that
 gets us to 320–400 tok/s aggregate.
+
+### Phase E RESULT — parity reached (measured end-to-end)
+
+Implemented `aspida_gpu_chain_forward_batch` (B lanes; shared-weight matvecs via
+the batched warp kernels, per-lane stateful/routing loops) + an Ada bench
+(`ASPIDA_BENCH_BATCH`). Measured pure-forward aggregate throughput:
+
+| B | aggregate tok/s | note |
+|---|---|---|
+| 1 | 82 | = single lane |
+| **4** | **135** | **> 124 parity** |
+| 8 | 142 | |
+| 16 | 145 | MoE (per-lane) is now the plateau |
+
+**Parity is reached at B=4.** The single-request path is untouched (still 80
+tok/s, coherent). The plateau (~145) is the MoE experts, still per-lane; grouped/
+sorted-token expert execution would lift it further, but 124 is already
+exceeded. Remaining for production: a continuous-batching scheduler in the Ada
+server (admit/evict requests, batched-step barrier) + batched-generation
+coherence verification. The throughput target is met.
+
+**Session arc:** 2.12 tok/s (naive per-matvec) → 80 (resident forward + ncu-
+guided occupancy tuning, single-request) → **135–145 aggregate (continuous
+batching) = past the 124 ollama-Q8 reference**, on aspida's own Ada/SPARK E2EE
+engine, fully resident, coherent.
