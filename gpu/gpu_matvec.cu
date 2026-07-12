@@ -794,6 +794,199 @@ extern "C" void aspida_gpu_dnet_step(
     cudaMemcpy(out, dout, (size_t) dim * 4, cudaMemcpyDeviceToHost);
 }
 
+// =====================================================================
+// Phase B2 — resident full-attention (GQA) decode layer.
+// Oracle: LLM_FullAttn.Step. K/V caches live on the device across tokens;
+// per token: 1 H2D of x, QKV projections, per-head QK-RMSNorm + partial RoPE
+// (NeoX split-half or interleaved, YaRN/PI/freq-factor aware), K/V append,
+// causal GQA softmax over the whole cache, per-dim sigmoid gate, out
+// projection, 1 D2H. Scores use a resident per-layer scratch (no length cap).
+// =====================================================================
+struct FattnState { float *K, *V, *scores; int max_len, kvd; };
+static std::vector<FattnState> g_fattn;
+
+extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
+    FattnState st; st.max_len = max_len; st.kvd = kvd;
+    if (cudaMalloc(&st.K, (size_t) max_len * kvd * 4) != cudaSuccess) return -1;
+    if (cudaMalloc(&st.V, (size_t) max_len * kvd * 4) != cudaSuccess) { cudaFree(st.K); return -1; }
+    if (cudaMalloc(&st.scores, (size_t) nq * max_len * 4) != cudaSuccess) {
+        cudaFree(st.K); cudaFree(st.V); return -1; }
+    g_fattn.push_back(st);
+    return (int) g_fattn.size() - 1;
+}
+
+// theta for RoPE pair i (matches LLM_RoPE.Apply_Sections text path exactly).
+__device__ __forceinline__ float rope_theta(
+    int i, int pos_eff, int rd, float base, float freq_scale,
+    int yarn_on, float corr_lo, float corr_hi,
+    const float *ff, int use_ff) {
+    float extrap = (float) pos_eff / powf(base, (float) (2 * i) / (float) rd);
+    float th;
+    if (yarn_on) {
+        float interp = freq_scale * extrap;
+        float yv = ((float) i - corr_lo) / fmaxf(0.001f, corr_hi - corr_lo);
+        float ramp = 1.f - fminf(1.f, fmaxf(0.f, yv));
+        th = interp * (1.f - ramp) + extrap * ramp;
+    } else {
+        th = extrap * freq_scale;
+    }
+    if (use_ff) th = th / ff[i];
+    return th;
+}
+
+// Per-head QK-RMSNorm + partial RoPE + cache append. Block b < nq: query head
+// (also splits out the raw gate). Block b >= nq: kv head — writes K/V cache
+// row `pos`. blockDim = hd. Shared: normed[hd].
+__global__ void k_fattn_prep(
+    const float *__restrict__ qg, const float *__restrict__ kt, const float *__restrict__ vt,
+    const float *__restrict__ q_norm, const float *__restrict__ k_norm,
+    float *__restrict__ q_all, float *__restrict__ g_all,
+    float *__restrict__ Kc, float *__restrict__ Vc,
+    int nq, int nkv, int hd, int kvd, int pos,
+    int rd, float base, float freq_scale, float m_scale,
+    int yarn_on, float corr_lo, float corr_hi,
+    const float *__restrict__ ff, int use_ff, int interleaved, int sec_total) {
+    extern __shared__ float sh[];
+    float *nrm = sh;                       // [hd]
+    int b = blockIdx.x, d = threadIdx.x;
+    int half = rd / 2;
+    bool is_q = b < nq;
+    int head = is_q ? b : b - nq;
+    float v;
+    if (is_q) {
+        v = qg[head * 2 * hd + d];
+        g_all[head * hd + d] = qg[head * 2 * hd + hd + d];
+    } else {
+        v = kt[head * hd + d];
+        Vc[(size_t) pos * kvd + head * hd + d] = vt[head * hd + d];
+    }
+    nrm[d] = v;
+    __syncthreads();
+    // RMSNorm over hd (each thread sums ascending — CPU order)
+    float ss = 0.f;
+    for (int i = 0; i < hd; ++i) ss += nrm[i] * nrm[i];
+    float rms = sqrtf(ss / (float) hd + 1e-6f);
+    float w = is_q ? q_norm[d] : k_norm[d];
+    float nv = (v / rms) * w;
+    __syncthreads();
+    nrm[d] = nv;                            // normed value
+    __syncthreads();
+    // partial RoPE on the first rd dims
+    float out = nv;
+    if (d < rd) {
+        int i, other; bool first;
+        if (interleaved) { i = d / 2; first = (d % 2) == 0; other = first ? d + 1 : d - 1; }
+        else if (d < half) { i = d; first = true;  other = d + half; }
+        else               { i = d - half; first = false; other = d - half; }
+        int pos_eff = (i < sec_total) ? pos : 0;
+        float th = rope_theta(i, pos_eff, rd, base, freq_scale,
+                              yarn_on, corr_lo, corr_hi, ff, use_ff);
+        float c = cosf(th) * m_scale, s = sinf(th) * m_scale;
+        float x1 = first ? nrm[d] : nrm[other];
+        float x2 = first ? nrm[other] : nrm[d];
+        out = first ? (x1 * c - x2 * s) : (x2 * c + x1 * s);
+    }
+    if (is_q) q_all[head * hd + d] = out;
+    else      Kc[(size_t) pos * kvd + head * hd + d] = out;
+}
+
+// Causal GQA softmax attention over the resident cache + per-dim sigmoid gate.
+// One block (256 threads) per q head; len = pos+1 positions.
+__global__ void k_fattn_attend(
+    const float *__restrict__ q_all, const float *__restrict__ g_all,
+    const float *__restrict__ Kc, const float *__restrict__ Vc,
+    float *__restrict__ scores, float *__restrict__ attn,
+    int nq, int nkv, int hd, int kvd, int len, int max_len) {
+    int h = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+    int rep = nq / nkv, kvh = h / rep;
+    int q_off = h * hd, kv_off = kvh * hd;
+    float *sc = scores + (size_t) h * max_len;
+    __shared__ float red[256];
+    float scale = rsqrtf((float) hd);       // 1/sqrt(hd)
+    // Phase 1: scores + local max (each thread strides positions)
+    float lmax = -3.402823466e38f;
+    for (int s = tid; s < len; s += nt) {
+        float dot = 0.f;
+        const float *k = Kc + (size_t) s * kvd + kv_off;
+        const float *q = q_all + q_off;
+        for (int d = 0; d < hd; ++d) dot += q[d] * k[d];
+        dot *= scale;
+        sc[s] = dot;
+        if (dot > lmax) lmax = dot;
+    }
+    red[tid] = lmax; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]); __syncthreads(); }
+    float bmax = red[0]; __syncthreads();
+    // Phase 2: exp + sum
+    float lsum = 0.f;
+    for (int s = tid; s < len; s += nt) { float e = expf(sc[s] - bmax); sc[s] = e; lsum += e; }
+    red[tid] = lsum; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; __syncthreads(); }
+    float inv = 1.f / red[0];
+    __syncthreads();
+    // Phase 3: weighted V + sigmoid gate (threads 0..hd-1)
+    if (tid < hd) {
+        float acc = 0.f;
+        for (int s = 0; s < len; ++s)
+            acc += sc[s] * inv * Vc[(size_t) s * kvd + kv_off + tid];
+        float g = g_all[q_off + tid];
+        attn[q_off + tid] = acc * (1.f / (1.f + expf(-g)));
+    }
+}
+
+// One full-attention decode layer on the device. pos = 0-based position (the
+// Ada St.Len before this token); the caller advances its Len afterwards.
+extern "C" void aspida_gpu_fattn_step(
+    int handle, const float *x, int dim,
+    const void *q_w, long q_b, int q_k,       // rows = nq*2*hd (query|gate)
+    const void *k_w, long k_b, int k_k,       // rows = nkv*hd
+    const void *v_w, long v_b, int v_k,       // rows = nkv*hd
+    const void *o_w, long o_b, int o_k,       // [dim, nq*hd]
+    const float *q_norm, long qn_b,            // [hd] host F32
+    const float *k_norm, long kn_b,            // [hd] host F32
+    int nq, int nkv, int hd, int pos,
+    int rd, float base, float freq_scale, float m_scale,
+    int yarn_on, float corr_lo, float corr_hi,
+    const float *ff, long ff_b, int use_ff, int interleaved, int sec_total,
+    float *out) {
+    if (handle < 0 || handle >= (int) g_fattn.size()) return;
+    FattnState st = g_fattn[handle];
+    int kvd = nkv * hd, att = nq * hd, qgd = nq * 2 * hd;
+
+    static float *dx = nullptr, *dqg = nullptr, *dkt = nullptr, *dvt = nullptr,
+                 *dqa = nullptr, *dga = nullptr, *datt = nullptr, *dout = nullptr;
+    static int c_dim = 0, c_qgd = 0, c_kvd = 0, c_att = 0;
+    if (dim > c_dim) { if (dx) cudaFree(dx); cudaMalloc(&dx, (size_t) dim * 4);
+                       if (dout) cudaFree(dout); cudaMalloc(&dout, (size_t) dim * 4); c_dim = dim; }
+    if (qgd > c_qgd) { if (dqg) cudaFree(dqg); cudaMalloc(&dqg, (size_t) qgd * 4); c_qgd = qgd; }
+    if (kvd > c_kvd) { if (dkt) cudaFree(dkt); cudaMalloc(&dkt, (size_t) kvd * 4);
+                       if (dvt) cudaFree(dvt); cudaMalloc(&dvt, (size_t) kvd * 4); c_kvd = kvd; }
+    if (att > c_att) { if (dqa) cudaFree(dqa); cudaMalloc(&dqa, (size_t) att * 4);
+                       if (dga) cudaFree(dga); cudaMalloc(&dga, (size_t) att * 4);
+                       if (datt) cudaFree(datt); cudaMalloc(&datt, (size_t) att * 4); c_att = att; }
+
+    uint8_t *dqw = upload_weight(q_w, q_b);
+    uint8_t *dkw = upload_weight(k_w, k_b);
+    uint8_t *dvw = upload_weight(v_w, v_b);
+    uint8_t *dow = upload_weight(o_w, o_b);
+    float *dqn = (float *) upload_weight(q_norm, qn_b);
+    float *dkn = (float *) upload_weight(k_norm, kn_b);
+    float *dff = (use_ff && ff) ? (float *) upload_weight(ff, ff_b) : nullptr;
+
+    cudaMemcpy(dx, x, (size_t) dim * 4, cudaMemcpyHostToDevice);
+    launch_mv_any(dqw, q_k, dim, qgd, dx, dqg);
+    launch_mv_any(dkw, k_k, dim, kvd, dx, dkt);
+    launch_mv_any(dvw, v_k, dim, kvd, dx, dvt);
+    k_fattn_prep<<<nq + nkv, hd, (size_t) hd * 4>>>(
+        dqg, dkt, dvt, dqn, dkn, dqa, dga, st.K, st.V,
+        nq, nkv, hd, kvd, pos, rd, base, freq_scale, m_scale,
+        yarn_on, corr_lo, corr_hi, dff, use_ff, interleaved, sec_total);
+    k_fattn_attend<<<nq, 256>>>(dqa, dga, st.K, st.V, st.scores, datt,
+                                nq, nkv, hd, kvd, pos + 1, st.max_len);
+    launch_mv_any(dow, o_k, att, dim, datt, dout);
+    cudaMemcpy(out, dout, (size_t) dim * 4, cudaMemcpyDeviceToHost);
+}
+
 // Router + stable-softmax + greedy top-k stay on the CPU (they are tiny, and
 // the router is often non-K-quant in mixed quants like Q4_K_M): LLM_MoE.Forward
 // computes top_idx (0-based) + renormalised top_w and hands them here. This

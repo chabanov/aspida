@@ -107,4 +107,38 @@ package LLM_Qwen_GPU is
       NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim, Kernel : Integer;
       Y       : System.Address);  -- [Dim] f32 host out
 
+   --  Resident full-attention layer (Phase B2). Fattn_New allocates the
+   --  device K/V caches [Max_Len, KVD] + score scratch and returns a handle
+   --  (or -1). Fattn_Step runs the whole GQA decode layer on the device:
+   --  q(+gate)/k/v projections, per-head QK-RMSNorm + partial RoPE, K/V
+   --  append at Pos, causal softmax over the cache, per-dim sigmoid gate,
+   --  out projection. Oracle: the CPU path in LLM_FullAttn.Step. The caller
+   --  advances its Len after the call (Pos is the 0-based position).
+   function Fattn_Available return Boolean;
+
+   function Fattn_New (Max_Len, KVD, NQ : Integer) return Integer;
+
+   procedure Fattn_Step
+     (Handle   : Integer;
+      X        : System.Address;   -- [Dim] f32 host in
+      Dim      : Integer;
+      Q_W      : GPU_Weight;       -- rows = NQ*2*HD (query|gate)
+      K_W      : GPU_Weight;       -- rows = NKV*HD
+      V_W      : GPU_Weight;
+      O_W      : GPU_Weight;       -- [Dim, NQ*HD]
+      Q_Norm   : System.Address;   -- [HD] f32 host
+      QN_B     : Long_Long_Integer;
+      K_Norm   : System.Address;   -- [HD] f32 host
+      KN_B     : Long_Long_Integer;
+      NQ, NKV, HD, Pos : Integer;
+      RD       : Integer;          -- rope dim
+      Base     : Float;
+      Freq_Scale, M_Scale : Float;
+      Yarn_On  : Integer;
+      Corr_Lo, Corr_Hi : Float;
+      FF       : System.Address;   -- [RD/2] f32 host, or Null_Address
+      FF_B     : Long_Long_Integer;
+      Use_FF, Interleaved, Sec_Total : Integer;
+      Y        : System.Address);  -- [Dim] f32 host out
+
 end LLM_Qwen_GPU;

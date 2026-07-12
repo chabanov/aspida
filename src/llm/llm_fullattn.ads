@@ -50,6 +50,7 @@ package LLM_FullAttn is
       K_Cache : LLM_Tensor.Tensor;  -- [Max_Len, N_KV_Heads*Head_Dim]
       V_Cache : LLM_Tensor.Tensor;  -- [Max_Len, N_KV_Heads*Head_Dim]
       Len     : Natural := 0;       -- positions filled so far
+      GPU_Handle : Integer := -1;   -- resident device KV (Phase B2), -1 = CPU
    end record;
 
    function Init_State (L : Full_Attn_Layer; Max_Len : Integer) return Attn_State;

@@ -73,9 +73,35 @@ package body LLM_Qwen_GPU is
      with Convention => C;
    function To_DStep is new Ada.Unchecked_Conversion (System.Address, Dnet_Step_Fn);
 
+   --  int aspida_gpu_fattn_new(int max_len, int kvd, int nq)
+   type Fattn_New_Fn is access function
+     (Max_Len, KVD, NQ : int) return int
+     with Convention => C;
+   function To_FNew is new Ada.Unchecked_Conversion (System.Address, Fattn_New_Fn);
+
+   --  void aspida_gpu_fattn_step(...) — see llm_qwen_gpu.ads / gpu_matvec.cu.
+   type Fattn_Step_Fn is access procedure
+     (Handle : int; X : System.Address; Dim : int;
+      QW : System.Address; QB : Interfaces.C.long; QK : int;
+      KW : System.Address; KB : Interfaces.C.long; KK : int;
+      VW : System.Address; VB : Interfaces.C.long; VK : int;
+      OW : System.Address; OB : Interfaces.C.long; OK : int;
+      QN : System.Address; QNB : Interfaces.C.long;
+      KN : System.Address; KNB : Interfaces.C.long;
+      NQ, NKV, HD, Pos : int;
+      RD : int; Base : C_float; Freq_Scale, M_Scale : C_float;
+      Yarn_On : int; Corr_Lo, Corr_Hi : C_float;
+      FF : System.Address; FFB : Interfaces.C.long;
+      Use_FF, Interleaved, Sec_Total : int;
+      Y : System.Address)
+     with Convention => C;
+   function To_FStep is new Ada.Unchecked_Conversion (System.Address, Fattn_Step_Fn);
+
    Fn       : MoE_Fn := null;
    DNew_Fn  : Dnet_New_Fn := null;
    DStep_Fn : Dnet_Step_Fn := null;
+   FNew_Fn  : Fattn_New_Fn := null;
+   FStep_Fn : Fattn_Step_Fn := null;
 
    protected Init_Guard is
       procedure Run;
@@ -135,6 +161,26 @@ package body LLM_Qwen_GPU is
                Free (CS);
                if A /= System.Null_Address then
                   DStep_Fn := To_DStep (A);
+               end if;
+            end;
+            declare
+               CS : chars_ptr := New_String ("aspida_gpu_fattn_new");
+               A  : System.Address;
+            begin
+               A := C_dlsym (H, CS);
+               Free (CS);
+               if A /= System.Null_Address then
+                  FNew_Fn := To_FNew (A);
+               end if;
+            end;
+            declare
+               CS : chars_ptr := New_String ("aspida_gpu_fattn_step");
+               A  : System.Address;
+            begin
+               A := C_dlsym (H, CS);
+               Free (CS);
+               if A /= System.Null_Address then
+                  FStep_Fn := To_FStep (A);
                end if;
             end;
          end;
@@ -229,5 +275,57 @@ package body LLM_Qwen_GPU is
                 int (NV), int (KHD), int (VHD), int (QO), int (Q_Dim),
                 int (N_K_Heads), int (V_Dim), int (Kernel), Y);
    end Dnet_Step;
+
+   function Fattn_Available return Boolean is
+   begin
+      Init;
+      return FNew_Fn /= null and then FStep_Fn /= null;
+   end Fattn_Available;
+
+   function Fattn_New (Max_Len, KVD, NQ : Integer) return Integer is
+   begin
+      Init;
+      if FNew_Fn = null then
+         return -1;
+      end if;
+      return Integer (FNew_Fn (int (Max_Len), int (KVD), int (NQ)));
+   end Fattn_New;
+
+   procedure Fattn_Step
+     (Handle   : Integer;
+      X        : System.Address;
+      Dim      : Integer;
+      Q_W      : GPU_Weight;
+      K_W      : GPU_Weight;
+      V_W      : GPU_Weight;
+      O_W      : GPU_Weight;
+      Q_Norm   : System.Address;
+      QN_B     : Long_Long_Integer;
+      K_Norm   : System.Address;
+      KN_B     : Long_Long_Integer;
+      NQ, NKV, HD, Pos : Integer;
+      RD       : Integer;
+      Base     : Float;
+      Freq_Scale, M_Scale : Float;
+      Yarn_On  : Integer;
+      Corr_Lo, Corr_Hi : Float;
+      FF       : System.Address;
+      FF_B     : Long_Long_Integer;
+      Use_FF, Interleaved, Sec_Total : Integer;
+      Y        : System.Address) is
+   begin
+      FStep_Fn (int (Handle), X, int (Dim),
+                Q_W.Addr, Interfaces.C.long (Q_W.Bytes), int (Q_W.Kind),
+                K_W.Addr, Interfaces.C.long (K_W.Bytes), int (K_W.Kind),
+                V_W.Addr, Interfaces.C.long (V_W.Bytes), int (V_W.Kind),
+                O_W.Addr, Interfaces.C.long (O_W.Bytes), int (O_W.Kind),
+                Q_Norm, Interfaces.C.long (QN_B),
+                K_Norm, Interfaces.C.long (KN_B),
+                int (NQ), int (NKV), int (HD), int (Pos),
+                int (RD), C_float (Base), C_float (Freq_Scale), C_float (M_Scale),
+                int (Yarn_On), C_float (Corr_Lo), C_float (Corr_Hi),
+                FF, Interfaces.C.long (FF_B),
+                int (Use_FF), int (Interleaved), int (Sec_Total), Y);
+   end Fattn_Step;
 
 end LLM_Qwen_GPU;
