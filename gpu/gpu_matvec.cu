@@ -1305,7 +1305,8 @@ __global__ void k_embed(const float *__restrict__ embed, const int *__restrict__
 __global__ void k_moe_route(const float *__restrict__ rl, const float *__restrict__ x,
                             const float *__restrict__ sgi, int sgi_len,
                             int n_exp, int top_k, int dim, MoeRoute *route) {
-    __shared__ float r[512]; __shared__ float red[256]; __shared__ float mx, sm;
+    __shared__ float r[512]; __shared__ float red[256]; __shared__ int redi[256];
+    __shared__ float mx, sm;
     int tid = threadIdx.x, nt = blockDim.x;
     if (n_exp > 512) return;
     float lmax = -3.402823466e38f;
@@ -1320,19 +1321,28 @@ __global__ void k_moe_route(const float *__restrict__ rl, const float *__restric
     if (tid == 0) sm = red[0]; __syncthreads();
     for (int e = tid; e < n_exp; e += nt) r[e] /= sm;
     __syncthreads();
-    if (tid == 0) {
-        bool used[512];
-        for (int e = 0; e < n_exp; ++e) used[e] = false;
-        float sw = 0.f;
-        for (int k = 0; k < top_k; ++k) {
-            int be = 0; float bv = -3.402823466e38f;
-            for (int e = 0; e < n_exp; ++e)
-                if (!used[e] && r[e] > bv) { bv = r[e]; be = e; }
-            route->idx[k] = be; route->w[k] = bv; used[be] = true; sw += bv;
+    // Parallel top-k: repeatedly argmax over r[] (block-wide reduction), then
+    // knock out the winner by setting it to -inf. All 256 threads participate,
+    // vs the previous single-thread O(top_k*n_exp) scan with a local used[] array.
+    for (int k = 0; k < top_k; ++k) {
+        float bv = -3.402823466e38f; int bi = 0;
+        for (int e = tid; e < n_exp; e += nt)
+            if (r[e] > bv) { bv = r[e]; bi = e; }
+        red[tid] = bv; redi[tid] = bi; __syncthreads();
+        for (int o = nt / 2; o > 0; o >>= 1) {
+            if (tid < o && red[tid + o] > red[tid]) { red[tid] = red[tid + o]; redi[tid] = redi[tid + o]; }
+            __syncthreads();
         }
+        if (tid == 0) { route->idx[k] = redi[0]; route->w[k] = red[0]; r[redi[0]] = -3.402823466e38f; }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float sw = 0.f;
+        for (int k = 0; k < top_k; ++k) sw += route->w[k];
         for (int k = 0; k < top_k; ++k) route->w[k] /= sw;
         for (int k = top_k; k < MOE_MAXK; ++k) { route->idx[k] = 0; route->w[k] = 0.f; }
     }
+    __syncthreads();
     float gd = 0.f;
     if (sgi_len > 1 && sgi) for (int d = tid; d < dim; d += nt) gd += sgi[d] * x[d];
     red[tid] = gd; __syncthreads();
