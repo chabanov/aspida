@@ -1,7 +1,7 @@
 ---------------------------------------------------------------------
 -- LLM_Qwen_GPU — resident-GPU decode blocks for the Qwen/MoE backend.
 --
--- This is the "resident forward" path (see docs/GPU_RESIDENT_FORWARD.md):
+-- This is the "resident forward" path (see GPU_RESIDENT_FORWARD.md):
 -- instead of offloading one matvec at a time (LLM_GPU.MatVec, which round-trips
 -- the activation host<->device on every weight), a whole decode block runs on
 -- the device with the hidden state kept resident, so per token only the input

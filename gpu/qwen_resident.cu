@@ -1,6 +1,6 @@
 // qwen_resident.cu — resident-GPU decode blocks for the Qwen/MoE backend.
 //
-// See docs/GPU_RESIDENT_FORWARD.md. This eliminates the per-matvec host<->device
+// See GPU_RESIDENT_FORWARD.md. This eliminates the per-matvec host<->device
 // ping-pong (the measured 2.2 tok/s ceiling) by running a whole decode block on
 // the device with the activation resident. Increment 1 = the fused MoE FFN.
 //
