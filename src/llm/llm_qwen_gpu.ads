@@ -186,7 +186,7 @@ package LLM_Qwen_GPU is
    procedure Chain_Model
      (Embed : System.Address; Embed_B : Long_Long_Integer;
       FNorm : System.Address; FNorm_B : Long_Long_Integer;
-      LM    : System.Address; LM_B    : Long_Long_Integer;
+      LM    : System.Address; LM_B    : Long_Long_Integer; LM_K : Integer;
       Dim, Vocab : Integer);
 
    function Chain_Ready return Boolean;

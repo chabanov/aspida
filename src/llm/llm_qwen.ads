@@ -6,6 +6,7 @@
 ---------------------------------------------------------------------
 
 with LLM_Tensor;
+with LLM_Weight;
 with LLM_Qwen_Blk;
 with LLM_Tokenizer;
 with LLM_Sampler;
@@ -166,6 +167,7 @@ private
       Blocks     : Block_Array_Ptr;
       Final_Norm : LLM_Tensor.Tensor;
       LM_Head    : LLM_Tensor.Tensor;
+      LM_Head_Q  : LLM_Weight.Weight;   -- native-quant output proj for the GPU chain
       N_Blocks   : Integer;
       Vocab_Sz   : Integer;
       Model_Dim  : Integer;

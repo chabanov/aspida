@@ -154,7 +154,7 @@ package body LLM_Qwen_GPU is
    type Chain_Model_Fn is access procedure
      (E : System.Address; EB : Interfaces.C.long;
       F : System.Address; FB : Interfaces.C.long;
-      L : System.Address; LB : Interfaces.C.long;
+      L : System.Address; LB : Interfaces.C.long; LK : int;
       Dim, Vocab : int)
      with Convention => C;
    function To_CModel is new Ada.Unchecked_Conversion (System.Address, Chain_Model_Fn);
@@ -550,12 +550,12 @@ package body LLM_Qwen_GPU is
    procedure Chain_Model
      (Embed : System.Address; Embed_B : Long_Long_Integer;
       FNorm : System.Address; FNorm_B : Long_Long_Integer;
-      LM    : System.Address; LM_B    : Long_Long_Integer;
+      LM    : System.Address; LM_B    : Long_Long_Integer; LM_K : Integer;
       Dim, Vocab : Integer) is
    begin
       CModel_Fn (Embed, Interfaces.C.long (Embed_B),
                  FNorm, Interfaces.C.long (FNorm_B),
-                 LM, Interfaces.C.long (LM_B), int (Dim), int (Vocab));
+                 LM, Interfaces.C.long (LM_B), int (LM_K), int (Dim), int (Vocab));
    end Chain_Model;
 
    function Chain_Ready return Boolean is

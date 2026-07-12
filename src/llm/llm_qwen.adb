@@ -25,7 +25,6 @@ with LLM_RMSNorm;
 with LLM_FullAttn;
 with LLM_DeltaNet_Blk;
 with LLM_RoPE;
-with LLM_Weight;
 with LLM_Chat_Parser;
 
 package body LLM_Qwen is
@@ -279,6 +278,7 @@ package body LLM_Qwen is
       Ada.Text_IO.Put_Line ("  loading output.weight (1GB)...");
       Ada.Text_IO.Flush;
       M.LM_Head := L ("output.weight");
+      M.LM_Head_Q := LQ ("output.weight");   -- native quant for the GPU chain
       Ada.Text_IO.Put_Line ("  output.weight loaded.");
 
       Ada.Text_IO.Put_Line ("  Loading transformer blocks...");
@@ -697,11 +697,21 @@ package body LLM_Qwen is
                Intermed => B.MoE.Intermed);
          end;
       end loop;
-      Chain_Model
-        (Embed => Data_Address (M.Token_Emb), Embed_B => TB (M.Token_Emb),
-         FNorm => Data_Address (M.Final_Norm), FNorm_B => TB (M.Final_Norm),
-         LM => Data_Address (M.LM_Head), LM_B => TB (M.LM_Head),
-         Dim => M.Model_Dim, Vocab => M.Vocab_Sz);
+      declare
+         LM_Is_Q : constant Boolean := LLM_Weight.Kind_Code (M.LM_Head_Q) >= 0;
+      begin
+         Chain_Model
+           (Embed => Data_Address (M.Token_Emb), Embed_B => TB (M.Token_Emb),
+            FNorm => Data_Address (M.Final_Norm), FNorm_B => TB (M.Final_Norm),
+            LM =>
+              (if LM_Is_Q then LLM_Weight.Raw_Address (M.LM_Head_Q)
+               else Data_Address (M.LM_Head)),
+            LM_B =>
+              (if LM_Is_Q then LLM_Weight.Raw_Bytes (M.LM_Head_Q)
+               else TB (M.LM_Head)),
+            LM_K => (if LM_Is_Q then LLM_Weight.Kind_Code (M.LM_Head_Q) else -1),
+            Dim => M.Model_Dim, Vocab => M.Vocab_Sz);
+      end;
       Chain_OK  := Chain_Ready;
       Chain_Tag := Data_Address (M.Token_Emb);
       --  Phase E: batched-throughput benchmark (env ASPIDA_BENCH_BATCH=B).
