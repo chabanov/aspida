@@ -164,6 +164,10 @@ package body LLM_Qwen_GPU is
      with Convention => C;
    function To_CFwd is new Ada.Unchecked_Conversion (System.Address, Chain_Fwd_Fn);
 
+   type Chain_Begin_Fn is access procedure (Handles : System.Address)
+     with Convention => C;
+   function To_CBegin is new Ada.Unchecked_Conversion (System.Address, Chain_Begin_Fn);
+
    Fn       : MoE_Fn := null;
    DNew_Fn  : Dnet_New_Fn := null;
    DStep_Fn : Dnet_Step_Fn := null;
@@ -178,6 +182,8 @@ package body LLM_Qwen_GPU is
    CMoE_Fn   : Chain_MoE_Fn := null;
    CModel_Fn : Chain_Model_Fn := null;
    CFwd_Fn   : Chain_Fwd_Fn := null;
+   CBegin_Fn : Chain_Begin_Fn := null;
+   CEnd_Fn   : Void_Fn := null;
 
    protected Init_Guard is
       procedure Run;
@@ -286,6 +292,10 @@ package body LLM_Qwen_GPU is
                if A /= System.Null_Address then CModel_Fn := To_CModel (A); end if;
                Look ("aspida_gpu_chain_forward", A);
                if A /= System.Null_Address then CFwd_Fn := To_CFwd (A); end if;
+               Look ("aspida_gpu_chain_begin", A);
+               if A /= System.Null_Address then CBegin_Fn := To_CBegin (A); end if;
+               Look ("aspida_gpu_chain_end", A);
+               if A /= System.Null_Address then CEnd_Fn := To_Void (A); end if;
             end;
          end;
       end Run;
@@ -546,6 +556,20 @@ package body LLM_Qwen_GPU is
       Init;
       return CReady_Fn /= null and then CReady_Fn.all /= 0;
    end Chain_Ready;
+
+   procedure Chain_Begin (Handles : System.Address) is
+   begin
+      if CBegin_Fn /= null then
+         CBegin_Fn (Handles);
+      end if;
+   end Chain_Begin;
+
+   procedure Chain_End is
+   begin
+      if CEnd_Fn /= null then
+         CEnd_Fn.all;
+      end if;
+   end Chain_End;
 
    procedure Chain_Forward
      (Embed_Row : Integer;

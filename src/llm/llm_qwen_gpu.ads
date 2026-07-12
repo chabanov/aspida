@@ -191,6 +191,12 @@ package LLM_Qwen_GPU is
 
    function Chain_Ready return Boolean;
 
+   --  Bind the per-generation state handles and force a fresh graph capture
+   --  (device state pointers differ from the previous generation). Call before
+   --  the decode loop; Chain_End releases the graph after it.
+   procedure Chain_Begin (Handles : System.Address);
+   procedure Chain_End;
+
    procedure Chain_Forward
      (Embed_Row : Integer;      -- 0-based row in the embedding table
       Pos       : Integer;      -- 0-based token position (RoPE / KV append)

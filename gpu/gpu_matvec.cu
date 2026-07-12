@@ -693,6 +693,19 @@ static inline void launch_mv_any(const uint8_t *dw, int kind, int in, int out,
     k_dense_mv<<<(out + WPB - 1) / WPB, TPB>>>((const float *) dw, dx, dy, in, out);
 }
 
+// Stream-aware matvec dispatch (for graph capture). Mirrors launch_matvec +
+// the dense F32 fallback, but every launch goes on stream `st`.
+static inline void launch_mv_st(const uint8_t *dw, int kind, int in, int out,
+                                const float *dx, float *dy, cudaStream_t st) {
+    const int TPB = 256, WPB = TPB / 32;
+    if (kind == 0)      k_q4k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
+    else if (kind == 1) k_q6k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
+    else if (kind == 2) k_q5k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
+    else if (kind == 3) k_q3k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
+    else if (kind == 4) k_q2k_w<<<(out + WPB - 1) / WPB, TPB, 0, st>>>(dw, dx, dy, in, out);
+    else k_dense_mv<<<(out + WPB - 1) / WPB, TPB, 0, st>>>((const float *) dw, dx, dy, in, out);
+}
+
 // Causal conv1d + SiLU over the resident history window, then advance it.
 // One thread per channel c: cq[c] = silu(qkv[c]*w[c,K-1] + sum_k hist[k,c]*w[c,k]),
 // then shift this channel's history down one row and append qkv[c].
@@ -885,12 +898,13 @@ __global__ void k_fattn_prep(
     const float *__restrict__ q_norm, const float *__restrict__ k_norm,
     float *__restrict__ q_all, float *__restrict__ g_all,
     float *__restrict__ Kc, float *__restrict__ Vc,
-    int nq, int nkv, int hd, int kvd, int pos,
+    int nq, int nkv, int hd, int kvd, const int *__restrict__ posp,
     int rd, float base, float freq_scale, float m_scale,
     int yarn_on, float corr_lo, float corr_hi,
     const float *__restrict__ ff, int use_ff, int interleaved, int sec_total) {
     extern __shared__ float sh[];
     float *nrm = sh;                       // [hd]
+    int pos = *posp;
     int b = blockIdx.x, d = threadIdx.x;
     int half = rd / 2;
     bool is_q = b < nq;
@@ -939,7 +953,8 @@ __global__ void k_fattn_attend(
     const float *__restrict__ q_all, const float *__restrict__ g_all,
     const float *__restrict__ Kc, const float *__restrict__ Vc,
     float *__restrict__ scores, float *__restrict__ attn,
-    int nq, int nkv, int hd, int kvd, int len, int max_len) {
+    int nq, int nkv, int hd, int kvd, const int *__restrict__ posp, int max_len) {
+    int len = *posp + 1;
     int h = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
     int rep = nq / nkv, kvh = h / rep;
     int q_off = h * hd, kv_off = kvh * hd;
@@ -1016,16 +1031,18 @@ extern "C" void aspida_gpu_fattn_step(
     float *dkn = (float *) upload_weight(k_norm, kn_b);
     float *dff = (use_ff && ff) ? (float *) upload_weight(ff, ff_b) : nullptr;
 
+    static int *d_pos1 = nullptr; if (!d_pos1) cudaMalloc(&d_pos1, 4);
+    cudaMemcpy(d_pos1, &pos, 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dx, x, (size_t) dim * 4, cudaMemcpyHostToDevice);
     launch_mv_any(dqw, q_k, dim, qgd, dx, dqg);
     launch_mv_any(dkw, k_k, dim, kvd, dx, dkt);
     launch_mv_any(dvw, v_k, dim, kvd, dx, dvt);
     k_fattn_prep<<<nq + nkv, hd, (size_t) hd * 4>>>(
         dqg, dkt, dvt, dqn, dkn, dqa, dga, st.K, st.V,
-        nq, nkv, hd, kvd, pos, rd, base, freq_scale, m_scale,
+        nq, nkv, hd, kvd, d_pos1, rd, base, freq_scale, m_scale,
         yarn_on, corr_lo, corr_hi, dff, use_ff, interleaved, sec_total);
     k_fattn_attend<<<nq, 256>>>(dqa, dga, st.K, st.V, st.scores, datt,
-                                nq, nkv, hd, kvd, pos + 1, st.max_len);
+                                nq, nkv, hd, kvd, d_pos1, st.max_len);
     launch_mv_any(dow, o_k, att, dim, datt, dout);
     cudaMemcpy(out, dout, (size_t) dim * 4, cudaMemcpyDeviceToHost);
 }
@@ -1145,10 +1162,10 @@ __global__ void k_norm1(const float *__restrict__ x, const float *__restrict__ w
 }
 
 // Embedding row gather: H = embed[row].
-__global__ void k_embed(const float *__restrict__ embed, int row,
+__global__ void k_embed(const float *__restrict__ embed, const int *__restrict__ rowp,
                         float *__restrict__ h, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < dim) h[i] = embed[(size_t) row * dim + i];
+    if (i < dim) h[i] = embed[(size_t) (*rowp) * dim + i];
 }
 
 // Router softmax + greedy top-k + renorm + shared sigmoid gate, single thread
@@ -1361,107 +1378,140 @@ extern "C" void aspida_gpu_chain_model(
 
 extern "C" int aspida_gpu_chain_ready(void) { return g_ch_ready && !g_chain.empty(); }
 
-// One full decode step: embed row in, logits out; H never leaves the device.
-// attn_handles[i] = the per-generation dnet/fattn state handle of layer i.
-extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,
-                                         const int *attn_handles, float *logits) {
-    static float *H = nullptr, *nx = nullptr, *ao = nullptr, *dlog = nullptr,
-                 *dqkv = nullptr, *dcq = nullptr, *dar = nullptr, *dbr = nullptr,
-                 *dz = nullptr, *dg = nullptr, *db = nullptr, *dor = nullptr,
-                 *dqg = nullptr, *dkt = nullptr, *dvt = nullptr, *dqa = nullptr,
-                 *dga = nullptr, *datt = nullptr, *drl = nullptr, *dhb = nullptr;
-    static MoeRoute *droute = nullptr;
-    static int inited = 0;
+// Persistent chain scratch + graph state.
+static float *H = nullptr, *nx = nullptr, *ao = nullptr, *dlog = nullptr,
+             *dqkv = nullptr, *dcq = nullptr, *dar = nullptr, *dbr = nullptr,
+             *dz = nullptr, *dg = nullptr, *db = nullptr, *dor = nullptr,
+             *dqg = nullptr, *dkt = nullptr, *dvt = nullptr, *dqa = nullptr,
+             *dga = nullptr, *datt = nullptr, *drl = nullptr, *dhb = nullptr;
+static MoeRoute *droute = nullptr;
+static int ch_inited = 0;
+static int *g_d_row = nullptr, *g_d_pos = nullptr;   // device-side per-token inputs
+static const int *g_handles = nullptr;               // per-generation state handles
+static cudaStream_t g_cstream = 0;
+static cudaGraph_t g_graph = nullptr;
+static cudaGraphExec_t g_gexec = nullptr;
+static int g_captured = 0;
+
+static void chain_alloc(void) {
     int dim = g_ch_dim;
-    if (!inited) {
-        cudaMalloc(&H, (size_t) dim * 4); cudaMalloc(&nx, (size_t) dim * 4);
-        cudaMalloc(&ao, (size_t) dim * 4);
-        cudaMalloc(&dlog, (size_t) g_ch_vocab * 4);
-        if (g_mx_qo) { cudaMalloc(&dqkv, (size_t) g_mx_qo * 4); cudaMalloc(&dcq, (size_t) g_mx_qo * 4); }
-        if (g_mx_nv) { cudaMalloc(&dar, (size_t) g_mx_nv * 4); cudaMalloc(&dbr, (size_t) g_mx_nv * 4);
-                       cudaMalloc(&dg, (size_t) g_mx_nv * 4); cudaMalloc(&db, (size_t) g_mx_nv * 4); }
-        if (g_mx_vd) { cudaMalloc(&dz, (size_t) g_mx_vd * 4); cudaMalloc(&dor, (size_t) g_mx_vd * 4); }
-        if (g_mx_qgd) cudaMalloc(&dqg, (size_t) g_mx_qgd * 4);
-        if (g_mx_kvd) { cudaMalloc(&dkt, (size_t) g_mx_kvd * 4); cudaMalloc(&dvt, (size_t) g_mx_kvd * 4); }
-        if (g_mx_att) { cudaMalloc(&dqa, (size_t) g_mx_att * 4); cudaMalloc(&dga, (size_t) g_mx_att * 4);
-                        cudaMalloc(&datt, (size_t) g_mx_att * 4); }
-        if (g_mx_nexp) cudaMalloc(&drl, (size_t) g_mx_nexp * 4);
-        if (g_mx_hbuf) cudaMalloc(&dhb, (size_t) g_mx_hbuf * 4);
-        cudaMalloc(&droute, sizeof(MoeRoute));
-        inited = 1;
-    }
+    if (ch_inited) return;
+    cudaMalloc(&H, (size_t) dim * 4); cudaMalloc(&nx, (size_t) dim * 4);
+    cudaMalloc(&ao, (size_t) dim * 4);
+    cudaMalloc(&dlog, (size_t) g_ch_vocab * 4);
+    if (g_mx_qo) { cudaMalloc(&dqkv, (size_t) g_mx_qo * 4); cudaMalloc(&dcq, (size_t) g_mx_qo * 4); }
+    if (g_mx_nv) { cudaMalloc(&dar, (size_t) g_mx_nv * 4); cudaMalloc(&dbr, (size_t) g_mx_nv * 4);
+                   cudaMalloc(&dg, (size_t) g_mx_nv * 4); cudaMalloc(&db, (size_t) g_mx_nv * 4); }
+    if (g_mx_vd) { cudaMalloc(&dz, (size_t) g_mx_vd * 4); cudaMalloc(&dor, (size_t) g_mx_vd * 4); }
+    if (g_mx_qgd) cudaMalloc(&dqg, (size_t) g_mx_qgd * 4);
+    if (g_mx_kvd) { cudaMalloc(&dkt, (size_t) g_mx_kvd * 4); cudaMalloc(&dvt, (size_t) g_mx_kvd * 4); }
+    if (g_mx_att) { cudaMalloc(&dqa, (size_t) g_mx_att * 4); cudaMalloc(&dga, (size_t) g_mx_att * 4);
+                    cudaMalloc(&datt, (size_t) g_mx_att * 4); }
+    if (g_mx_nexp) cudaMalloc(&drl, (size_t) g_mx_nexp * 4);
+    if (g_mx_hbuf) cudaMalloc(&dhb, (size_t) g_mx_hbuf * 4);
+    cudaMalloc(&droute, sizeof(MoeRoute));
+    cudaMalloc(&g_d_row, 4); cudaMalloc(&g_d_pos, 4);
+    cudaStreamCreate(&g_cstream);
+    ch_inited = 1;
+}
+
+// Record the fixed per-token kernel sequence onto `st` (a capture stream or the
+// default stream). embed_row/pos are read from device memory (g_d_row/g_d_pos),
+// so the identical sequence serves every token — capturable into a CUDA graph.
+static void chain_record(cudaStream_t st) {
+    int dim = g_ch_dim;
     int gblk = (dim + 255) / 256;
-    static int eprof = getenv("ASPIDA_CHAIN_PROF") ? 1 : 0;
-    static cudaEvent_t e0, e1, e2; static int ev = 0;
-    static double al = 0, ah = 0; static long en = 0;
-    if (eprof && !ev) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2); ev = 1; }
-    if (eprof) cudaEventRecord(e0);
-    k_embed<<<gblk, 256>>>(g_ch_embed, embed_row, H, dim);
+    k_embed<<<gblk, 256, 0, st>>>(g_ch_embed, g_d_row, H, dim);
     for (size_t li = 0; li < g_chain.size(); ++li) {
         ChainLayer &L = g_chain[li];
-        k_norm1<<<1, 256>>>(H, L.attn_norm, nx, dim);
+        k_norm1<<<1, 256, 0, st>>>(H, L.attn_norm, nx, dim);
         if (!L.is_fattn) {
-            DnetState st = g_dnet[attn_handles[li]];
-            launch_mv_any(L.qkv, L.qkv_k, dim, L.qo, nx, dqkv);
-            launch_mv_any(L.al, L.al_k, dim, L.nv, nx, dar);
-            launch_mv_any(L.be, L.be_k, dim, L.nv, nx, dbr);
-            launch_mv_any(L.ga, L.ga_k, dim, L.v_dim, nx, dz);
-            k_dnet_conv<<<(L.qo + 255) / 256, 256>>>(dqkv, st.hist, L.conv, dcq, L.qo, L.kernel);
-            k_dnet_gates<<<(L.nv + 255) / 256, 256>>>(dar, dbr, L.aw, L.dtw, dg, db, L.nv);
+            DnetState ds = g_dnet[g_handles[li]];
+            launch_mv_st(L.qkv, L.qkv_k, dim, L.qo, nx, dqkv, st);
+            launch_mv_st(L.al, L.al_k, dim, L.nv, nx, dar, st);
+            launch_mv_st(L.be, L.be_k, dim, L.nv, nx, dbr, st);
+            launch_mv_st(L.ga, L.ga_k, dim, L.v_dim, nx, dz, st);
+            k_dnet_conv<<<(L.qo + 255) / 256, 256, 0, st>>>(dqkv, ds.hist, L.conv, dcq, L.qo, L.kernel);
+            k_dnet_gates<<<(L.nv + 255) / 256, 256, 0, st>>>(dar, dbr, L.aw, L.dtw, dg, db, L.nv);
             size_t shmem = (size_t) (4 * L.khd + 2 * L.vhd) * 4;
-            k_dnet_recur<<<L.nv, L.khd, shmem>>>(st.S, dcq, dg, db, dz, L.nw, dor,
-                                                 L.khd, L.vhd, L.q_dim, L.nkh);
-            launch_mv_any(L.ow, L.ow_k, L.v_dim, dim, dor, ao);
+            k_dnet_recur<<<L.nv, L.khd, shmem, st>>>(ds.S, dcq, dg, db, dz, L.nw, dor,
+                                                     L.khd, L.vhd, L.q_dim, L.nkh);
+            launch_mv_st(L.ow, L.ow_k, L.v_dim, dim, dor, ao, st);
         } else {
-            FattnState st = g_fattn[attn_handles[li]];
+            FattnState fs = g_fattn[g_handles[li]];
             int kvd = L.nkv * L.hd, att = L.nq * L.hd, qgd = L.nq * 2 * L.hd;
-            launch_mv_any(L.qw, L.qw_k, dim, qgd, nx, dqg);
-            launch_mv_any(L.kw, L.kw_k, dim, kvd, nx, dkt);
-            launch_mv_any(L.vw, L.vw_k, dim, kvd, nx, dvt);
-            k_fattn_prep<<<L.nq + L.nkv, L.hd, (size_t) L.hd * 4>>>(
-                dqg, dkt, dvt, L.qn, L.kn, dqa, dga, st.K, st.V,
-                L.nq, L.nkv, L.hd, kvd, pos, L.rd, L.base, L.freq_scale, L.m_scale,
+            launch_mv_st(L.qw, L.qw_k, dim, qgd, nx, dqg, st);
+            launch_mv_st(L.kw, L.kw_k, dim, kvd, nx, dkt, st);
+            launch_mv_st(L.vw, L.vw_k, dim, kvd, nx, dvt, st);
+            k_fattn_prep<<<L.nq + L.nkv, L.hd, (size_t) L.hd * 4, st>>>(
+                dqg, dkt, dvt, L.qn, L.kn, dqa, dga, fs.K, fs.V,
+                L.nq, L.nkv, L.hd, kvd, g_d_pos, L.rd, L.base, L.freq_scale, L.m_scale,
                 L.yarn_on, L.corr_lo, L.corr_hi, L.ffp, L.use_ff, L.interleaved, L.sec_total);
-            k_fattn_attend<<<L.nq, 256>>>(dqa, dga, st.K, st.V, st.scores, datt,
-                                          L.nq, L.nkv, L.hd, kvd, pos + 1, st.max_len);
-            launch_mv_any(L.fow, L.fow_k, att, dim, datt, ao);
+            k_fattn_attend<<<L.nq, 256, 0, st>>>(dqa, dga, fs.K, fs.V, fs.scores, datt,
+                                                 L.nq, L.nkv, L.hd, kvd, g_d_pos, fs.max_len);
+            launch_mv_st(L.fow, L.fow_k, att, dim, datt, ao, st);
         }
-        k_axpy<<<gblk, 256>>>(H, 1.0f, ao, dim);
+        k_axpy<<<gblk, 256, 0, st>>>(H, 1.0f, ao, dim);
         if (L.has_moe) {
-            k_norm1<<<1, 256>>>(H, L.post_norm, nx, dim);
-            launch_mv_any(L.rw, L.rk, dim, L.n_exp, nx, drl);
-            k_moe_route<<<1, 1>>>(drl, nx, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, droute);
+            k_norm1<<<1, 256, 0, st>>>(H, L.post_norm, nx, dim);
+            launch_mv_st(L.rw, L.rk, dim, L.n_exp, nx, drl, st);
+            k_moe_route<<<1, 1, 0, st>>>(drl, nx, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, droute);
             int w1 = (L.top_k + 1) * L.intermed, b1 = (w1 * 32 + 255) / 256;
             int b2 = (dim * 32 + 255) / 256;
-            k_moe_gu_p<<<b1, 256>>>(L.gdw, L.udw, L.sgdw, L.sudw, nx, dhb, droute,
-                                    L.top_k, dim, L.intermed, L.g_bpe, L.u_bpe,
-                                    L.gk, L.uk, L.sgk, L.suk);
-            k_moe_down_p<<<b2, 256>>>(L.ddw, L.sddw, dhb, ao, droute, L.top_k,
-                                      L.intermed, dim, L.d_bpe, L.dk, L.sdk);
-            k_axpy<<<gblk, 256>>>(H, 1.0f, ao, dim);
+            k_moe_gu_p<<<b1, 256, 0, st>>>(L.gdw, L.udw, L.sgdw, L.sudw, nx, dhb, droute,
+                                           L.top_k, dim, L.intermed, L.g_bpe, L.u_bpe,
+                                           L.gk, L.uk, L.sgk, L.suk);
+            k_moe_down_p<<<b2, 256, 0, st>>>(L.ddw, L.sddw, dhb, ao, droute, L.top_k,
+                                             L.intermed, dim, L.d_bpe, L.dk, L.sdk);
+            k_axpy<<<gblk, 256, 0, st>>>(H, 1.0f, ao, dim);
         }
     }
-    if (eprof) cudaEventRecord(e1);
-    k_norm1<<<1, 256>>>(H, g_ch_fnorm, nx, dim);
+    k_norm1<<<1, 256, 0, st>>>(H, g_ch_fnorm, nx, dim);
     const int TPB = 256, WPB = TPB / 32;
-    k_dense_mv<<<(g_ch_vocab + WPB - 1) / WPB, TPB>>>(g_ch_lm, nx, dlog, dim, g_ch_vocab);
-    if (eprof) {
-        cudaEventRecord(e2); cudaEventSynchronize(e2);
-        float ml = 0, mh = 0; cudaEventElapsedTime(&ml, e0, e1); cudaEventElapsedTime(&mh, e1, e2);
-        al += ml; ah += mh; en++;
-        if (en % 100 == 0)
-            fprintf(stderr, "[CHAINSPLIT] embed+layers %.3f ms | finalnorm+lmhead %.3f ms (n=%ld)\n",
-                    al / en, ah / en, en);
+    k_dense_mv<<<(g_ch_vocab + WPB - 1) / WPB, TPB, 0, st>>>(g_ch_lm, nx, dlog, dim, g_ch_vocab);
+}
+
+// Begin a generation: bind the per-generation state handles and force a fresh
+// graph capture (state device pointers changed vs the previous generation).
+extern "C" void aspida_gpu_chain_begin(const int *attn_handles) {
+    chain_alloc();
+    g_handles = attn_handles;
+    if (g_gexec) { cudaGraphExecDestroy(g_gexec); g_gexec = nullptr; }
+    if (g_graph) { cudaGraphDestroy(g_graph); g_graph = nullptr; }
+    g_captured = 0;
+}
+
+extern "C" void aspida_gpu_chain_end(void) {
+    if (g_gexec) { cudaGraphExecDestroy(g_gexec); g_gexec = nullptr; }
+    if (g_graph) { cudaGraphDestroy(g_graph); g_graph = nullptr; }
+    g_captured = 0; g_handles = nullptr;
+}
+
+// One decode step. First call of a generation captures the graph; the rest
+// replay it — one launch for the whole ~350-kernel token instead of 350.
+extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,
+                                         const int *attn_handles, float *logits) {
+    if (g_handles == nullptr) aspida_gpu_chain_begin(attn_handles);
+    cudaMemcpy(g_d_row, &embed_row, 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(g_d_pos, &pos, 4, cudaMemcpyHostToDevice);
+    if (!g_captured) {
+        cudaStreamBeginCapture(g_cstream, cudaStreamCaptureModeThreadLocal);
+        chain_record(g_cstream);
+        cudaStreamEndCapture(g_cstream, &g_graph);
+        cudaGraphInstantiate(&g_gexec, g_graph, nullptr, nullptr, 0);
+        g_captured = 1;
     }
-    cudaMemcpy(logits, dlog, (size_t) g_ch_vocab * 4, cudaMemcpyDeviceToHost);
+    cudaGraphLaunch(g_gexec, g_cstream);
+    cudaMemcpyAsync(logits, dlog, (size_t) g_ch_vocab * 4, cudaMemcpyDeviceToHost, g_cstream);
+    cudaStreamSynchronize(g_cstream);
     static int cprof = getenv("ASPIDA_CHAIN_PROF") ? 1 : 0;
     if (cprof) {
-        static double acc = 0; static long n = 0;
+        static double acc = 0; static long n = 0; static struct timespec t0; static int have = 0;
         struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
-        static struct timespec t0; static int have = 0;
         if (have) { acc += (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9; n++; }
         have = 1; t0 = t1;
         if (n && n % 100 == 0)
             fprintf(stderr, "[CHAINPROF] wall between forwards avg %.3f ms (n=%ld)\n", 1e3 * acc / n, n);
     }
 }
+

@@ -738,6 +738,7 @@ package body LLM_Qwen is
 
       procedure Free_States is
       begin
+         LLM_Qwen_GPU.Chain_End;
          for I in Cache'Range loop
             if Cache (I).Is_Full then
                LLM_Qwen_GPU.Fattn_Free (Cache (I).Full_St.GPU_Handle);
@@ -838,6 +839,9 @@ package body LLM_Qwen is
             Handles (I) := Interfaces.C.int (Hn);
          end;
       end loop;
+      if Use_Chain then
+         LLM_Qwen_GPU.Chain_Begin (Handles (1)'Address);
+      end if;
 
       --  Prefill (row = id + 1: ids are 0-based, embedding rows 1-based).
       --  Tick per token so a UI shows progress before the first output token.
