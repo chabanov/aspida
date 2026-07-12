@@ -1236,33 +1236,45 @@ __global__ void k_embed(const float *__restrict__ embed, const int *__restrict__
 // Router softmax + greedy top-k + renorm + shared sigmoid gate, single thread
 // (byte-for-byte the LLM_MoE.Forward order: ascending scans, strict >, first
 // max wins). Writes the MoeRoute struct in device memory.
+// 256-thread router: parallel stable softmax + gate-dot reductions; the greedy
+// top-k stays a single-thread serial scan (order-exact, matches LLM_MoE, keeps
+// the expert selection robust). Launch <<<1,256>>>.
 __global__ void k_moe_route(const float *__restrict__ rl, const float *__restrict__ x,
                             const float *__restrict__ sgi, int sgi_len,
                             int n_exp, int top_k, int dim, MoeRoute *route) {
-    float r[512];
+    __shared__ float r[512]; __shared__ float red[256]; __shared__ float mx, sm;
+    int tid = threadIdx.x, nt = blockDim.x;
     if (n_exp > 512) return;
-    float maxl = rl[0];
-    for (int e = 1; e < n_exp; ++e) if (rl[e] > maxl) maxl = rl[e];
-    float sum = 0.f;
-    for (int e = 0; e < n_exp; ++e) { r[e] = expf(rl[e] - maxl); sum += r[e]; }
-    for (int e = 0; e < n_exp; ++e) r[e] /= sum;
-    bool used[512] = {false};
-    float sw = 0.f;
-    for (int k = 0; k < top_k; ++k) {
-        int be = 0; float bv = -3.402823466e38f;
-        for (int e = 0; e < n_exp; ++e)
-            if (!used[e] && r[e] > bv) { bv = r[e]; be = e; }
-        route->idx[k] = be; route->w[k] = bv; used[be] = true; sw += bv;
+    float lmax = -3.402823466e38f;
+    for (int e = tid; e < n_exp; e += nt) { r[e] = rl[e]; if (r[e] > lmax) lmax = r[e]; }
+    red[tid] = lmax; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]); __syncthreads(); }
+    if (tid == 0) mx = red[0]; __syncthreads();
+    float ls = 0.f;
+    for (int e = tid; e < n_exp; e += nt) { r[e] = expf(r[e] - mx); ls += r[e]; }
+    red[tid] = ls; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; __syncthreads(); }
+    if (tid == 0) sm = red[0]; __syncthreads();
+    for (int e = tid; e < n_exp; e += nt) r[e] /= sm;
+    __syncthreads();
+    if (tid == 0) {
+        bool used[512];
+        for (int e = 0; e < n_exp; ++e) used[e] = false;
+        float sw = 0.f;
+        for (int k = 0; k < top_k; ++k) {
+            int be = 0; float bv = -3.402823466e38f;
+            for (int e = 0; e < n_exp; ++e)
+                if (!used[e] && r[e] > bv) { bv = r[e]; be = e; }
+            route->idx[k] = be; route->w[k] = bv; used[be] = true; sw += bv;
+        }
+        for (int k = 0; k < top_k; ++k) route->w[k] /= sw;
+        for (int k = top_k; k < MOE_MAXK; ++k) { route->idx[k] = 0; route->w[k] = 0.f; }
     }
-    for (int k = 0; k < top_k; ++k) route->w[k] /= sw;
-    for (int k = top_k; k < MOE_MAXK; ++k) { route->idx[k] = 0; route->w[k] = 0.f; }
-    float sg = 1.0f;
-    if (sgi_len > 1 && sgi) {
-        float gs = 0.f;
-        for (int d = 0; d < dim; ++d) gs += sgi[d] * x[d];
-        sg = 1.0f / (1.0f + expf(-gs));
-    }
-    route->w[MOE_MAXK] = sg;
+    float gd = 0.f;
+    if (sgi_len > 1 && sgi) for (int d = tid; d < dim; d += nt) gd += sgi[d] * x[d];
+    red[tid] = gd; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; __syncthreads(); }
+    if (tid == 0) route->w[MOE_MAXK] = (sgi_len > 1 && sgi) ? 1.0f / (1.0f + expf(-red[0])) : 1.0f;
 }
 
 // Device-route variants of the fused MoE kernels (route in device memory so
@@ -1520,7 +1532,7 @@ static void chain_record(cudaStream_t st) {
         if (L.has_moe) {
             k_norm1<<<1, 256, 0, st>>>(H, L.post_norm, nx, dim);
             launch_mv_st(L.rw, L.rk, dim, L.n_exp, nx, drl, st);
-            k_moe_route<<<1, 1, 0, st>>>(drl, nx, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, droute);
+            k_moe_route<<<1, 256, 0, st>>>(drl, nx, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, droute);
             int w1 = (L.top_k + 1) * L.intermed, b1 = (w1 * 32 + 255) / 256;
             int b2 = (dim * 32 + 255) / 256;
             k_moe_gu_p<<<b1, 256, 0, st>>>(L.gdw, L.udw, L.sgdw, L.sudw, nx, dhb, droute,
