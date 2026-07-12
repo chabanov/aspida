@@ -164,6 +164,28 @@ big projections (llama.cpp `mul_mat_q`), flash-decode attention, f16/WMMA GEMM
 for prefill, per-op occupancy tuning. Push toward the ~124 tok/s baseline and
 beyond for batched serving (the `_wb` batched kernels already exist).
 
+### Progress so far (RTX 6000 Ada, Hura Q4_K_M, measured)
+| Step | tok/s | note |
+|---|---|---|
+| per-matvec MoE (start) | 2.12 | GPU ~4% |
+| + resident MoE experts (Increment 1) | 2.61 | |
+| + dense LM head on GPU | 3.20 | **1.51× cumulative** |
+
+Per-token breakdown at 3.20 tok/s (0.312 s): **attention/delta-net 0.163 s
+(52%)**, MoE 0.083 s (27%), LM head 0.004 s (1%), rest ~0.062 s (norms / embed /
+sampling / E2EE proxy). GPU util still ~4% — the engine is CPU/serial-bound.
+
+**Honest parity read.** The incremental offloads (MoE, LM head) buy ~1.5× and
+top out in single digits, because between the GPU ops the activation still
+round-trips host↔device, the delta-net recurrence + full-attn softmax run on the
+CPU, and every op is a separate launch under a per-token E2EE proxy hop.
+**Reaching 124 tok/s requires Increment 3 — the fully resident forward** (hidden
+state + KV + delta state never leave VRAM, all ops on-device, one CUDA-graph
+replay per token), very likely plus Increment 4's tensor-core quant GEMM (MMQ).
+That is a major rewrite of the decode path in CUDA, not another point offload.
+Increment 2 (resident attention/delta-net) is the next and biggest single lever
+(52%) and the natural bridge into Increment 3.
+
 ### Targets (honest)
 - Increment 1 alone: expect a **multi-× jump** from 2.2 tok/s (MoE is ~28/38 of
   the GEMVs), realistically into the low tens of tok/s.
