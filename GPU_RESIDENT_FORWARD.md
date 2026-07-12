@@ -178,10 +178,18 @@ Per-token breakdown flips as each hot spot falls:
 - at 7.18 tok/s (0.139 s): **MoE 0.086 s (62%)**, attention 0.0255 s (delta-net
   now on GPU), LM head 0.004 s, rest ~0.023 s. Output verified coherent.
 
-**Next lever: the MoE (now 62%).** ~1000 tiny expert matvec launches/token,
-serialised on the default stream and under-occupying the GPU — batch the 8
-selected experts into one kernel per projection (gate/up/down) and/or CUDA-graph
-the layer. Then the resident full-attn KV cache (9 layers, still CPU softmax).
+**Next lever: the MoE (now 62%).** MEASURED NEGATIVE RESULT: running the 8
+experts on concurrent CUDA streams gave only 7.18 → 7.30 tok/s (noise). Reason:
+a single expert matvec already launches ~1024 warps (32k threads) and fills the
+RTX 6000's SMs, so the experts don't gain from overlap — MoE is not
+launch/occupancy-bound. It is **quant-GEMV-efficiency-bound**: ~1.4 GB of Q4_K
+expert weights/token read at only ~17 GB/s effective (vs ~960 GB/s peak), because
+decode is batch-1 (no weight reuse) and the warp-per-row kernel has a
+latency-bound per-warp accumulation chain. The real MoE lever is therefore
+**Increment 4 — an MMQ-style int8 tensor-core quant GEMM** (llama.cpp `mul_mat_q`:
+dequant to int8, MMA on tensor cores), a substantial kernel effort — not batching
+or graphs. The streams change was reverted (complexity for ~0 gain). Full-attn
+(9 layers) softmax is still CPU but small now (~part of the 0.0255 s).
 
 **Honest parity read.** Point offloads have already delivered 3.39× and each
 flip of the profile exposes the next. Single-digit → tens of tok/s is in reach
