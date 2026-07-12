@@ -1391,6 +1391,11 @@ extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,
         inited = 1;
     }
     int gblk = (dim + 255) / 256;
+    static int eprof = getenv("ASPIDA_CHAIN_PROF") ? 1 : 0;
+    static cudaEvent_t e0, e1, e2; static int ev = 0;
+    static double al = 0, ah = 0; static long en = 0;
+    if (eprof && !ev) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventCreate(&e2); ev = 1; }
+    if (eprof) cudaEventRecord(e0);
     k_embed<<<gblk, 256>>>(g_ch_embed, embed_row, H, dim);
     for (size_t li = 0; li < g_chain.size(); ++li) {
         ChainLayer &L = g_chain[li];
@@ -1436,9 +1441,18 @@ extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,
             k_axpy<<<gblk, 256>>>(H, 1.0f, ao, dim);
         }
     }
+    if (eprof) cudaEventRecord(e1);
     k_norm1<<<1, 256>>>(H, g_ch_fnorm, nx, dim);
     const int TPB = 256, WPB = TPB / 32;
     k_dense_mv<<<(g_ch_vocab + WPB - 1) / WPB, TPB>>>(g_ch_lm, nx, dlog, dim, g_ch_vocab);
+    if (eprof) {
+        cudaEventRecord(e2); cudaEventSynchronize(e2);
+        float ml = 0, mh = 0; cudaEventElapsedTime(&ml, e0, e1); cudaEventElapsedTime(&mh, e1, e2);
+        al += ml; ah += mh; en++;
+        if (en % 100 == 0)
+            fprintf(stderr, "[CHAINSPLIT] embed+layers %.3f ms | finalnorm+lmhead %.3f ms (n=%ld)\n",
+                    al / en, ah / en, en);
+    }
     cudaMemcpy(logits, dlog, (size_t) g_ch_vocab * 4, cudaMemcpyDeviceToHost);
     static int cprof = getenv("ASPIDA_CHAIN_PROF") ? 1 : 0;
     if (cprof) {
