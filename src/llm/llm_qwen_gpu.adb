@@ -47,7 +47,23 @@ package body LLM_Qwen_GPU is
 
    function To_Fn is new Ada.Unchecked_Conversion (System.Address, MoE_Fn);
 
-   Fn : MoE_Fn := null;
+   --  int aspida_gpu_dnet_new(int nv, int khd, int vhd)
+   type Dnet_New_Fn is access function
+     (NV, KHD, VHD : int) return int
+     with Convention => C;
+   function To_DNew is new Ada.Unchecked_Conversion (System.Address, Dnet_New_Fn);
+
+   --  void aspida_gpu_dnet_recur(int handle, const float* cq, gate, beta, z,
+   --      norm_w, float* o_row, int nv,khd,vhd,qo,q_dim,n_k_heads,v_dim)
+   type Dnet_Recur_Fn is access procedure
+     (Handle : int; CQ, Gate, Beta, Z, Norm_W, O_Row : System.Address;
+      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim : int)
+     with Convention => C;
+   function To_DRecur is new Ada.Unchecked_Conversion (System.Address, Dnet_Recur_Fn);
+
+   Fn       : MoE_Fn := null;
+   DNew_Fn  : Dnet_New_Fn := null;
+   DRec_Fn  : Dnet_Recur_Fn := null;
 
    protected Init_Guard is
       procedure Run;
@@ -87,6 +103,26 @@ package body LLM_Qwen_GPU is
                Free (CS);
                if A /= System.Null_Address then
                   Fn := To_Fn (A);
+               end if;
+            end;
+            declare
+               CS : chars_ptr := New_String ("aspida_gpu_dnet_new");
+               A  : System.Address;
+            begin
+               A := C_dlsym (H, CS);
+               Free (CS);
+               if A /= System.Null_Address then
+                  DNew_Fn := To_DNew (A);
+               end if;
+            end;
+            declare
+               CS : chars_ptr := New_String ("aspida_gpu_dnet_recur");
+               A  : System.Address;
+            begin
+               A := C_dlsym (H, CS);
+               Free (CS);
+               if A /= System.Null_Address then
+                  DRec_Fn := To_DRecur (A);
                end if;
             end;
          end;
@@ -132,5 +168,35 @@ package body LLM_Qwen_GPU is
           Shared_Down.Addr, Interfaces.C.long (Shared_Down.Bytes), int (Shared_Down.Kind),
           Shared_Gate_Inp,  int (Gate_Inp_Len), Y);
    end MoE_Experts;
+
+   function Dnet_Available return Boolean is
+   begin
+      Init;
+      return DNew_Fn /= null and then DRec_Fn /= null;
+   end Dnet_Available;
+
+   function Dnet_New (NV, KHD, VHD : Integer) return Integer is
+   begin
+      Init;
+      if DNew_Fn = null then
+         return -1;
+      end if;
+      return Integer (DNew_Fn (int (NV), int (KHD), int (VHD)));
+   end Dnet_New;
+
+   procedure Dnet_Recur
+     (Handle : Integer;
+      CQ     : System.Address;
+      Gate   : System.Address;
+      Beta   : System.Address;
+      Z      : System.Address;
+      Norm_W : System.Address;
+      O_Row  : System.Address;
+      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim : Integer) is
+   begin
+      DRec_Fn (int (Handle), CQ, Gate, Beta, Z, Norm_W, O_Row,
+               int (NV), int (KHD), int (VHD), int (QO), int (Q_Dim),
+               int (N_K_Heads), int (V_Dim));
+   end Dnet_Recur;
 
 end LLM_Qwen_GPU;

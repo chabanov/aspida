@@ -68,4 +68,24 @@ package LLM_Qwen_GPU is
       Gate_Inp_Len    : Integer;
       Y               : System.Address);  -- [Dim] f32 host out
 
+   --  Resident delta-net recurrence (Increment 2). Dnet_New allocates the
+   --  per-layer recurrent state S_All [NV*KHD, VHD] on the device and returns a
+   --  handle >= 0 (or -1 if unavailable / alloc failed). Dnet_Recur runs one
+   --  decode step's per-head recurrence + gated RMSNorm against that resident
+   --  state — only cq/gate/beta/z go in and o_row comes out; S_All stays on the
+   --  device. Oracle: LLM_DeltaNet.Step + the gated norm in LLM_DeltaNet_Blk.
+   function Dnet_Available return Boolean;
+
+   function Dnet_New (NV, KHD, VHD : Integer) return Integer;
+
+   procedure Dnet_Recur
+     (Handle : Integer;
+      CQ     : System.Address;   -- [QO]    conv'd + SiLU qkv (host)
+      Gate   : System.Address;   -- [NV]    per-head decay
+      Beta   : System.Address;   -- [NV]    per-head beta
+      Z      : System.Address;   -- [V_Dim] gate projection
+      Norm_W : System.Address;   -- [VHD]   dense norm weight
+      O_Row  : System.Address;   -- [V_Dim] output (host)
+      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim : Integer);
+
 end LLM_Qwen_GPU;

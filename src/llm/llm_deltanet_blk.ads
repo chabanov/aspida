@@ -52,8 +52,9 @@ package LLM_DeltaNet_Blk is
    -- [1, Dim] and returns [1, Dim], mutating the state in place.
    --------------------------------------------------------------------
    type DNet_State is record
-      S_All     : LLM_Tensor.Tensor;  -- packed states [N_V_Heads*Key_Head_Dim, Value_Head_Dim]
-      Conv_Hist : LLM_Tensor.Tensor;  -- last (Kernel-1) raw qkv rows [Kernel-1, QKV_Out]
+      S_All      : LLM_Tensor.Tensor;  -- packed states [N_V_Heads*Key_Head_Dim, Value_Head_Dim]
+      Conv_Hist  : LLM_Tensor.Tensor;  -- last (Kernel-1) raw qkv rows [Kernel-1, QKV_Out]
+      GPU_Handle : Integer := -1;      -- resident device S_All (Increment 2), or -1 = CPU
    end record;
 
    function Init_State (L : DeltaNet_Layer) return DNet_State;

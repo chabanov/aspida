@@ -5,6 +5,7 @@
 //   nvcc -O3 --fmad=false -arch=native -shared -Xcompiler -fPIC gpu_matvec.cu -o libaspidagpu.so
 #include <cuda_fp16.h>
 #include <unordered_map>
+#include <vector>
 #include <cstdint>
 
 __device__ __forceinline__ float f16(const uint8_t *p){ __half h; *reinterpret_cast<uint16_t*>(&h)=(uint16_t)p[0]|((uint16_t)p[1]<<8); return __half2float(h);}
@@ -445,6 +446,92 @@ extern "C" void aspida_gpu_dense_matvec(const void *w, long wbytes, int in_dim,
     const int TPB = 256, WPB = TPB / 32;
     k_dense_mv<<<(out_dim + WPB - 1) / WPB, TPB>>>((const float *) dw, dx, dy, in_dim, out_dim);
     cudaMemcpy(y, dy, (size_t) out_dim * 4, cudaMemcpyDeviceToHost);
+}
+
+// =====================================================================
+// Increment 2 — resident delta-net per-head recurrence + gated RMSNorm.
+// Oracle: LLM_DeltaNet.Step + the gated-norm in LLM_DeltaNet_Blk.Step. The
+// per-head recurrent state S_All stays RESIDENT on the device across tokens
+// (allocated per layer via aspida_gpu_dnet_new, updated in place here). Only
+// the small per-token vectors move host<->device (cq/gate/beta/z in, o_row out).
+//
+// One block per head; blockDim = khd (== vhd). Each thread owns column v of
+// this head's state block and loops k ASCENDING — the same order as the CPU
+// sums (Retr, output, L2/RMS), so results track the CPU oracle to fp precision.
+// Key_Head_Dim == Value_Head_Dim (set in Create), so one thread index serves
+// as both the k and v index.
+// =====================================================================
+static std::vector<float *> g_dnet;   // resident S_All per layer, by handle
+
+extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd) {
+    float *s; size_t n = (size_t) nv * khd * vhd;
+    if (cudaMalloc(&s, n * 4) != cudaSuccess) return -1;
+    cudaMemset(s, 0, n * 4);
+    g_dnet.push_back(s);
+    return (int) g_dnet.size() - 1;
+}
+
+__global__ void k_dnet_recur(float *S, const float *cq, const float *gate,
+    const float *beta, const float *z, const float *norm_w, float *o_row,
+    int khd, int vhd, int q_dim, int n_k_heads) {
+    int h = blockIdx.x;
+    int v = threadIdx.x;                  // 0..khd-1 (== vhd-1)
+    extern __shared__ float sh[];
+    float *Qr = sh, *Kr = sh + khd, *QN = sh + 2 * khd,
+          *KN = sh + 3 * khd, *Vv = sh + 4 * khd, *osh = sh + 4 * khd + vhd;
+    int k_head = h % n_k_heads;
+    Qr[v] = cq[k_head * khd + v];
+    Kr[v] = cq[q_dim + k_head * khd + v];
+    Vv[v] = cq[2 * q_dim + h * vhd + v];
+    __syncthreads();
+    // L2 normalise Q, K (each thread sums ascending, matching the CPU order).
+    float ssq = 0.f, ssk = 0.f;
+    for (int i = 0; i < khd; ++i) { ssq += Qr[i] * Qr[i]; ssk += Kr[i] * Kr[i]; }
+    QN[v] = Qr[v] * (1.f / (sqrtf(ssq) + 1e-6f));
+    KN[v] = Kr[v] * (1.f / (sqrtf(ssk) + 1e-6f));
+    __syncthreads();
+    float g = gate[h], b = beta[h], scale = 1.f / sqrtf((float) khd);
+    int base = h * khd;                   // row offset into S_All [nv*khd, vhd]
+    // Thread v owns column v: retrieval, correction, gated write, output.
+    float retr = 0.f;
+    for (int k = 0; k < khd; ++k) retr += g * S[(size_t)(base + k) * vhd + v] * KN[k];
+    float corr = b * (Vv[v] - retr);
+    for (int k = 0; k < khd; ++k)
+        S[(size_t)(base + k) * vhd + v] = g * S[(size_t)(base + k) * vhd + v] + KN[k] * corr;
+    float o = 0.f;
+    for (int k = 0; k < khd; ++k) o += S[(size_t)(base + k) * vhd + v] * QN[k];
+    osh[v] = o * scale;
+    __syncthreads();
+    // Gated RMSNorm over vhd (ascending sum, CPU order) + SiLU(z) gate.
+    float ss = 0.f;
+    for (int i = 0; i < vhd; ++i) ss += osh[i] * osh[i];
+    float rms = sqrtf(ss / (float) vhd + 1e-6f);
+    float zz = z[h * vhd + v];
+    o_row[h * vhd + v] = (osh[v] / rms) * norm_w[v] * (zz / (1.f + expf(-zz)));
+}
+
+extern "C" void aspida_gpu_dnet_recur(int handle, const float *cq, const float *gate,
+    const float *beta, const float *z, const float *norm_w, float *o_row,
+    int nv, int khd, int vhd, int qo, int q_dim, int n_k_heads, int v_dim) {
+    if (handle < 0 || handle >= (int) g_dnet.size()) return;
+    float *S = g_dnet[handle];
+    static float *dcq = nullptr, *dg = nullptr, *db = nullptr, *dz = nullptr,
+                 *dnw = nullptr, *dor = nullptr;
+    static int c_qo = 0, c_nv = 0, c_vd = 0, c_vhd = 0;
+    if (qo > c_qo)    { if (dcq) cudaFree(dcq); cudaMalloc(&dcq, (size_t) qo * 4);    c_qo = qo; }
+    if (nv > c_nv)    { if (dg) cudaFree(dg); cudaMalloc(&dg, (size_t) nv * 4);
+                        if (db) cudaFree(db); cudaMalloc(&db, (size_t) nv * 4);       c_nv = nv; }
+    if (v_dim > c_vd) { if (dz) cudaFree(dz); cudaMalloc(&dz, (size_t) v_dim * 4);
+                        if (dor) cudaFree(dor); cudaMalloc(&dor, (size_t) v_dim * 4); c_vd = v_dim; }
+    if (vhd > c_vhd)  { if (dnw) cudaFree(dnw); cudaMalloc(&dnw, (size_t) vhd * 4);   c_vhd = vhd; }
+    cudaMemcpy(dcq, cq, (size_t) qo * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dg, gate, (size_t) nv * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(db, beta, (size_t) nv * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dz, z, (size_t) v_dim * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dnw, norm_w, (size_t) vhd * 4, cudaMemcpyHostToDevice);
+    size_t shmem = (size_t) (4 * khd + 2 * vhd) * 4;
+    k_dnet_recur<<<nv, khd, shmem>>>(S, dcq, dg, db, dz, dnw, dor, khd, vhd, q_dim, n_k_heads);
+    cudaMemcpy(o_row, dor, (size_t) v_dim * 4, cudaMemcpyDeviceToHost);
 }
 
 // Router + stable-softmax + greedy top-k stay on the CPU (they are tiny, and
