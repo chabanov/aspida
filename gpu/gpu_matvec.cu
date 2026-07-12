@@ -644,6 +644,7 @@ extern "C" void aspida_gpu_dense_matvec(const void *w, long wbytes, int in_dim,
 // history window both live on the device across tokens.
 struct DnetState { float *S; float *hist; int qo; int kernel; };
 static std::vector<DnetState> g_dnet;
+static std::vector<int> g_dnet_free;      // freed slots for reuse
 
 extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel) {
     DnetState st; size_t n = (size_t) nv * khd * vhd;
@@ -653,8 +654,22 @@ extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel)
     if (cudaMalloc(&st.hist, hn * 4) != cudaSuccess) { cudaFree(st.S); return -1; }
     cudaMemset(st.hist, 0, hn * 4);
     st.qo = qo; st.kernel = kernel;
+    if (!g_dnet_free.empty()) {
+        int h = g_dnet_free.back(); g_dnet_free.pop_back();
+        g_dnet[h] = st; return h;
+    }
     g_dnet.push_back(st);
     return (int) g_dnet.size() - 1;
+}
+
+// States are per-generation (allocated in Init_State) — without this they
+// leak ~8 MB VRAM per delta-net layer per request. Slot is reused by _new.
+extern "C" void aspida_gpu_dnet_free(int handle) {
+    if (handle < 0 || handle >= (int) g_dnet.size()) return;
+    DnetState &st = g_dnet[handle];
+    if (st.S)    { cudaFree(st.S); st.S = nullptr; }
+    if (st.hist) { cudaFree(st.hist); st.hist = nullptr; }
+    g_dnet_free.push_back(handle);
 }
 
 // Matvec with kind >= 0 -> K-quant warp kernel; kind == -1 -> the weight's raw
@@ -804,6 +819,7 @@ extern "C" void aspida_gpu_dnet_step(
 // =====================================================================
 struct FattnState { float *K, *V, *scores; int max_len, kvd; };
 static std::vector<FattnState> g_fattn;
+static std::vector<int> g_fattn_free;     // freed slots for reuse
 
 extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
     FattnState st; st.max_len = max_len; st.kvd = kvd;
@@ -811,8 +827,23 @@ extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
     if (cudaMalloc(&st.V, (size_t) max_len * kvd * 4) != cudaSuccess) { cudaFree(st.K); return -1; }
     if (cudaMalloc(&st.scores, (size_t) nq * max_len * 4) != cudaSuccess) {
         cudaFree(st.K); cudaFree(st.V); return -1; }
+    if (!g_fattn_free.empty()) {
+        int h = g_fattn_free.back(); g_fattn_free.pop_back();
+        g_fattn[h] = st; return h;
+    }
     g_fattn.push_back(st);
     return (int) g_fattn.size() - 1;
+}
+
+// Per-generation KV caches — must be released when the generation ends or
+// they leak tens of MB VRAM per request. Slot is reused by _new.
+extern "C" void aspida_gpu_fattn_free(int handle) {
+    if (handle < 0 || handle >= (int) g_fattn.size()) return;
+    FattnState &st = g_fattn[handle];
+    if (st.K)      { cudaFree(st.K); st.K = nullptr; }
+    if (st.V)      { cudaFree(st.V); st.V = nullptr; }
+    if (st.scores) { cudaFree(st.scores); st.scores = nullptr; }
+    g_fattn_free.push_back(handle);
 }
 
 // theta for RoPE pair i (matches LLM_RoPE.Apply_Sections text path exactly).
@@ -1077,4 +1108,324 @@ extern "C" void aspida_gpu_moe_experts(
             1e3 * t_h2d / n_calls, 1e3 * t_gu / n_calls,
             1e3 * t_down / n_calls, 1e3 * t_d2h / n_calls, n_calls);
     }
+}
+
+// =====================================================================
+// Phase C — full resident forward chain. The hidden state H lives on the
+// device across ALL layers; per token the host sends the embedding row id
+// and receives the logits. Layers are registered once at model load (device
+// weight pointers resolved through the same g_wcache); per-generation attn
+// states are passed as a handle array per call. Every kernel matches its CPU
+// oracle's summation order (single-thread exact norms / routing).
+// =====================================================================
+
+// Exact single-block RMSNorm: thread 0 sums ascending (CPU order), all scale.
+__global__ void k_norm1(const float *__restrict__ x, const float *__restrict__ w,
+                        float *__restrict__ y, int n) {
+    __shared__ float rms;
+    if (threadIdx.x == 0) {
+        float ss = 0.f;
+        for (int i = 0; i < n; ++i) ss += x[i] * x[i];
+        rms = sqrtf(ss / (float) n + 1e-6f);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = (x[i] / rms) * w[i];
+}
+
+// Embedding row gather: H = embed[row].
+__global__ void k_embed(const float *__restrict__ embed, int row,
+                        float *__restrict__ h, int dim) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < dim) h[i] = embed[(size_t) row * dim + i];
+}
+
+// Router softmax + greedy top-k + renorm + shared sigmoid gate, single thread
+// (byte-for-byte the LLM_MoE.Forward order: ascending scans, strict >, first
+// max wins). Writes the MoeRoute struct in device memory.
+__global__ void k_moe_route(const float *__restrict__ rl, const float *__restrict__ x,
+                            const float *__restrict__ sgi, int sgi_len,
+                            int n_exp, int top_k, int dim, MoeRoute *route) {
+    float r[512];
+    if (n_exp > 512) return;
+    float maxl = rl[0];
+    for (int e = 1; e < n_exp; ++e) if (rl[e] > maxl) maxl = rl[e];
+    float sum = 0.f;
+    for (int e = 0; e < n_exp; ++e) { r[e] = expf(rl[e] - maxl); sum += r[e]; }
+    for (int e = 0; e < n_exp; ++e) r[e] /= sum;
+    bool used[512] = {false};
+    float sw = 0.f;
+    for (int k = 0; k < top_k; ++k) {
+        int be = 0; float bv = -3.402823466e38f;
+        for (int e = 0; e < n_exp; ++e)
+            if (!used[e] && r[e] > bv) { bv = r[e]; be = e; }
+        route->idx[k] = be; route->w[k] = bv; used[be] = true; sw += bv;
+    }
+    for (int k = 0; k < top_k; ++k) route->w[k] /= sw;
+    for (int k = top_k; k < MOE_MAXK; ++k) { route->idx[k] = 0; route->w[k] = 0.f; }
+    float sg = 1.0f;
+    if (sgi_len > 1 && sgi) {
+        float gs = 0.f;
+        for (int d = 0; d < dim; ++d) gs += sgi[d] * x[d];
+        sg = 1.0f / (1.0f + expf(-gs));
+    }
+    route->w[MOE_MAXK] = sg;
+}
+
+// Device-route variants of the fused MoE kernels (route in device memory so
+// the whole layer chain runs without host knowledge of the selection).
+__global__ void k_moe_gu_p(const uint8_t *__restrict__ gdw, const uint8_t *__restrict__ udw,
+                           const uint8_t *__restrict__ sgdw, const uint8_t *__restrict__ sudw,
+                           const float *__restrict__ x, float *__restrict__ h,
+                           const MoeRoute *__restrict__ route, int top_k, int dim, int intermed,
+                           long g_bpe, long u_bpe, int gk, int uk, int sgk, int suk) {
+    int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    int total = (top_k + 1) * intermed;
+    if (wid >= total) return;
+    int k = wid / intermed, r = wid % intermed;
+    const uint8_t *grow, *urow; int gkind, ukind;
+    if (k < top_k) {
+        int e = route->idx[k];
+        grow = gdw + (size_t) e * g_bpe + (size_t) r * (dim / 256) * kq_bpb(gk);
+        urow = udw + (size_t) e * u_bpe + (size_t) r * (dim / 256) * kq_bpb(uk);
+        gkind = gk; ukind = uk;
+    } else {
+        grow = sgdw + (size_t) r * (dim / 256) * kq_bpb(sgk);
+        urow = sudw + (size_t) r * (dim / 256) * kq_bpb(suk);
+        gkind = sgk; ukind = suk;
+    }
+    float g = wrow(grow, gkind, x, dim, lane);
+    float u = wrow(urow, ukind, x, dim, lane);
+    if (lane == 0)
+        h[(size_t) k * intermed + r] = (g / (1.f + expf(-g))) * u;
+}
+
+__global__ void k_moe_down_p(const uint8_t *__restrict__ ddw, const uint8_t *__restrict__ sddw,
+                             const float *__restrict__ h, float *__restrict__ y,
+                             const MoeRoute *__restrict__ route, int top_k, int intermed, int dim,
+                             long d_bpe, int dk, int sdk) {
+    int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (wid >= dim) return;
+    size_t bpr_d = (size_t) (intermed / 256) * kq_bpb(dk);
+    size_t bpr_s = (size_t) (intermed / 256) * kq_bpb(sdk);
+    float acc = 0.f;
+    for (int k = 0; k < top_k; ++k) {
+        const uint8_t *row = ddw + (size_t) route->idx[k] * d_bpe + (size_t) wid * bpr_d;
+        acc += route->w[k] * wrow(row, dk, h + (size_t) k * intermed, intermed, lane);
+    }
+    acc += route->w[MOE_MAXK]
+           * wrow(sddw + (size_t) wid * bpr_s, sdk, h + (size_t) top_k * intermed, intermed, lane);
+    if (lane == 0) y[wid] = acc;
+}
+
+struct ChainLayer {
+    int is_fattn;
+    float *attn_norm, *post_norm;
+    // delta-net
+    uint8_t *qkv, *al, *be, *ga, *ow; int qkv_k, al_k, be_k, ga_k, ow_k;
+    float *conv, *aw, *dtw, *nw;
+    int nv, khd, vhd, qo, q_dim, nkh, v_dim, kernel;
+    // full-attn
+    uint8_t *qw, *kw, *vw, *fow; int qw_k, kw_k, vw_k, fow_k;
+    float *qn, *kn, *ffp;
+    int nq, nkv, hd, rd, yarn_on, use_ff, interleaved, sec_total;
+    float base, freq_scale, m_scale, corr_lo, corr_hi;
+    // moe
+    uint8_t *rw; int rk;
+    uint8_t *gdw, *udw, *ddw, *sgdw, *sudw, *sddw;
+    int gk, uk, dk, sgk, suk, sdk;
+    long g_bpe, u_bpe, d_bpe;
+    float *sgi; int sgi_len;
+    int n_exp, top_k, intermed;
+    int has_moe;
+};
+static std::vector<ChainLayer> g_chain;
+static float *g_ch_embed = nullptr, *g_ch_fnorm = nullptr, *g_ch_lm = nullptr;
+static int g_ch_dim = 0, g_ch_vocab = 0, g_ch_ready = 0;
+static int g_mx_qo = 0, g_mx_nv = 0, g_mx_vd = 0, g_mx_qgd = 0, g_mx_kvd = 0,
+           g_mx_att = 0, g_mx_hbuf = 0, g_mx_nexp = 0;
+
+extern "C" void aspida_gpu_chain_reset(void) {
+    g_chain.clear(); g_ch_embed = nullptr; g_ch_ready = 0;
+    g_mx_qo = g_mx_nv = g_mx_vd = g_mx_qgd = g_mx_kvd = g_mx_att = g_mx_hbuf = g_mx_nexp = 0;
+}
+
+extern "C" void aspida_gpu_chain_dnet(
+    const float *attn_norm, long an_b, const float *post_norm, long pn_b,
+    const void *qkv_w, long qkv_b, int qkv_k,
+    const void *al_w, long al_b, int al_k,
+    const void *be_w, long be_b, int be_k,
+    const void *ga_w, long ga_b, int ga_k,
+    const void *out_w, long out_b, int out_k,
+    const float *conv_w, long conv_b, const float *a_w, long a_b,
+    const float *dt_w, long dt_b, const float *norm_w, long norm_b,
+    int nv, int khd, int vhd, int qo, int q_dim, int n_k_heads, int v_dim, int kernel) {
+    ChainLayer L = {}; L.is_fattn = 0;
+    L.attn_norm = (float *) upload_weight(attn_norm, an_b);
+    L.post_norm = (float *) upload_weight(post_norm, pn_b);
+    L.qkv = upload_weight(qkv_w, qkv_b); L.qkv_k = qkv_k;
+    L.al = upload_weight(al_w, al_b); L.al_k = al_k;
+    L.be = upload_weight(be_w, be_b); L.be_k = be_k;
+    L.ga = upload_weight(ga_w, ga_b); L.ga_k = ga_k;
+    L.ow = upload_weight(out_w, out_b); L.ow_k = out_k;
+    L.conv = (float *) upload_weight(conv_w, conv_b);
+    L.aw = (float *) upload_weight(a_w, a_b);
+    L.dtw = (float *) upload_weight(dt_w, dt_b);
+    L.nw = (float *) upload_weight(norm_w, norm_b);
+    L.nv = nv; L.khd = khd; L.vhd = vhd; L.qo = qo; L.q_dim = q_dim;
+    L.nkh = n_k_heads; L.v_dim = v_dim; L.kernel = kernel;
+    if (qo > g_mx_qo) g_mx_qo = qo;
+    if (nv > g_mx_nv) g_mx_nv = nv;
+    if (v_dim > g_mx_vd) g_mx_vd = v_dim;
+    g_chain.push_back(L);
+}
+
+extern "C" void aspida_gpu_chain_fattn(
+    const float *attn_norm, long an_b, const float *post_norm, long pn_b,
+    const void *q_w, long q_b, int q_k, const void *k_w, long k_b, int k_k,
+    const void *v_w, long v_b, int v_k, const void *o_w, long o_b, int o_k,
+    const float *q_norm, long qn_b, const float *k_norm, long kn_b,
+    int nq, int nkv, int hd,
+    int rd, float base, float freq_scale, float m_scale,
+    int yarn_on, float corr_lo, float corr_hi,
+    const float *ff, long ff_b, int use_ff, int interleaved, int sec_total) {
+    ChainLayer L = {}; L.is_fattn = 1;
+    L.attn_norm = (float *) upload_weight(attn_norm, an_b);
+    L.post_norm = (float *) upload_weight(post_norm, pn_b);
+    L.qw = upload_weight(q_w, q_b); L.qw_k = q_k;
+    L.kw = upload_weight(k_w, k_b); L.kw_k = k_k;
+    L.vw = upload_weight(v_w, v_b); L.vw_k = v_k;
+    L.fow = upload_weight(o_w, o_b); L.fow_k = o_k;
+    L.qn = (float *) upload_weight(q_norm, qn_b);
+    L.kn = (float *) upload_weight(k_norm, kn_b);
+    L.ffp = (use_ff && ff) ? (float *) upload_weight(ff, ff_b) : nullptr;
+    L.nq = nq; L.nkv = nkv; L.hd = hd; L.rd = rd; L.base = base;
+    L.freq_scale = freq_scale; L.m_scale = m_scale; L.yarn_on = yarn_on;
+    L.corr_lo = corr_lo; L.corr_hi = corr_hi; L.use_ff = use_ff;
+    L.interleaved = interleaved; L.sec_total = sec_total;
+    int qgd = nq * 2 * hd, kvd = nkv * hd, att = nq * hd;
+    if (qgd > g_mx_qgd) g_mx_qgd = qgd;
+    if (kvd > g_mx_kvd) g_mx_kvd = kvd;
+    if (att > g_mx_att) g_mx_att = att;
+    g_chain.push_back(L);
+}
+
+extern "C" void aspida_gpu_chain_moe(
+    const void *router_w, long router_b, int router_k,
+    const void *gate_w, long gate_b, int gate_k,
+    const void *up_w, long up_b, int up_k,
+    const void *down_w, long down_b, int down_k,
+    const void *shg_w, long shg_b, int shg_k,
+    const void *shu_w, long shu_b, int shu_k,
+    const void *shd_w, long shd_b, int shd_k,
+    const float *sgi, long sgi_b, int sgi_len,
+    int n_exp, int top_k, int intermed) {
+    if (g_chain.empty()) return;
+    ChainLayer &L = g_chain.back();
+    L.rw = upload_weight(router_w, router_b); L.rk = router_k;
+    L.gdw = upload_weight(gate_w, gate_b); L.gk = gate_k;
+    L.udw = upload_weight(up_w, up_b); L.uk = up_k;
+    L.ddw = upload_weight(down_w, down_b); L.dk = down_k;
+    L.sgdw = upload_weight(shg_w, shg_b); L.sgk = shg_k;
+    L.sudw = upload_weight(shu_w, shu_b); L.suk = shu_k;
+    L.sddw = upload_weight(shd_w, shd_b); L.sdk = shd_k;
+    L.sgi = (sgi_len > 1 && sgi) ? (float *) upload_weight(sgi, sgi_b) : nullptr;
+    L.sgi_len = sgi_len;
+    L.g_bpe = gate_b / n_exp; L.u_bpe = up_b / n_exp; L.d_bpe = down_b / n_exp;
+    L.n_exp = n_exp; L.top_k = top_k > MOE_MAXK ? MOE_MAXK : top_k;
+    L.intermed = intermed; L.has_moe = 1;
+    int hbuf = (MOE_MAXK + 1) * intermed;
+    if (hbuf > g_mx_hbuf) g_mx_hbuf = hbuf;
+    if (n_exp > g_mx_nexp) g_mx_nexp = n_exp;
+}
+
+extern "C" void aspida_gpu_chain_model(
+    const float *embed, long embed_b, const float *fnorm, long fnorm_b,
+    const float *lm, long lm_b, int dim, int vocab) {
+    g_ch_embed = (float *) upload_weight(embed, embed_b);
+    g_ch_fnorm = (float *) upload_weight(fnorm, fnorm_b);
+    g_ch_lm = (float *) upload_weight(lm, lm_b);
+    g_ch_dim = dim; g_ch_vocab = vocab; g_ch_ready = 1;
+}
+
+extern "C" int aspida_gpu_chain_ready(void) { return g_ch_ready && !g_chain.empty(); }
+
+// One full decode step: embed row in, logits out; H never leaves the device.
+// attn_handles[i] = the per-generation dnet/fattn state handle of layer i.
+extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,
+                                         const int *attn_handles, float *logits) {
+    static float *H = nullptr, *nx = nullptr, *ao = nullptr, *dlog = nullptr,
+                 *dqkv = nullptr, *dcq = nullptr, *dar = nullptr, *dbr = nullptr,
+                 *dz = nullptr, *dg = nullptr, *db = nullptr, *dor = nullptr,
+                 *dqg = nullptr, *dkt = nullptr, *dvt = nullptr, *dqa = nullptr,
+                 *dga = nullptr, *datt = nullptr, *drl = nullptr, *dhb = nullptr;
+    static MoeRoute *droute = nullptr;
+    static int inited = 0;
+    int dim = g_ch_dim;
+    if (!inited) {
+        cudaMalloc(&H, (size_t) dim * 4); cudaMalloc(&nx, (size_t) dim * 4);
+        cudaMalloc(&ao, (size_t) dim * 4);
+        cudaMalloc(&dlog, (size_t) g_ch_vocab * 4);
+        if (g_mx_qo) { cudaMalloc(&dqkv, (size_t) g_mx_qo * 4); cudaMalloc(&dcq, (size_t) g_mx_qo * 4); }
+        if (g_mx_nv) { cudaMalloc(&dar, (size_t) g_mx_nv * 4); cudaMalloc(&dbr, (size_t) g_mx_nv * 4);
+                       cudaMalloc(&dg, (size_t) g_mx_nv * 4); cudaMalloc(&db, (size_t) g_mx_nv * 4); }
+        if (g_mx_vd) { cudaMalloc(&dz, (size_t) g_mx_vd * 4); cudaMalloc(&dor, (size_t) g_mx_vd * 4); }
+        if (g_mx_qgd) cudaMalloc(&dqg, (size_t) g_mx_qgd * 4);
+        if (g_mx_kvd) { cudaMalloc(&dkt, (size_t) g_mx_kvd * 4); cudaMalloc(&dvt, (size_t) g_mx_kvd * 4); }
+        if (g_mx_att) { cudaMalloc(&dqa, (size_t) g_mx_att * 4); cudaMalloc(&dga, (size_t) g_mx_att * 4);
+                        cudaMalloc(&datt, (size_t) g_mx_att * 4); }
+        if (g_mx_nexp) cudaMalloc(&drl, (size_t) g_mx_nexp * 4);
+        if (g_mx_hbuf) cudaMalloc(&dhb, (size_t) g_mx_hbuf * 4);
+        cudaMalloc(&droute, sizeof(MoeRoute));
+        inited = 1;
+    }
+    int gblk = (dim + 255) / 256;
+    k_embed<<<gblk, 256>>>(g_ch_embed, embed_row, H, dim);
+    for (size_t li = 0; li < g_chain.size(); ++li) {
+        ChainLayer &L = g_chain[li];
+        k_norm1<<<1, 256>>>(H, L.attn_norm, nx, dim);
+        if (!L.is_fattn) {
+            DnetState st = g_dnet[attn_handles[li]];
+            launch_mv_any(L.qkv, L.qkv_k, dim, L.qo, nx, dqkv);
+            launch_mv_any(L.al, L.al_k, dim, L.nv, nx, dar);
+            launch_mv_any(L.be, L.be_k, dim, L.nv, nx, dbr);
+            launch_mv_any(L.ga, L.ga_k, dim, L.v_dim, nx, dz);
+            k_dnet_conv<<<(L.qo + 255) / 256, 256>>>(dqkv, st.hist, L.conv, dcq, L.qo, L.kernel);
+            k_dnet_gates<<<(L.nv + 255) / 256, 256>>>(dar, dbr, L.aw, L.dtw, dg, db, L.nv);
+            size_t shmem = (size_t) (4 * L.khd + 2 * L.vhd) * 4;
+            k_dnet_recur<<<L.nv, L.khd, shmem>>>(st.S, dcq, dg, db, dz, L.nw, dor,
+                                                 L.khd, L.vhd, L.q_dim, L.nkh);
+            launch_mv_any(L.ow, L.ow_k, L.v_dim, dim, dor, ao);
+        } else {
+            FattnState st = g_fattn[attn_handles[li]];
+            int kvd = L.nkv * L.hd, att = L.nq * L.hd, qgd = L.nq * 2 * L.hd;
+            launch_mv_any(L.qw, L.qw_k, dim, qgd, nx, dqg);
+            launch_mv_any(L.kw, L.kw_k, dim, kvd, nx, dkt);
+            launch_mv_any(L.vw, L.vw_k, dim, kvd, nx, dvt);
+            k_fattn_prep<<<L.nq + L.nkv, L.hd, (size_t) L.hd * 4>>>(
+                dqg, dkt, dvt, L.qn, L.kn, dqa, dga, st.K, st.V,
+                L.nq, L.nkv, L.hd, kvd, pos, L.rd, L.base, L.freq_scale, L.m_scale,
+                L.yarn_on, L.corr_lo, L.corr_hi, L.ffp, L.use_ff, L.interleaved, L.sec_total);
+            k_fattn_attend<<<L.nq, 256>>>(dqa, dga, st.K, st.V, st.scores, datt,
+                                          L.nq, L.nkv, L.hd, kvd, pos + 1, st.max_len);
+            launch_mv_any(L.fow, L.fow_k, att, dim, datt, ao);
+        }
+        k_axpy<<<gblk, 256>>>(H, 1.0f, ao, dim);
+        if (L.has_moe) {
+            k_norm1<<<1, 256>>>(H, L.post_norm, nx, dim);
+            launch_mv_any(L.rw, L.rk, dim, L.n_exp, nx, drl);
+            k_moe_route<<<1, 1>>>(drl, nx, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, droute);
+            int w1 = (L.top_k + 1) * L.intermed, b1 = (w1 * 32 + 255) / 256;
+            int b2 = (dim * 32 + 255) / 256;
+            k_moe_gu_p<<<b1, 256>>>(L.gdw, L.udw, L.sgdw, L.sudw, nx, dhb, droute,
+                                    L.top_k, dim, L.intermed, L.g_bpe, L.u_bpe,
+                                    L.gk, L.uk, L.sgk, L.suk);
+            k_moe_down_p<<<b2, 256>>>(L.ddw, L.sddw, dhb, ao, droute, L.top_k,
+                                      L.intermed, dim, L.d_bpe, L.dk, L.sdk);
+            k_axpy<<<gblk, 256>>>(H, 1.0f, ao, dim);
+        }
+    }
+    k_norm1<<<1, 256>>>(H, g_ch_fnorm, nx, dim);
+    const int TPB = 256, WPB = TPB / 32;
+    k_dense_mv<<<(g_ch_vocab + WPB - 1) / WPB, TPB>>>(g_ch_lm, nx, dlog, dim, g_ch_vocab);
+    cudaMemcpy(logits, dlog, (size_t) g_ch_vocab * 4, cudaMemcpyDeviceToHost);
 }

@@ -141,4 +141,60 @@ package LLM_Qwen_GPU is
       Use_FF, Interleaved, Sec_Total : Integer;
       Y        : System.Address);  -- [Dim] f32 host out
 
+   --  Release a per-generation device state (S_All/conv window or K/V cache).
+   --  Without these every request leaks its states' VRAM; slots are reused.
+   procedure Dnet_Free  (Handle : Integer);
+   procedure Fattn_Free (Handle : Integer);
+
+   --  Phase C — full resident forward chain. Layers are registered once per
+   --  loaded model (device weight pointers resolved through the resident
+   --  cache); Chain_Forward then runs a whole decode step on the device:
+   --  embedding row in, logits out, hidden state never leaves VRAM.
+   --  Handles is the address of a C int array: per layer, the generation's
+   --  dnet/fattn state handle.
+   function Chain_Available return Boolean;
+   procedure Chain_Reset;
+
+   procedure Chain_Dnet
+     (Attn_Norm : System.Address; AN_B : Long_Long_Integer;
+      Post_Norm : System.Address; PN_B : Long_Long_Integer;
+      QKV_W, Alpha_W, Beta_W, Gate_W, Out_W : GPU_Weight;
+      Conv_W : System.Address; Conv_B : Long_Long_Integer;
+      A_W    : System.Address; A_B    : Long_Long_Integer;
+      Dt_W   : System.Address; Dt_B   : Long_Long_Integer;
+      Norm_W : System.Address; Norm_B : Long_Long_Integer;
+      NV, KHD, VHD, QO, Q_Dim, N_K_Heads, V_Dim, Kernel : Integer);
+
+   procedure Chain_Fattn
+     (Attn_Norm : System.Address; AN_B : Long_Long_Integer;
+      Post_Norm : System.Address; PN_B : Long_Long_Integer;
+      Q_W, K_W, V_W, O_W : GPU_Weight;
+      Q_Norm : System.Address; QN_B : Long_Long_Integer;
+      K_Norm : System.Address; KN_B : Long_Long_Integer;
+      NQ, NKV, HD : Integer;
+      RD : Integer; Base, Freq_Scale, M_Scale : Float;
+      Yarn_On : Integer; Corr_Lo, Corr_Hi : Float;
+      FF : System.Address; FF_B : Long_Long_Integer;
+      Use_FF, Interleaved, Sec_Total : Integer);
+
+   procedure Chain_MoE
+     (Router, Gate_Exp, Up_Exp, Down_Exp,
+      Shared_Gate, Shared_Up, Shared_Down : GPU_Weight;
+      SGI : System.Address; SGI_B : Long_Long_Integer; SGI_Len : Integer;
+      N_Experts, Top_K, Intermed : Integer);
+
+   procedure Chain_Model
+     (Embed : System.Address; Embed_B : Long_Long_Integer;
+      FNorm : System.Address; FNorm_B : Long_Long_Integer;
+      LM    : System.Address; LM_B    : Long_Long_Integer;
+      Dim, Vocab : Integer);
+
+   function Chain_Ready return Boolean;
+
+   procedure Chain_Forward
+     (Embed_Row : Integer;      -- 0-based row in the embedding table
+      Pos       : Integer;      -- 0-based token position (RoPE / KV append)
+      Handles   : System.Address;  -- C int[n_layers] state handles
+      Logits    : System.Address); -- [Vocab] f32 host out
+
 end LLM_Qwen_GPU;

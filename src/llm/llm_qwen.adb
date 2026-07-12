@@ -17,6 +17,9 @@ with LLM_Tensor;  use LLM_Tensor;
 with LLM_MoE;
 with LLM_Dense_FFN;
 with LLM_GPU;
+with LLM_Qwen_GPU;
+with System;
+with Interfaces.C;
 with LLM_Step_Lock;
 with LLM_RMSNorm;
 with LLM_FullAttn;
@@ -543,6 +546,165 @@ package body LLM_Qwen is
    --  Shared cached-decode core: prefill the prompt token ids, then greedily
    --  generate up to Max_New_Tokens, stopping early at Stop1/Stop2 (ids; -1 =
    --  none). Returns the decoded text of the GENERATED tokens only.
+   --  Phase C: full resident forward chain — registered once per loaded
+   --  model (keyed by the embedding table address). When registered AND all
+   --  per-generation states allocated on the device, Decode runs one
+   --  Chain_Forward per token: embedding row in, logits out, hidden state
+   --  never leaves VRAM.
+   Chain_Tag : System.Address := System.Null_Address;
+   Chain_OK  : Boolean := False;
+
+   procedure Register_Chain (M : Qwen_Model) is
+      use type System.Address;
+      use LLM_Qwen_GPU;
+
+      function WOK (W : LLM_Weight.Weight) return Boolean is
+        (LLM_Weight.Kind_Code (W) >= 0 or else LLM_Weight.Is_F32 (W));
+
+      function GW (W : LLM_Weight.Weight) return GPU_Weight is
+        (Addr  => LLM_Weight.Raw_Address (W),
+         Bytes => LLM_Weight.Raw_Bytes (W),
+         Kind  => LLM_Weight.Kind_Code (W));
+
+      function TB (T : Tensor) return Long_Long_Integer is
+        (Long_Long_Integer (Numel (T)) * 4);
+
+      function Sec_Total (R : LLM_RoPE.RoPE_Params) return Integer is
+         T : Integer := 0;
+      begin
+         for S in 1 .. 4 loop
+            T := T + Integer'Max (0, Integer (Get_Flat (R.Sections, S)));
+         end loop;
+         return T;
+      end Sec_Total;
+
+      OK : Boolean := True;
+   begin
+      if not Chain_Available then
+         return;
+      end if;
+      if Chain_Tag = Data_Address (M.Token_Emb) then
+         return;                       -- this model is already registered
+      end if;
+      Chain_OK  := False;
+      Chain_Tag := System.Null_Address;
+
+      --  Eligibility: every layer must be MoE with K-quant experts and
+      --  K-quant|F32 projections (same gates as the per-layer paths).
+      for I in 1 .. M.N_Blocks loop
+         declare
+            B : LLM_Qwen_Blk.Qwen_Block renames M.Blocks (I).all;
+         begin
+            OK := OK and then B.Is_MoE;
+            if B.Is_Full_Attn then
+               OK := OK and then WOK (B.Full.Q_W) and then WOK (B.Full.K_W)
+                 and then WOK (B.Full.V_W) and then WOK (B.Full.O_W);
+            else
+               OK := OK and then WOK (B.DNet.QKV_W) and then WOK (B.DNet.Alpha_W)
+                 and then WOK (B.DNet.Beta_W) and then WOK (B.DNet.Gate_W)
+                 and then WOK (B.DNet.Out_W);
+            end if;
+            if B.Is_MoE then
+               OK := OK and then WOK (B.MoE.Gate_Inp_W)
+                 and then LLM_Weight.Kind_Code (B.MoE.Gate_Exp_W) >= 0
+                 and then LLM_Weight.Kind_Code (B.MoE.Up_W) >= 0
+                 and then LLM_Weight.Kind_Code (B.MoE.Down_W) >= 0
+                 and then LLM_Weight.Kind_Code (B.MoE.Shexp_Gate_W) >= 0
+                 and then LLM_Weight.Kind_Code (B.MoE.Shexp_Up_W) >= 0
+                 and then LLM_Weight.Kind_Code (B.MoE.Shexp_Down_W) >= 0;
+            end if;
+         end;
+      end loop;
+      if not OK then
+         return;
+      end if;
+
+      Chain_Reset;
+      for I in 1 .. M.N_Blocks loop
+         declare
+            B : LLM_Qwen_Blk.Qwen_Block renames M.Blocks (I).all;
+         begin
+            if B.Is_Full_Attn then
+               Chain_Fattn
+                 (Attn_Norm => Data_Address (B.Attn_Norm_W),
+                  AN_B      => TB (B.Attn_Norm_W),
+                  Post_Norm => Data_Address (B.Post_Attn_Norm_W),
+                  PN_B      => TB (B.Post_Attn_Norm_W),
+                  Q_W => GW (B.Full.Q_W), K_W => GW (B.Full.K_W),
+                  V_W => GW (B.Full.V_W), O_W => GW (B.Full.O_W),
+                  Q_Norm => Data_Address (B.Full.Q_Norm),
+                  QN_B   => TB (B.Full.Q_Norm),
+                  K_Norm => Data_Address (B.Full.K_Norm),
+                  KN_B   => TB (B.Full.K_Norm),
+                  NQ  => B.Full.N_Q_Heads,
+                  NKV => B.Full.N_KV_Heads,
+                  HD  => B.Full.Head_Dim,
+                  RD  => B.Full.RoPE.Dim,
+                  Base => B.Full.RoPE.Freq_Base,
+                  Freq_Scale => B.Full.RoPE.Freq_Scale,
+                  M_Scale => B.Full.RoPE.M_Scale,
+                  Yarn_On => (if B.Full.RoPE.Yarn_On then 1 else 0),
+                  Corr_Lo => B.Full.RoPE.Corr_Low,
+                  Corr_Hi => B.Full.RoPE.Corr_High,
+                  FF => (if B.Full.RoPE.Use_FF
+                         then Data_Address (B.Full.RoPE.Freq_Factors)
+                         else System.Null_Address),
+                  FF_B => (if B.Full.RoPE.Use_FF
+                           then TB (B.Full.RoPE.Freq_Factors) else 0),
+                  Use_FF => (if B.Full.RoPE.Use_FF then 1 else 0),
+                  Interleaved => (if B.Full.RoPE.Interleaved then 1 else 0),
+                  Sec_Total => Sec_Total (B.Full.RoPE));
+            else
+               Chain_Dnet
+                 (Attn_Norm => Data_Address (B.Attn_Norm_W),
+                  AN_B      => TB (B.Attn_Norm_W),
+                  Post_Norm => Data_Address (B.Post_Attn_Norm_W),
+                  PN_B      => TB (B.Post_Attn_Norm_W),
+                  QKV_W => GW (B.DNet.QKV_W), Alpha_W => GW (B.DNet.Alpha_W),
+                  Beta_W => GW (B.DNet.Beta_W), Gate_W => GW (B.DNet.Gate_W),
+                  Out_W => GW (B.DNet.Out_W),
+                  Conv_W => Data_Address (B.DNet.Conv_W),
+                  Conv_B => TB (B.DNet.Conv_W),
+                  A_W => Data_Address (B.DNet.A_W), A_B => TB (B.DNet.A_W),
+                  Dt_W => Data_Address (B.DNet.Dt_W), Dt_B => TB (B.DNet.Dt_W),
+                  Norm_W => Data_Address (B.DNet.Norm_W),
+                  Norm_B => TB (B.DNet.Norm_W),
+                  NV => B.DNet.N_V_Heads,
+                  KHD => B.DNet.Key_Head_Dim,
+                  VHD => B.DNet.Value_Head_Dim,
+                  QO => B.DNet.QKV_Out,
+                  Q_Dim => B.DNet.N_K_Heads * B.DNet.Key_Head_Dim,
+                  N_K_Heads => B.DNet.N_K_Heads,
+                  V_Dim => B.DNet.V_Dim,
+                  Kernel => Shape (B.DNet.Conv_W) (2));
+            end if;
+            Chain_MoE
+              (Router => GW (B.MoE.Gate_Inp_W),
+               Gate_Exp => GW (B.MoE.Gate_Exp_W),
+               Up_Exp => GW (B.MoE.Up_W),
+               Down_Exp => GW (B.MoE.Down_W),
+               Shared_Gate => GW (B.MoE.Shexp_Gate_W),
+               Shared_Up => GW (B.MoE.Shexp_Up_W),
+               Shared_Down => GW (B.MoE.Shexp_Down_W),
+               SGI => (if Numel (B.MoE.Shexp_Gate_Inp_W) > 1
+                       then Data_Address (B.MoE.Shexp_Gate_Inp_W)
+                       else System.Null_Address),
+               SGI_B => TB (B.MoE.Shexp_Gate_Inp_W),
+               SGI_Len => Numel (B.MoE.Shexp_Gate_Inp_W),
+               N_Experts => B.MoE.N_Experts,
+               Top_K => B.MoE.Top_K,
+               Intermed => B.MoE.Intermed);
+         end;
+      end loop;
+      Chain_Model
+        (Embed => Data_Address (M.Token_Emb), Embed_B => TB (M.Token_Emb),
+         FNorm => Data_Address (M.Final_Norm), FNorm_B => TB (M.Final_Norm),
+         LM => Data_Address (M.LM_Head), LM_B => TB (M.LM_Head),
+         Dim => M.Model_Dim, Vocab => M.Vocab_Sz);
+      Chain_OK  := Chain_Ready;
+      Chain_Tag := Data_Address (M.Token_Emb);
+   end Register_Chain;
+
    function Decode_Tokens
      (M              : Qwen_Model;
       Prompt_Ids     : LLM_Tokenizer.Token_Array;
@@ -568,6 +730,25 @@ package body LLM_Qwen is
       --  step costs O(1) matmuls instead of recomputing the sequence.
       Cache : array (1 .. M.N_Blocks) of LLM_Qwen_Blk.Block_State;
 
+      --  Phase C chain: per-generation state handles + token position.
+      Use_Chain : Boolean := False;
+      Chain_Pos : Natural := 0;
+      Handles   : array (1 .. M.N_Blocks) of Interfaces.C.int :=
+        [others => Interfaces.C.int (Integer'(-1))];
+
+      procedure Free_States is
+      begin
+         for I in Cache'Range loop
+            if Cache (I).Is_Full then
+               LLM_Qwen_GPU.Fattn_Free (Cache (I).Full_St.GPU_Handle);
+               Cache (I).Full_St.GPU_Handle := -1;
+            else
+               LLM_Qwen_GPU.Dnet_Free (Cache (I).DNet_St.GPU_Handle);
+               Cache (I).DNet_St.GPU_Handle := -1;
+            end if;
+         end loop;
+      end Free_States;
+
       --  One forward step under the shared step lock, released between steps
       --  (incl. on exception) so concurrent generations interleave per token.
       function Decode (Embed_Row : Integer) return Tensor is
@@ -576,6 +757,22 @@ package body LLM_Qwen is
          TS : Ada.Real_Time.Time;
       begin
          LLM_Step_Lock.Acquire;
+         if Use_Chain then
+            declare
+               R : constant Tensor := New_Tensor ([1, M.Vocab_Sz]);
+            begin
+               if Chain_Pos >= Cap then
+                  raise Constraint_Error with "chain KV overflow at"
+                    & Integer'Image (Chain_Pos);
+               end if;
+               LLM_Qwen_GPU.Chain_Forward
+                 (Embed_Row - 1, Chain_Pos, Handles (1)'Address,
+                  Data_Address (R));
+               Chain_Pos := Chain_Pos + 1;
+               LLM_Step_Lock.Release;
+               return R;
+            end;
+         end if;
          for D in 1 .. Dim loop
             Set_Flat (H, D, Get (M.Token_Emb, [Embed_Row, D]));
          end loop;
@@ -623,6 +820,23 @@ package body LLM_Qwen is
    begin
       for I in 1 .. M.N_Blocks loop
          Cache (I) := LLM_Qwen_Blk.Init_State (M.Blocks (I).all, Cap);
+      end loop;
+
+      --  Phase C: use the resident chain when the model is registered and
+      --  every layer's device state was allocated.
+      Register_Chain (M);
+      Use_Chain := Chain_OK;
+      for I in 1 .. M.N_Blocks loop
+         declare
+            Hn : constant Integer :=
+              (if Cache (I).Is_Full then Cache (I).Full_St.GPU_Handle
+               else Cache (I).DNet_St.GPU_Handle);
+         begin
+            if Hn < 0 then
+               Use_Chain := False;
+            end if;
+            Handles (I) := Interfaces.C.int (Hn);
+         end;
       end loop;
 
       --  Prefill (row = id + 1: ids are 0-based, embedding rows 1-based).
@@ -686,7 +900,12 @@ package body LLM_Qwen is
                        Truncated         => not Hit_Stop,
                        Overflow          => False);
       end if;
+      Free_States;
       return To_String (Out_Buf);
+   exception
+      when others =>
+         Free_States;
+         raise;
    end Decode_Tokens;
 
    function Generate
