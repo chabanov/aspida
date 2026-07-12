@@ -425,6 +425,174 @@ static inline void launch_matvec(const uint8_t *dw, int kind, int in, int out,
     else                k_q2k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
 }
 
+// ---- Warp-cooperative single-row quant dot products (device functions).
+//      Same math/lane layout as the k_*_w kernels; every lane returns the
+//      reduced value. `r` points at the row's first quant block, `in` is the
+//      row length. Used by the fused MoE kernels (one warp = one (row,expert)).
+__device__ __forceinline__ float wrow_q4k(const uint8_t *r, const float *x, int in, int lane) {
+  int nb = in / 256; float acc = 0.f;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t *blk = r + (size_t) b * 144;
+    float d = f16(blk), dm = f16(blk + 2);
+    const uint8_t *sc = blk + 4; const uint8_t *qs = blk + 16;
+    int bs = b * 256;
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      int j = lane + 32 * t, g = j >> 5, l = j & 31;
+      int s1, m1, s2, m2; gsm(sc, 2 * g, &s1, &m1); gsm(sc, 2 * g + 1, &s2, &m2);
+      uint8_t q = qs[j];
+      acc += (d * s1 * (q & 0x0F) - dm * m1) * x[bs + 64 * g + l];
+      acc += (d * s2 * (q >> 4)   - dm * m2) * x[bs + 64 * g + 32 + l];
+    }
+  }
+  acc = warp_reduce(acc);
+  return __shfl_sync(0xffffffffu, acc, 0);
+}
+__device__ __forceinline__ float wrow_q6k(const uint8_t *r, const float *x, int in, int lane) {
+  int nb = in / 256; float acc = 0.f;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t *blk = r + (size_t) b * 210;
+    const uint8_t *ql = blk; const uint8_t *qh = blk + 128;
+    const int8_t *sc = (const int8_t *) (blk + 192); float d = f16(blk + 208);
+    int bs = b * 256, l = lane, is = l / 16;
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint8_t *QL = ql + h * 64; const uint8_t *QH = qh + h * 32;
+      const int8_t *SC = sc + h * 8; int base = bs + h * 128;
+      int q1 = (int) ((QL[l] & 0xF)      | (((QH[l] >> 0) & 3) << 4)) - 32;
+      int q2 = (int) ((QL[l + 32] & 0xF) | (((QH[l] >> 2) & 3) << 4)) - 32;
+      int q3 = (int) ((QL[l] >> 4)       | (((QH[l] >> 4) & 3) << 4)) - 32;
+      int q4 = (int) ((QL[l + 32] >> 4)  | (((QH[l] >> 6) & 3) << 4)) - 32;
+      acc += d * SC[is + 0] * q1 * x[base + l];
+      acc += d * SC[is + 2] * q2 * x[base + l + 32];
+      acc += d * SC[is + 4] * q3 * x[base + l + 64];
+      acc += d * SC[is + 6] * q4 * x[base + l + 96];
+    }
+  }
+  acc = warp_reduce(acc);
+  return __shfl_sync(0xffffffffu, acc, 0);
+}
+__device__ __forceinline__ float wrow_q5k(const uint8_t *r, const float *x, int in, int lane) {
+  int nb = in / 256; float acc = 0.f;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t *blk = r + (size_t) b * 176;
+    float d = f16(blk), dm = f16(blk + 2);
+    const uint8_t *sc = blk + 4; const uint8_t *qh = blk + 16; const uint8_t *qs = blk + 48;
+    int bs = b * 256, L = lane; unsigned hbits = qh[L];
+    #pragma unroll
+    for (int g = 0; g < 4; ++g) {
+      int s1, m1, s2, m2; gsm(sc, 2 * g, &s1, &m1); gsm(sc, 2 * g + 1, &s2, &m2);
+      unsigned q = qs[32 * g + L];
+      int lo = (q & 0xF) + (((hbits >> (2 * g)) & 1) << 4);
+      int hi = (q >> 4)  + (((hbits >> (2 * g + 1)) & 1) << 4);
+      acc += (d * s1 * lo - dm * m1) * x[bs + 64 * g + L];
+      acc += (d * s2 * hi - dm * m2) * x[bs + 64 * g + 32 + L];
+    }
+  }
+  acc = warp_reduce(acc);
+  return __shfl_sync(0xffffffffu, acc, 0);
+}
+__device__ __forceinline__ float wrow_q3k(const uint8_t *r, const float *x, int in, int lane) {
+  int nb = in / 256; int g = lane >> 4; float acc = 0.f;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t *bl = r + (size_t) b * 110; const uint8_t *hm = bl, *qs = bl + 32, *sc = bl + 96;
+    float d = f16(bl + 108); int sca[16]; q3k_scales(sc, sca);
+    int bs = b * 256; unsigned hb = hm[lane];
+    #pragma unroll
+    for (int nh = 0; nh < 2; ++nh) { unsigned qb = qs[nh * 32 + lane];
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) { int low2 = (qb >> (2 * j)) & 3, hbit = (hb >> (nh * 4 + j)) & 1, is = nh * 8 + j * 2 + g;
+        acc += d * sca[is] * (float) (low2 + 4 * hbit - 4) * x[bs + nh * 128 + j * 32 + lane]; }
+    }
+  }
+  acc = warp_reduce(acc);
+  return __shfl_sync(0xffffffffu, acc, 0);
+}
+__device__ __forceinline__ float wrow_q2k(const uint8_t *r, const float *x, int in, int lane) {
+  int nb = in / 256; int g = lane >> 4; float acc = 0.f;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t *bl = r + (size_t) b * 84; const uint8_t *sc = bl, *qs = bl + 16;
+    float d = f16(bl + 80), dm = f16(bl + 82); int bs = b * 256;
+    #pragma unroll
+    for (int nh = 0; nh < 2; ++nh) { unsigned qb = qs[nh * 32 + lane];
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) { int q2 = (qb >> (2 * j)) & 3, is = nh * 8 + j * 2 + g;
+        acc += (d * (sc[is] & 0xF) * (float) q2 - dm * (sc[is] >> 4)) * x[bs + nh * 128 + j * 32 + lane]; }
+    }
+  }
+  acc = warp_reduce(acc);
+  return __shfl_sync(0xffffffffu, acc, 0);
+}
+// Bytes per 256-value super-block, by kind code.
+__host__ __device__ __forceinline__ int kq_bpb(int kind) {
+  return kind == 0 ? 144 : kind == 1 ? 210 : kind == 2 ? 176 : kind == 3 ? 110 : 84;
+}
+// Warp-cooperative dot of one quant row (branch is warp-uniform).
+__device__ __forceinline__ float wrow(const uint8_t *r, int kind, const float *x, int in, int lane) {
+  switch (kind) {
+    case 0:  return wrow_q4k(r, x, in, lane);
+    case 1:  return wrow_q6k(r, x, in, lane);
+    case 2:  return wrow_q5k(r, x, in, lane);
+    case 3:  return wrow_q3k(r, x, in, lane);
+    default: return wrow_q2k(r, x, in, lane);
+  }
+}
+
+// Expert routing packed into kernel params (no extra H2D): idx[k] = expert id,
+// w[k] = combine weight; slot MOE_MAXK holds the shared expert's gate weight.
+#define MOE_MAXK 8
+struct MoeRoute { int idx[MOE_MAXK]; float w[MOE_MAXK + 1]; };
+
+// Fused kernel 1: h[k][r] = silu(gate_k_row_r . x) * (up_k_row_r . x) for the
+// top_k routed experts AND the shared expert (slot top_k). One warp per
+// (expert, row); both dots share the same x reads. Replaces 18 launches.
+__global__ void k_moe_gu(const uint8_t *__restrict__ gdw, const uint8_t *__restrict__ udw,
+                         const uint8_t *__restrict__ sgdw, const uint8_t *__restrict__ sudw,
+                         const float *__restrict__ x, float *__restrict__ h,
+                         MoeRoute route, int top_k, int dim, int intermed,
+                         long g_bpe, long u_bpe, int gk, int uk, int sgk, int suk) {
+    int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    int total = (top_k + 1) * intermed;
+    if (wid >= total) return;
+    int k = wid / intermed, r = wid % intermed;
+    const uint8_t *grow, *urow; int gkind, ukind;
+    if (k < top_k) {
+        int e = route.idx[k];
+        grow = gdw + (size_t) e * g_bpe + (size_t) r * (dim / 256) * kq_bpb(gk);
+        urow = udw + (size_t) e * u_bpe + (size_t) r * (dim / 256) * kq_bpb(uk);
+        gkind = gk; ukind = uk;
+    } else {                                  // shared expert
+        grow = sgdw + (size_t) r * (dim / 256) * kq_bpb(sgk);
+        urow = sudw + (size_t) r * (dim / 256) * kq_bpb(suk);
+        gkind = sgk; ukind = suk;
+    }
+    float g = wrow(grow, gkind, x, dim, lane);
+    float u = wrow(urow, ukind, x, dim, lane);
+    if (lane == 0)
+        h[(size_t) k * intermed + r] = (g / (1.f + expf(-g))) * u;
+}
+
+// Fused kernel 2: y[i] = sum_k route.w[k] * (down_k_row_i . h[k]) + the shared
+// expert (slot top_k, weight route.w[MOE_MAXK]). One warp per output row i,
+// looping the experts inside — single launch, single write. Replaces 12.
+__global__ void k_moe_down(const uint8_t *__restrict__ ddw, const uint8_t *__restrict__ sddw,
+                           const float *__restrict__ h, float *__restrict__ y,
+                           MoeRoute route, int top_k, int intermed, int dim,
+                           long d_bpe, int dk, int sdk) {
+    int wid = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (wid >= dim) return;
+    size_t bpr_d = (size_t) (intermed / 256) * kq_bpb(dk);
+    size_t bpr_s = (size_t) (intermed / 256) * kq_bpb(sdk);
+    float acc = 0.f;
+    for (int k = 0; k < top_k; ++k) {
+        const uint8_t *row = ddw + (size_t) route.idx[k] * d_bpe + (size_t) wid * bpr_d;
+        acc += route.w[k] * wrow(row, dk, h + (size_t) k * intermed, intermed, lane);
+    }
+    acc += route.w[MOE_MAXK]
+           * wrow(sddw + (size_t) wid * bpr_s, sdk, h + (size_t) top_k * intermed, intermed, lane);
+    if (lane == 0) y[wid] = acc;
+}
+
 // Dense F32 matvec (the LM head + token-embedding endpoints bypass the K-quant
 // path). y[out] = W[out,in] . x[in], W row-major dense float. Warp-per-row,
 // weight cached resident by host pointer (same g_wcache). One H2D + one D2H.
@@ -552,22 +720,17 @@ extern "C" void aspida_gpu_moe_experts(
     const void *shd_w,  long shd_bytes,  int shd_kind,
     const float *shared_gate_inp, int gate_inp_len,
     float *y) {
-    // Resident scratch, grown-only across tokens/layers.
-    static float *dx = nullptr, *d_gate = nullptr, *d_up = nullptr,
-                 *d_h = nullptr, *d_y = nullptr, *d_acc = nullptr;
-    static int cdim = 0, cint = 0;
+    // Resident scratch, grown-only across tokens/layers. d_h holds all
+    // (MOE_MAXK+1) experts' SwiGLU outputs for the fused path.
+    static float *dx = nullptr, *d_h = nullptr, *d_acc = nullptr;
+    static int cdim = 0; static size_t chn = 0;
+    size_t hn = (size_t) (MOE_MAXK + 1) * intermed;
     if (dim > cdim) {
-        if (dx) cudaFree(dx);   cudaMalloc(&dx,   (size_t) dim * 4);
-        if (d_y) cudaFree(d_y); cudaMalloc(&d_y,  (size_t) dim * 4);
+        if (dx) cudaFree(dx);       cudaMalloc(&dx,    (size_t) dim * 4);
         if (d_acc) cudaFree(d_acc); cudaMalloc(&d_acc, (size_t) dim * 4);
         cdim = dim;
     }
-    if (intermed > cint) {
-        if (d_gate) cudaFree(d_gate); cudaMalloc(&d_gate, (size_t) intermed * 4);
-        if (d_up) cudaFree(d_up);     cudaMalloc(&d_up,   (size_t) intermed * 4);
-        if (d_h) cudaFree(d_h);       cudaMalloc(&d_h,    (size_t) intermed * 4);
-        cint = intermed;
-    }
+    if (hn > chn) { if (d_h) cudaFree(d_h); cudaMalloc(&d_h, hn * 4); chn = hn; }
 
     uint8_t *gdw = upload_weight(gate_w, gate_bytes);
     uint8_t *udw = upload_weight(up_w, up_bytes);
@@ -578,10 +741,10 @@ extern "C" void aspida_gpu_moe_experts(
     size_t g_bpe = (size_t)(gate_bytes / n_exp), u_bpe = (size_t)(up_bytes / n_exp),
            d_bpe = (size_t)(down_bytes / n_exp);
 
-    // Segment profiler (env ASPIDA_MOE_PROF): wall time per phase with a sync
-    // after each, accumulated across calls, dumped every 36*20 calls (~20 tok).
+    // Segment profiler (env ASPIDA_MOE_PROF): wall time per phase, sync after
+    // each, accumulated across calls, dumped every 36*20 calls (~20 tokens).
     static int prof = getenv("ASPIDA_MOE_PROF") ? 1 : 0;
-    static double t_h2d = 0, t_gu = 0, t_swi = 0, t_down = 0, t_shared = 0, t_d2h = 0;
+    static double t_h2d = 0, t_gu = 0, t_down = 0, t_d2h = 0;
     static long n_calls = 0;
     struct timespec t0, t1;
     #define SEG(acc, ...) do { if (prof) { cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t0); } \
@@ -589,40 +752,32 @@ extern "C" void aspida_gpu_moe_experts(
         if (prof) { cudaDeviceSynchronize(); clock_gettime(CLOCK_MONOTONIC, &t1); \
             acc += (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9; } } while (0)
 
-    int gblk = (dim + 255) / 256, iblk = (intermed + 255) / 256;
-    SEG(t_h2d, {
-        cudaMemcpy(dx, x, (size_t) dim * 4, cudaMemcpyHostToDevice);
-        cudaMemset(d_acc, 0, (size_t) dim * 4);
-    });
+    if (top_k > MOE_MAXK) top_k = MOE_MAXK;   // route struct capacity (top_k is 8)
 
-    // Selected experts — gate/up (3D slice e*bpe) -> SwiGLU -> down -> combine.
-    for (int k = 0; k < top_k; ++k) {
-        int e = top_idx[k];
-        SEG(t_gu, {
-            launch_matvec(gdw + (size_t) e * g_bpe, gate_kind, dim, intermed, dx, d_gate);
-            launch_matvec(udw + (size_t) e * u_bpe, up_kind,   dim, intermed, dx, d_up);
-        });
-        SEG(t_swi, k_swiglu<<<iblk, 256>>>(d_gate, d_up, d_h, intermed));
-        SEG(t_down, {
-            launch_matvec(ddw + (size_t) e * d_bpe, down_kind, intermed, dim, d_h, d_y);
-            k_axpy<<<gblk, 256>>>(d_acc, top_w[k], d_y, dim);
-        });
+    // Routing packed into kernel params; slot MOE_MAXK = shared expert gate.
+    MoeRoute route;
+    for (int k = 0; k < top_k; ++k) { route.idx[k] = top_idx[k]; route.w[k] = top_w[k]; }
+    for (int k = top_k; k < MOE_MAXK; ++k) { route.idx[k] = 0; route.w[k] = 0.f; }
+    float shared_gate = 1.0f;
+    if (gate_inp_len > 1 && shared_gate_inp) {
+        float gs = 0.f;
+        for (int d = 0; d < dim; ++d) gs += shared_gate_inp[d] * x[d];
+        shared_gate = 1.0f / (1.0f + expf(-gs));
     }
+    route.w[MOE_MAXK] = shared_gate;
 
-    // Shared expert (+ optional sigmoid gate; gate dot on host over dim).
-    SEG(t_shared, {
-        launch_matvec(sgdw, shg_kind, dim, intermed, dx, d_gate);
-        launch_matvec(sudw, shu_kind, dim, intermed, dx, d_up);
-        k_swiglu<<<iblk, 256>>>(d_gate, d_up, d_h, intermed);
-        launch_matvec(sddw, shd_kind, intermed, dim, d_h, d_y);
-        float shared_gate = 1.0f;
-        if (gate_inp_len > 1 && shared_gate_inp) {
-            float gs = 0.f;
-            for (int d = 0; d < dim; ++d) gs += shared_gate_inp[d] * x[d];
-            shared_gate = 1.0f / (1.0f + expf(-gs));
-        }
-        k_axpy<<<gblk, 256>>>(d_acc, shared_gate, d_y, dim);
-    });
+    SEG(t_h2d, cudaMemcpy(dx, x, (size_t) dim * 4, cudaMemcpyHostToDevice));
+
+    // Fused: 1 launch for all (top_k+1) experts' gate+up+SwiGLU, 1 launch for
+    // all down projections + weighted combine (replaces ~30 launches/layer).
+    int w1 = (top_k + 1) * intermed, b1 = (w1 * 32 + 255) / 256;
+    int b2 = (dim * 32 + 255) / 256;
+    SEG(t_gu, k_moe_gu<<<b1, 256>>>(gdw, udw, sgdw, sudw, dx, d_h, route, top_k,
+                                    dim, intermed, (long) g_bpe, (long) u_bpe,
+                                    gate_kind, up_kind, shg_kind, shu_kind));
+    SEG(t_down, k_moe_down<<<b2, 256>>>(ddw, sddw, d_h, d_acc, route, top_k,
+                                        intermed, dim, (long) d_bpe,
+                                        down_kind, shd_kind));
 
     SEG(t_d2h, cudaMemcpy(y, d_acc, (size_t) dim * 4, cudaMemcpyDeviceToHost));
     #undef SEG
@@ -630,13 +785,12 @@ extern "C" void aspida_gpu_moe_experts(
     if (prof && ++n_calls % (36 * 20) == 0) {
         fprintf(stderr,
             "[MOEPROF] dims: dim=%d intermed=%d top_k=%d kinds g/u/d=%d/%d/%d "
-            "shg/shu/shd=%d/%d/%d bpe g/u/d=%zu/%zu/%zu\n"
-            "[MOEPROF] per-layer-call ms: h2d=%.3f gate+up=%.3f swiglu=%.3f "
-            "down+axpy=%.3f shared=%.3f d2h=%.3f (n=%ld)\n",
+            "shg/shu/shd=%d/%d/%d\n"
+            "[MOEPROF] per-layer-call ms: h2d=%.3f gu_fused=%.3f down_fused=%.3f "
+            "d2h=%.3f (n=%ld)\n",
             dim, intermed, top_k, gate_kind, up_kind, down_kind,
-            shg_kind, shu_kind, shd_kind, g_bpe, u_bpe, d_bpe,
-            1e3 * t_h2d / n_calls, 1e3 * t_gu / n_calls, 1e3 * t_swi / n_calls,
-            1e3 * t_down / n_calls, 1e3 * t_shared / n_calls, 1e3 * t_d2h / n_calls,
-            n_calls);
+            shg_kind, shu_kind, shd_kind,
+            1e3 * t_h2d / n_calls, 1e3 * t_gu / n_calls,
+            1e3 * t_down / n_calls, 1e3 * t_d2h / n_calls, n_calls);
     }
 }
