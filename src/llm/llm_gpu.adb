@@ -37,6 +37,15 @@ package body LLM_GPU is
 
    function To_MM is new Ada.Unchecked_Conversion (System.Address, MatMul_Fn);
 
+   --  Matches  void aspida_gpu_dense_matvec(const void* w, long wbytes,
+   --                  int in, int out, const float* x, float* y)
+   type Dense_Fn is access procedure
+     (W : System.Address; WB : Interfaces.C.long;
+      In_D : int; Out_D : int; X : System.Address; Y : System.Address)
+     with Convention => C;
+
+   function To_Dense is new Ada.Unchecked_Conversion (System.Address, Dense_Fn);
+
    --  Matches  void aspida_gpu_free_weight(const void* w)
    type Free_Fn is access procedure (W : System.Address)
      with Convention => C;
@@ -45,6 +54,7 @@ package body LLM_GPU is
 
    Fn        : MatVec_Fn := null;
    MM_Fn     : MatMul_Fn := null;
+   Dense_Fn_P : Dense_Fn := null;
    Free_W_Fn : Free_Fn := null;
 
    --  The lazy dlopen must run exactly once even when several handler tasks
@@ -115,6 +125,16 @@ package body LLM_GPU is
                end if;
             end;
             declare
+               CS : chars_ptr := New_String ("aspida_gpu_dense_matvec");
+               A  : System.Address;
+            begin
+               A := C_dlsym (H, CS);
+               Free (CS);
+               if A /= System.Null_Address then
+                  Dense_Fn_P := To_Dense (A);
+               end if;
+            end;
+            declare
                CS : chars_ptr := New_String ("aspida_gpu_free_weight");
                A  : System.Address;
             begin
@@ -157,6 +177,24 @@ package body LLM_GPU is
       Init;
       return MM_Fn /= null;
    end Has_MatMul;
+
+   function Has_Dense return Boolean is
+   begin
+      Init;
+      return Dense_Fn_P /= null;
+   end Has_Dense;
+
+   procedure Dense_MatVec
+     (W_Addr  : System.Address;
+      W_Bytes : Long_Long_Integer;
+      In_Dim  : Integer;
+      Out_Dim : Integer;
+      X       : System.Address;
+      Y       : System.Address) is
+   begin
+      Dense_Fn_P (W_Addr, Interfaces.C.long (W_Bytes),
+                  int (In_Dim), int (Out_Dim), X, Y);
+   end Dense_MatVec;
 
    procedure MatMul
      (W_Addr  : System.Address;

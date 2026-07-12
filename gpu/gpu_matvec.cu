@@ -422,6 +422,31 @@ static inline void launch_matvec(const uint8_t *dw, int kind, int in, int out,
     else                k_q2k_w<<<blocks, TPB>>>(dw, dx, dy, in, out);
 }
 
+// Dense F32 matvec (the LM head + token-embedding endpoints bypass the K-quant
+// path). y[out] = W[out,in] . x[in], W row-major dense float. Warp-per-row,
+// weight cached resident by host pointer (same g_wcache). One H2D + one D2H.
+__global__ void k_dense_mv(const float *__restrict__ w, const float *__restrict__ x,
+                           float *__restrict__ y, int in, int out) {
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (row >= out) return;
+    const float *r = w + (size_t) row * in;
+    float acc = 0.f;
+    for (int i = lane; i < in; i += 32) acc += r[i] * x[i];
+    acc = warp_reduce(acc);
+    if (lane == 0) y[row] = acc;
+}
+extern "C" void aspida_gpu_dense_matvec(const void *w, long wbytes, int in_dim,
+                                        int out_dim, const float *x, float *y) {
+    static float *dx = nullptr, *dy = nullptr; static long cx = 0, cy = 0;
+    uint8_t *dw = upload_weight(w, wbytes);
+    if (in_dim > cx)  { if (dx) cudaFree(dx); cudaMalloc(&dx, (size_t) in_dim * 4);  cx = in_dim; }
+    if (out_dim > cy) { if (dy) cudaFree(dy); cudaMalloc(&dy, (size_t) out_dim * 4); cy = out_dim; }
+    cudaMemcpy(dx, x, (size_t) in_dim * 4, cudaMemcpyHostToDevice);
+    const int TPB = 256, WPB = TPB / 32;
+    k_dense_mv<<<(out_dim + WPB - 1) / WPB, TPB>>>((const float *) dw, dx, dy, in_dim, out_dim);
+    cudaMemcpy(y, dy, (size_t) out_dim * 4, cudaMemcpyDeviceToHost);
+}
+
 // Router + stable-softmax + greedy top-k stay on the CPU (they are tiny, and
 // the router is often non-K-quant in mixed quants like Q4_K_M): LLM_MoE.Forward
 // computes top_idx (0-based) + renormalised top_w and hands them here. This

@@ -3,10 +3,33 @@
 ---------------------------------------------------------------------
 
 with LLM_RMSNorm;
+with Ada.Real_Time;
+with Ada.Text_IO;
+with Ada.Environment_Variables;
 
 package body LLM_Qwen_Blk is
 
    use LLM_Tensor;
+
+   --  Lightweight decode profiler (env ASPIDA_PROFILE). Accumulates attention
+   --  vs MoE time across Step calls and prints per-token averages every 100
+   --  tokens' worth of block calls, then resets.
+   Prof_On   : constant Boolean := Ada.Environment_Variables.Exists ("ASPIDA_PROFILE");
+   Prof_Attn : Duration := 0.0;
+   Prof_MoE  : Duration := 0.0;
+   Prof_N    : Natural  := 0;   -- Step (block) calls since last dump
+
+   procedure Prof_Tick is
+   begin
+      Prof_N := Prof_N + 1;
+      if Prof_N >= 3600 then      -- ~100 tokens at 36 blocks/token
+         Ada.Text_IO.Put_Line
+           (Ada.Text_IO.Standard_Error,
+            "[PROF blk] per-token: attn=" & Duration'Image (Prof_Attn / 100.0)
+            & "s moe=" & Duration'Image (Prof_MoE / 100.0) & "s");
+         Prof_Attn := 0.0; Prof_MoE := 0.0; Prof_N := 0;
+      end if;
+   end Prof_Tick;
 
    --  Dispatch the post-attention FFN: routed MoE or dense SwiGLU.
    function FFN (B : Qwen_Block; X : Tensor) return Tensor is
@@ -99,16 +122,22 @@ package body LLM_Qwen_Blk is
    function Step (B : Qwen_Block; St : in out Block_State; X : Tensor)
       return Tensor
    is
+      use type Ada.Real_Time.Time;
       Dim      : constant Integer := B.Dim;
       H        : Tensor := X;   -- residual stream [1, dim]
       Norm_X   : constant Tensor := LLM_RMSNorm.Forward (X, B.Attn_Norm_W);
       Attn_Out : Tensor;
+      TS       : Ada.Real_Time.Time;
    begin
       --  Step 1: pre-attention RMSNorm + (attention | delta-net) + residual.
+      TS := Ada.Real_Time.Clock;
       if B.Is_Full_Attn then
          Attn_Out := LLM_FullAttn.Step (B.Full, St.Full_St, Norm_X);
       else
          Attn_Out := LLM_DeltaNet_Blk.Step (B.DNet, St.DNet_St, Norm_X);
+      end if;
+      if Prof_On then
+         Prof_Attn := Prof_Attn + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
       end if;
       for I in 1 .. Dim loop
          Set_Flat (H, I, Get_Flat (H, I) + Get_Flat (Attn_Out, I));
@@ -117,13 +146,21 @@ package body LLM_Qwen_Blk is
       --  Step 2: post-attention RMSNorm + MoE + residual.
       declare
          NR      : constant Tensor := LLM_RMSNorm.Forward (H, B.Post_Attn_Norm_W);
-         Moe_Row : constant Tensor := FFN (B, NR);
+         Moe_Row : Tensor;
       begin
+         TS := Ada.Real_Time.Clock;
+         Moe_Row := FFN (B, NR);
+         if Prof_On then
+            Prof_MoE := Prof_MoE + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
+         end if;
          for I in 1 .. Dim loop
             Set_Flat (H, I, Get_Flat (H, I) + Get_Flat (Moe_Row, I));
          end loop;
       end;
 
+      if Prof_On then
+         Prof_Tick;
+      end if;
       return H;
    end Step;
 

@@ -4,6 +4,7 @@
 
 with Ada.Text_IO;
 with Ada.Environment_Variables;
+with Ada.Real_Time;
 with Ada.Numerics.Elementary_Functions;
 with Ada.Strings.Fixed;
 with Ada.Strings;
@@ -15,6 +16,7 @@ with LLM_Dequant; use LLM_Dequant;
 with LLM_Tensor;  use LLM_Tensor;
 with LLM_MoE;
 with LLM_Dense_FFN;
+with LLM_GPU;
 with LLM_Step_Lock;
 with LLM_RMSNorm;
 with LLM_FullAttn;
@@ -26,6 +28,24 @@ with LLM_Chat_Parser;
 package body LLM_Qwen is
 
    use Ada.Strings.Fixed;
+
+   --  Decode profiler (env ASPIDA_PROFILE): block-loop vs LM-head per token.
+   Prof2_On   : constant Boolean := Ada.Environment_Variables.Exists ("ASPIDA_PROFILE");
+   Prof2_Loop : Duration := 0.0;
+   Prof2_Head : Duration := 0.0;
+   Prof2_N    : Natural  := 0;
+
+   procedure Prof2_Tick is
+   begin
+      Prof2_N := Prof2_N + 1;
+      if Prof2_N >= 100 then
+         Ada.Text_IO.Put_Line
+           (Ada.Text_IO.Standard_Error,
+            "[PROF drv] per-token: blocks=" & Duration'Image (Prof2_Loop / 100.0)
+            & "s lm_head=" & Duration'Image (Prof2_Head / 100.0) & "s");
+         Prof2_Loop := 0.0; Prof2_Head := 0.0; Prof2_N := 0;
+      end if;
+   end Prof2_Tick;
 
    --  Default Chat_Sink.Emit / Tick forward to On_Text so a sink that
    --  overrides only On_Text still receives text pieces (legacy Token_Sink
@@ -551,19 +571,45 @@ package body LLM_Qwen is
       --  One forward step under the shared step lock, released between steps
       --  (incl. on exception) so concurrent generations interleave per token.
       function Decode (Embed_Row : Integer) return Tensor is
-         H : Tensor := New_Tensor ([1, Dim]);
+         use type Ada.Real_Time.Time;
+         H  : Tensor := New_Tensor ([1, Dim]);
+         TS : Ada.Real_Time.Time;
       begin
          LLM_Step_Lock.Acquire;
          for D in 1 .. Dim loop
             Set_Flat (H, D, Get (M.Token_Emb, [Embed_Row, D]));
          end loop;
+         TS := Ada.Real_Time.Clock;
          for I in 1 .. M.N_Blocks loop
             H := LLM_Qwen_Blk.Step (M.Blocks (I).all, Cache (I), H);
          end loop;
+         if Prof2_On then
+            Prof2_Loop := Prof2_Loop + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
+         end if;
          declare
             Normed : constant Tensor := LLM_RMSNorm.Forward (H, M.Final_Norm);
-            R      : constant Tensor := MatVec_Rows (M.LM_Head, Normed);
+            R      : Tensor;
          begin
+            TS := Ada.Real_Time.Clock;
+            --  LM head is a dense F32 [vocab, dim] GEMV — offload it to the
+            --  resident GPU dense matvec when the shim supports it, else the
+            --  CPU pooled path. (The token embedding stays a cheap host gather.)
+            if LLM_GPU.Has_Dense then
+               R := New_Tensor ([1, Shape (M.LM_Head) (1)]);
+               LLM_GPU.Dense_MatVec
+                 (W_Addr  => Data_Address (M.LM_Head),
+                  W_Bytes => Long_Long_Integer (Numel (M.LM_Head)) * 4,
+                  In_Dim  => Shape (M.LM_Head) (2),
+                  Out_Dim => Shape (M.LM_Head) (1),
+                  X       => Data_Address (Normed),
+                  Y       => Data_Address (R));
+            else
+               R := MatVec_Rows (M.LM_Head, Normed);
+            end if;
+            if Prof2_On then
+               Prof2_Head := Prof2_Head + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
+               Prof2_Tick;
+            end if;
             LLM_Step_Lock.Release;
             return R;
          end;

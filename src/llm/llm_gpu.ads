@@ -41,6 +41,20 @@ package LLM_GPU is
    --  unconditionally; it is always safe). Idempotent for a given Addr.
    procedure Free_Weight (Addr : System.Address);
 
+   --  True iff the loaded shim exports the dense-F32 matvec entry point.
+   function Has_Dense return Boolean;
+
+   --  Dense F32 matvec: y[Out] = W[Out,In] . x[In], W a row-major dense float
+   --  tensor at W_Addr (W_Bytes = Out*In*4). For the endpoints that bypass the
+   --  K-quant path (LM head, token embedding). Weight cached resident by ptr.
+   procedure Dense_MatVec
+     (W_Addr  : System.Address;
+      W_Bytes : Long_Long_Integer;
+      In_Dim  : Integer;
+      Out_Dim : Integer;
+      X       : System.Address;
+      Y       : System.Address);
+
    --  True iff the loaded shim also exports the batched matmul entry point.
    function Has_MatMul return Boolean;
 
