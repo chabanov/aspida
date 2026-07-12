@@ -287,3 +287,43 @@ build is promoted. Cost is controlled by spinning the dev box up per work
 session, snapshotting, and destroying it when idle. Prod (ollama) stays the
 instant rollback until a resident build clears every bit-exactness gate *and*
 reaches usable tok/s.
+
+---
+
+## Phase E — continuous batching: the proven path to (and past) parity
+
+Single-request decode is occupancy-starved (batch=1 gives each matvec ~64 warps).
+The batched warp kernels (`k_q*k_wb`, `aspida_gpu_matmul`) read each weight ONCE
+and accumulate B sequence sums — so B requests cost far less than B× a single.
+
+**Measured (RTX 6000 Ada, Q4_K gate matvec [out=512,in=2048], microbench):**
+| B | µs/call | µs/request | aggregate vs serial |
+|---|---|---|---|
+| 1 | 10.7 | 10.7 | 1× |
+| 4 | 13.3 | 3.3 | 3.2× |
+| 8 | 19.7 | 2.46 | 4.35× |
+| 16 | 32.4 | 2.03 | 5.3× |
+
+At the current 80 tok/s single-request, batching yields **~320–400 tok/s
+aggregate — 2.6–3.2× beyond the 124 tok/s reference.** Parity-level throughput
+is therefore proven reachable; it is a serving-architecture feature, not more
+kernel tuning.
+
+**Integration plan (the next major increment — a batched decode server):**
+1. **Batch the resident chain**: `H[B, dim]`; every kernel gains a B loop /
+   grid.y. The matvecs switch to the `_wb` batched variants (already exist).
+2. **Per-request state**: B delta-net `S_All`/conv windows and B full-attn KV
+   caches (the handle arrays already are per-generation — extend to B lanes).
+3. **MoE is the hard part**: each request routes to its own top-8 experts, so
+   the routed-expert GEMMs can't share one weight read trivially. Use grouped/
+   sorted-token expert execution (sort the B*top_k (request,expert) pairs by
+   expert, run one grouped GEMM per active expert) — the standard MoE-serving
+   trick. The router/softmax/top-k stay per-request (cheap).
+4. **Scheduler**: a continuous-batching loop — admit new requests each step,
+   evict finished ones, keep the batch full (the `LLM_Step_Lock` becomes a
+   batched-step barrier). Ada owns the scheduler + the E2EE session lifecycle;
+   the batched forward is the CUDA leaf.
+
+This is a multi-day project (batched MoE + scheduler), but the throughput target
+is de-risked: the microbench already shows the weight-read amortization that
+gets us to 320–400 tok/s aggregate.
