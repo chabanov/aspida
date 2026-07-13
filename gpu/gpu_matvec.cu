@@ -2363,6 +2363,7 @@ struct PScr {
     MoeRoute *droute;
     int *rows;
     int *mg_pos, *mg_k, *mg_cnt;   // expert-grouped MoE: positions/slots per expert + counts
+    float *dmoe;                   // grouped-down per-(position,slot) outputs [P][MOE_MAXK+1][dim]
     cudaStream_t stream;
 };
 static PScr g_ps[PMAXLANE];
@@ -2390,6 +2391,7 @@ static void chain_alloc_p(void) {
         if (g_mx_nexp){ cudaMalloc(&S.mg_pos, (size_t)g_mx_nexp*Pd*4);
                         cudaMalloc(&S.mg_k, (size_t)g_mx_nexp*Pd*4);
                         cudaMalloc(&S.mg_cnt, (size_t)g_mx_nexp*4); }
+        cudaMalloc(&S.dmoe, Pd*(size_t)(MOE_MAXK+1)*dim*4);
         cudaStreamCreate(&S.stream);
     }
     pch_inited=1;
@@ -2483,6 +2485,77 @@ __global__ void k_moe_gu_grouped(
     }
 }
 
+// Grouped down projection on tensor cores. Like k_moe_gu_grouped but the input
+// is the SwiGLU output h_b[p][slot] (K=intermed) and the output goes to a
+// per-(position,slot) buffer d_buf[p][slot][dim] — NOT summed here, so the
+// cross-expert combine can run in a fixed, deterministic order afterwards.
+__global__ void k_moe_down_grouped(
+    const uint8_t *__restrict__ ddw, const float *__restrict__ h_b, float *__restrict__ d_buf,
+    const int *__restrict__ mg_pos, const int *__restrict__ mg_k, const int *__restrict__ mg_cnt,
+    long d_bpe, int intermed, int dim, int Pstride, int top_k, int P, int mode) {
+    int e = blockIdx.z;
+    int cnt = (mode == 0) ? mg_cnt[e] : P;
+    int m0 = blockIdx.y * 16; if (m0 >= cnt) return;
+    int n0 = blockIdx.x * 16;
+    int lane = threadIdx.x & 31;
+    int nb = intermed / 32; size_t bpr = (size_t) nb * 34;
+    const uint8_t *W = (mode == 0) ? ddw + (size_t) e * d_bpe : ddw;
+    __shared__ half As[16 * 32];
+    __shared__ half Bs[32 * 16];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cd;
+    nvcuda::wmma::fill_fragment(cd, 0.0f);
+    for (int kb = 0; kb < nb; ++kb) {
+        for (int m = 0; m < 16; ++m) {
+            int gm = m0 + m; float hv = 0.0f;
+            if (gm < cnt) {
+                int p = (mode == 0) ? mg_pos[(size_t) e * Pstride + gm] : gm;
+                int k = (mode == 0) ? mg_k[(size_t) e * Pstride + gm] : top_k;
+                hv = h_b[((size_t) p * (MOE_MAXK + 1) + k) * intermed + kb * 32 + lane];
+            }
+            As[(size_t) m * 32 + lane] = __float2half(hv);
+        }
+        for (int n = 0; n < 16; ++n) {
+            const uint8_t *bl = W + (size_t) (n0 + n) * bpr + (size_t) kb * 34;
+            float d = f16(bl); const int8_t *q = (const int8_t *) (bl + 2);
+            Bs[(size_t) lane * 16 + n] = __float2half(d * (float) q[lane]);
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int k16 = 0; k16 < 2; ++k16) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> af;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major> bf;
+            nvcuda::wmma::load_matrix_sync(af, As + k16 * 16, 32);
+            nvcuda::wmma::load_matrix_sync(bf, Bs + (size_t) k16 * 16 * 16, 16);
+            nvcuda::wmma::mma_sync(cd, af, bf, cd);
+        }
+        __syncwarp();
+    }
+    __shared__ float Cs[16 * 16];
+    nvcuda::wmma::store_matrix_sync(Cs, cd, 16, nvcuda::wmma::mem_row_major);
+    for (int idx = lane; idx < 256; idx += 32) {
+        int m = idx / 16, n = idx % 16, gm = m0 + m;
+        if (gm < cnt && (n0 + n) < dim) {
+            int p = (mode == 0) ? mg_pos[(size_t) e * Pstride + gm] : gm;
+            int k = (mode == 0) ? mg_k[(size_t) e * Pstride + gm] : top_k;
+            d_buf[((size_t) p * (MOE_MAXK + 1) + k) * dim + n0 + n] = Cs[idx];
+        }
+    }
+}
+
+// Deterministic expert combine: y[p] = sum_k route.w[k] * d_buf[p][k] (routed,
+// ascending k) + route.w[shared] * d_buf[p][shared]. Fixed order → bit-stable.
+__global__ void k_moe_combine(const float *__restrict__ d_buf, const MoeRoute *__restrict__ route_b,
+                              float *__restrict__ y_b, int top_k, int dim, int P) {
+    int p = blockIdx.y; if (p >= P) return;
+    int d = blockIdx.x * blockDim.x + threadIdx.x; if (d >= dim) return;
+    const MoeRoute *r = route_b + p;
+    const float *D = d_buf + (size_t) p * (MOE_MAXK + 1) * dim;
+    float acc = 0.f;
+    for (int k = 0; k < top_k; ++k) acc += r->w[k] * D[(size_t) k * dim + d];
+    acc += r->w[MOE_MAXK] * D[(size_t) top_k * dim + d];
+    y_b[(size_t) p * dim + d] = acc;
+}
+
 // Prefill P positions [pos_start .. pos_start+P-1] of ONE generation on LANE
 // `lane`, updating its resident per-layer state (handles[li]); return the
 // LM-head logits of the LAST position in last_logits (what the caller samples).
@@ -2500,6 +2573,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     MoeRoute *pdroute=S.droute;
     int *p_rows=S.rows;
     int *pmg_pos=S.mg_pos,*pmg_k=S.mg_k,*pmg_cnt=S.mg_cnt;
+    float *pdmoe=S.dmoe;
     int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=S.stream;
     //  Opt-in per-phase profiler (env ASPIDA_PREFILL_PROF): splits GPU time
     //  into the attention/dnet block vs the MoE block, aggregated over layers.
@@ -2557,21 +2631,33 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             k_moe_route_b<<<P,256,0,st>>>(pdrl, pnxb, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, pdroute, P);
             int w1=(L.top_k+1)*L.intermed;
             int b1b=((size_t)P*w1*32+255)/256, b2b=((size_t)P*dim*32+255)/256;
-            if (L.gk==5 && L.uk==5 && L.sgk==5 && L.suk==5 && pmg_cnt) {
-                //  Expert-grouped tensor-core gate+up: one GEMM per expert over
-                //  the chunk positions that routed to it (weight read once).
+            bool grouped = (L.gk==5 && L.uk==5 && L.sgk==5 && L.suk==5 &&
+                            L.dk==5 && L.sdk==5 && pmg_cnt);
+            if (grouped) {
+                //  Expert-grouped tensor-core MoE: bucket positions by expert
+                //  (once), then one GEMM per expert reading its weight once.
                 cudaMemsetAsync(pmg_cnt, 0, (size_t)L.n_exp*4, st);
                 k_moe_group<<<(P+255)/256,256,0,st>>>(pdroute, P, L.top_k, pmg_pos, pmg_k, pmg_cnt, PCH);
+                //  gate+up+SwiGLU -> h_b[p][slot]
                 dim3 grR((L.intermed+15)/16, (PCH+15)/16, L.n_exp);
                 k_moe_gu_grouped<<<grR,32,0,st>>>(L.gdw,L.udw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
                     L.g_bpe,L.u_bpe, dim,L.intermed, PCH, L.top_k, P, 0);
-                dim3 grS((L.intermed+15)/16, (P+15)/16, 1);
-                k_moe_gu_grouped<<<grS,32,0,st>>>(L.sgdw,L.sudw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
+                dim3 grSh((L.intermed+15)/16, (P+15)/16, 1);
+                k_moe_gu_grouped<<<grSh,32,0,st>>>(L.sgdw,L.sudw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
                     0,0, dim,L.intermed, PCH, L.top_k, P, 1);
+                //  down -> per-(position,slot) d_buf, then deterministic combine
+                dim3 grD((dim+15)/16, (PCH+15)/16, L.n_exp);
+                k_moe_down_grouped<<<grD,32,0,st>>>(L.ddw, pdhb, pdmoe, pmg_pos,pmg_k,pmg_cnt,
+                    L.d_bpe, L.intermed, dim, PCH, L.top_k, P, 0);
+                dim3 grDs((dim+15)/16, (P+15)/16, 1);
+                k_moe_down_grouped<<<grDs,32,0,st>>>(L.sddw, pdhb, pdmoe, pmg_pos,pmg_k,pmg_cnt,
+                    0, L.intermed, dim, PCH, L.top_k, P, 1);
+                dim3 grC((dim+255)/256, P, 1);
+                k_moe_combine<<<grC,256,0,st>>>(pdmoe, pdroute, paob, L.top_k, dim, P);
             } else {
                 k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
+                k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
             }
-            k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
             k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
             if (pprof) { cudaEventRecord(pe2, st); cudaEventSynchronize(pe2);
                 float m=0; cudaEventElapsedTime(&m, pe1, pe2); acc_moe += m; }
