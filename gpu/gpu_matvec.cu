@@ -1762,6 +1762,15 @@ static int ch_inited = 0;
 static int *g_d_row = nullptr, *g_d_pos = nullptr;   // device-side per-token inputs
 static const int *g_handles = nullptr;               // per-generation state handles
 static cudaStream_t g_cstream = 0;
+//  Stream priority: DECODE (interactive, latency-critical) gets the highest
+//  priority, PREFILL (throughput, bursty, saturates HBM for tens of ms) the
+//  lowest — so a short decode token can slip through while a big prefill runs,
+//  instead of being stuck behind it. high=1 returns the highest-priority value
+//  (most negative on CUDA), high=0 the lowest.
+static int aspida_stream_prio(int high) {
+    int lo = 0, hi = 0; cudaDeviceGetStreamPriorityRange(&lo, &hi);
+    return high ? hi : lo;
+}
 static cudaGraph_t g_graph = nullptr;
 static cudaGraphExec_t g_gexec = nullptr;
 static int g_captured = 0;
@@ -1786,7 +1795,7 @@ static void chain_alloc(void) {
     if (g_mx_hbuf) cudaMalloc(&dhb, (size_t) g_mx_hbuf * 4);
     cudaMalloc(&droute, sizeof(MoeRoute));
     cudaMalloc(&g_d_row, 4); cudaMalloc(&g_d_pos, 4);
-    cudaStreamCreate(&g_cstream);
+    cudaStreamCreateWithPriority(&g_cstream, cudaStreamDefault, aspida_stream_prio(1));
     ch_inited = 1;
 }
 
@@ -2109,7 +2118,7 @@ static void chain_alloc_b(void) {
     cudaMalloc(&gb_rows, Bd*4); cudaMalloc(&gb_pos, Bd*4);
     cudaMalloc(&gb_Sptr, (size_t) g_chain.size() * Bd * sizeof(void*));
     cudaMalloc(&gb_histptr, (size_t) g_chain.size() * Bd * sizeof(void*));
-    cudaStreamCreate(&gb_stream);
+    cudaStreamCreateWithPriority(&gb_stream, cudaStreamDefault, aspida_stream_prio(1));
     chb_inited=1;
 }
 
@@ -2464,7 +2473,7 @@ static void chain_alloc_p(void) {
                         cudaMalloc(&S.mg_k, (size_t)g_mx_nexp*Pd*4);
                         cudaMalloc(&S.mg_cnt, (size_t)g_mx_nexp*4); }
         cudaMalloc(&S.dmoe, Pd*(size_t)(MOE_MAXK+1)*dim*4);
-        cudaStreamCreate(&S.stream);
+        cudaStreamCreateWithPriority(&S.stream, cudaStreamDefault, aspida_stream_prio(0));
     }
     pch_inited=1;
 }
