@@ -20,7 +20,12 @@ package LLM_Sampler is
       Top_K          : Integer  := 0;     -- <= 0   => no top-k cut
       Top_P          : Float    := 1.0;   -- 1.0    => no nucleus cut
       Min_P          : Float    := 0.0;   -- > 0.0  => keep prob >= Min_P*p_max
-      Repeat_Penalty : Float    := 1.0;   -- 1.0    => no penalty
+      Repeat_Penalty : Float    := 1.0;   -- 1.0    => no penalty (multiplicative)
+      --  OpenAI-style presence penalty: subtract this once from the logit of any
+      --  token already present in the recent window. Qwen3.6 recommends 1.5 for
+      --  general/thinking tasks (0.0 for code) to curb the repetitive self-check
+      --  loops long reasoning traces fall into. 0.0 => disabled.
+      Presence_Penalty : Float  := 0.0;
       Repeat_Last_N  : Integer  := 64;    -- window of recent tokens penalised
       --  Minimum tokens to generate before the stop/EOS token may be sampled.
       --  The generation loop masks the stop-token logits to -inf until this

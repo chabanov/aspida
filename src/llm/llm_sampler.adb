@@ -62,7 +62,9 @@ package body LLM_Sampler is
       --  Fast greedy path: temperature <= 0 with no repeat penalty is the common
       --  case. Argmax straight over the logits tensor — skips the ~1MB heap
       --  buffer and the element-wise copy that cost ~1ms/token at vocab = 248k.
-      if S.P.Temperature <= 0.0 and then S.P.Repeat_Penalty = 1.0 then
+      if S.P.Temperature <= 0.0 and then S.P.Repeat_Penalty = 1.0
+        and then S.P.Presence_Penalty = 0.0
+      then
          declare
             --  Overlay the contiguous logit data directly (the forward pass
             --  wrote vocab floats to Data_Address) — a raw scan, no per-element
@@ -92,6 +94,25 @@ package body LLM_Sampler is
                else
                   L (R + 1) := L (R + 1) * S.P.Repeat_Penalty;
                end if;
+            end if;
+         end loop;
+      end if;
+
+      --  Presence penalty: subtract once per DISTINCT token in the window
+      --  (Recent is small, so the O(n^2) distinctness check is negligible).
+      if S.P.Presence_Penalty /= 0.0 then
+         for I in Recent'Range loop
+            if Recent (I) >= 0 and then Recent (I) + 1 <= N then
+               declare
+                  Seen : Boolean := False;
+               begin
+                  for J in Recent'First .. I - 1 loop
+                     if Recent (J) = Recent (I) then Seen := True; exit; end if;
+                  end loop;
+                  if not Seen then
+                     L (Recent (I) + 1) := L (Recent (I) + 1) - S.P.Presence_Penalty;
+                  end if;
+               end;
             end if;
          end loop;
       end if;

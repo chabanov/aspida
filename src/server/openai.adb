@@ -41,11 +41,15 @@ package body OpenAI is
          --  that silently truncates normal answers.
          R.Max_Tokens := JSON.As_Int (JSON.Get (V, "max_tokens"), 1_000_000);
          R.Stream     := JSON.As_Bool (JSON.Get (V, "stream"), False);
-         --  Sampling: honour OpenAI fields (temperature default 1.0, top_p 1.0).
-         R.Params.Temperature := JSON.As_Float (JSON.Get (V, "temperature"), 1.0);
-         R.Params.Top_P       := JSON.As_Float (JSON.Get (V, "top_p"), 1.0);
-         R.Params.Top_K       := JSON.As_Int   (JSON.Get (V, "top_k"), 0);
-         R.Params.Min_P       := JSON.As_Float (JSON.Get (V, "min_p"), 0.0);
+         --  Sampling: honour OpenAI fields. Defaults are Hura / Qwen3.6-35B-A3B's
+         --  recommended production settings (temp 1.0, top_p 0.95, top_k 20,
+         --  presence_penalty 1.5) so a client that omits them still gets the
+         --  model's intended behaviour rather than raw greedy / no-cut sampling.
+         R.Params.Temperature      := JSON.As_Float (JSON.Get (V, "temperature"), 1.0);
+         R.Params.Top_P            := JSON.As_Float (JSON.Get (V, "top_p"), 0.95);
+         R.Params.Top_K            := JSON.As_Int   (JSON.Get (V, "top_k"), 20);
+         R.Params.Min_P            := JSON.As_Float (JSON.Get (V, "min_p"), 0.0);
+         R.Params.Presence_Penalty := JSON.As_Float (JSON.Get (V, "presence_penalty"), 1.5);
          R.Params.Seed        :=
            Long_Long_Integer (JSON.As_Int (JSON.Get (V, "seed"), 0));
          if JSON.Exists (JSON.Get (V, "frequency_penalty")) then

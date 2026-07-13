@@ -663,6 +663,8 @@ procedure Secure_Server is
                         if P.Top_P <= 0.0 or else P.Top_P > 1.0 then P.Top_P := 1.0; end if;
                         if P.Top_K < 0 then P.Top_K := 0; end if;
                         if P.Min_P < 0.0 or else P.Min_P > 1.0 then P.Min_P := 0.0; end if;
+                        if P.Presence_Penalty < -2.0 then P.Presence_Penalty := -2.0;
+                        elsif P.Presence_Penalty > 2.0 then P.Presence_Penalty := 2.0; end if;
                         LLM_Registry.Acquire
                           (To_String (Rq.Model), Lse, Leased, LErr);
                         if not Leased then
