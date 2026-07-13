@@ -39,7 +39,11 @@ package body Encrypting_Sink is
         (ASCII.LF & "{" &
          ASCII.LF & "  ""id"": """      & Escaped (Id)           & """," &
          ASCII.LF & "  ""name"": """    & Escaped (Name)         & """," &
-         ASCII.LF & "  ""arguments"": " & Escaped (Arguments_JS) &
+         --  arguments is a JSON STRING whose value is itself JSON; it MUST be
+         --  wrapped in quotes (like id/name above) or the Tag_Tool_Call body is
+         --  invalid JSON and the proxy's JSON.Parse drops the whole tool call
+         --  (streaming tool_calls silently vanished before this fix).
+         ASCII.LF & "  ""arguments"": """ & Escaped (Arguments_JS) & """" &
          ASCII.LF & "}");
    end Build_Tool_Call_JSON;
 
