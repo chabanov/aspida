@@ -2013,11 +2013,19 @@ __global__ void k_q8_wmma(const uint8_t *__restrict__ w, const float *__restrict
 static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
                                const float *dx, float *dy, int B, cudaStream_t st) {
     const int TPB = 256, WPB = TPB / 32; int blocks = (out + WPB - 1) / WPB;
-    //  Q8_0 (the hura weight format): tensor-core path, any B — no MAXB cap, so
-    //  chunked prefill can use a large chunk and amortize the weight read.
+    //  Q8_0 (the hura weight format): tensor-core path for LARGE batches only.
+    //  k_q8_wmma has a fixed cost (a 16x16 tile over all of `out`) independent
+    //  of B, so it only wins once B fills the 16-row M-tile — crossover ~B=12
+    //  (microbench: B=1 it's 4.7x SLOWER, B>=16 ~1.8x faster). Prefill runs at
+    //  B=PCH (256) -> WMMA; batched DECODE runs at B<=8 lanes -> the scalar
+    //  warp-per-row kernel, which is weight-read-bound and far faster at low B.
     if (kind == 5) {
-        dim3 grid((out + WMM_TN - 1) / WMM_TN, (B + WMM_TM - 1) / WMM_TM);
-        k_q8_wmma<<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
+        if (B >= 16) {
+            dim3 grid((out + WMM_TN - 1) / WMM_TN, (B + WMM_TM - 1) / WMM_TM);
+            k_q8_wmma<<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
+        } else {
+            k_q8_0_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
+        }
         return;
     }
     //  Other quant kinds keep the warp-per-row kernels, whose acc[MAXB] caps the
