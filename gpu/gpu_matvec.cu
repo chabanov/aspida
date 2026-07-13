@@ -1844,6 +1844,15 @@ extern "C" void aspida_gpu_chain_end(void) {
     g_captured = 0; g_handles = nullptr;
 }
 
+// Return (and clear) the last CUDA error as an int (0 == cudaSuccess). Called
+// by the Ada side right after a forward: a failed GPU op (e.g. an allocation
+// failure under VRAM pressure, or an illegal access) must ABORT the generation
+// and release the inference lock, not leave a handler wedged holding the lock
+// while the GPU sits idle — the shape of the 2026-07-13 prod GPU-0% wedge.
+extern "C" int aspida_gpu_last_error(void) {
+    return (int) cudaGetLastError();
+}
+
 // One decode step. First call of a generation captures the graph; the rest
 // replay it — one launch for the whole ~350-kernel token instead of 350.
 extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,

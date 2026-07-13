@@ -21,6 +21,12 @@ with System;
 
 package LLM_Qwen_GPU is
 
+   --  Raised by Chain_Forward / Chain_Forward_Batch when a GPU op fails
+   --  (allocation failure under VRAM pressure, illegal access, etc.). Aborts
+   --  the generation so the caller frees its state and releases the inference
+   --  lock instead of wedging with the GPU idle.
+   GPU_Error : exception;
+
    --  True iff the resident shim is loaded and aspida_gpu_moe_decode resolved.
    function Available return Boolean;
 

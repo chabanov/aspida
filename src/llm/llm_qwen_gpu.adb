@@ -189,6 +189,7 @@ package body LLM_Qwen_GPU is
    CBegin_Fn : Chain_Begin_Fn := null;
    CEnd_Fn   : Void_Fn := null;
    CBatch_Fn : Chain_Batch_Fn := null;
+   CErr_Fn   : Int_Fn := null;   --  aspida_gpu_last_error
 
    protected Init_Guard is
       procedure Run;
@@ -303,6 +304,8 @@ package body LLM_Qwen_GPU is
                if A /= System.Null_Address then CEnd_Fn := To_Void (A); end if;
                Look ("aspida_gpu_chain_forward_batch", A);
                if A /= System.Null_Address then CBatch_Fn := To_CBatch (A); end if;
+               Look ("aspida_gpu_last_error", A);
+               if A /= System.Null_Address then CErr_Fn := To_Int (A); end if;
             end;
          end;
       end Run;
@@ -578,6 +581,23 @@ package body LLM_Qwen_GPU is
       end if;
    end Chain_End;
 
+   --  A failed GPU op must abort this generation (so Decode_Tokens frees its
+   --  state and the handler releases the inference lock) rather than leave the
+   --  token loop running on poisoned device state or a wedged handler holding
+   --  the lock while the GPU sits idle — the 2026-07-13 prod GPU-0% wedge.
+   procedure Check_GPU is
+   begin
+      if CErr_Fn /= null then
+         declare
+            E : constant int := CErr_Fn.all;
+         begin
+            if E /= 0 then
+               raise GPU_Error with "CUDA error" & int'Image (E);
+            end if;
+         end;
+      end if;
+   end Check_GPU;
+
    procedure Chain_Forward
      (Embed_Row : Integer;
       Pos       : Integer;
@@ -585,6 +605,7 @@ package body LLM_Qwen_GPU is
       Logits    : System.Address) is
    begin
       CFwd_Fn (int (Embed_Row), int (Pos), Handles, Logits);
+      Check_GPU;
    end Chain_Forward;
 
    function Chain_Batch_Available return Boolean is
@@ -597,6 +618,7 @@ package body LLM_Qwen_GPU is
      (B : Integer; Rows, Pos, Handles, Logits : System.Address) is
    begin
       CBatch_Fn (int (B), Rows, Pos, Handles, Logits);
+      Check_GPU;
    end Chain_Forward_Batch;
 
 end LLM_Qwen_GPU;
