@@ -785,13 +785,35 @@ struct DnetState { float *S; float *hist; int qo; int kernel; };
 static std::vector<DnetState> g_dnet;
 static std::vector<int> g_dnet_free;      // freed slots for reuse
 
+//  Stream-ordered pool allocator for per-generation KV/recurrent state. The
+//  old cudaMalloc/cudaFree here were SYNCHRONOUS + DEVICE-WIDE: every request
+//  start/finish drained the entire GPU, stalling all in-flight decode/prefill
+//  lanes — the dominant cause of the concurrent-load blowup (1.3s -> 38s).
+//  cudaMallocAsync pulls from a retained pool (reuses freed blocks, no OS
+//  round-trip, no device drain) and is stream-ordered; one sync on the
+//  dedicated alloc stream makes the block usable on any stream. Frees are
+//  stream-ordered too — safe because Free_States runs at teardown, after the
+//  generation's forwards have already synced their streams (state is idle).
+static cudaStream_t g_astream = nullptr;
+static void ensure_astream() {
+    if (g_astream) return;
+    cudaStreamCreate(&g_astream);
+    cudaMemPool_t pool;
+    if (cudaDeviceGetDefaultMemPool(&pool, 0) == cudaSuccess) {
+        uint64_t thr = ~0ull;
+        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thr);
+    }
+}
+
 extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel) {
+    ensure_astream();
     DnetState st; size_t n = (size_t) nv * khd * vhd;
-    if (cudaMalloc(&st.S, n * 4) != cudaSuccess) return -1;
-    cudaMemset(st.S, 0, n * 4);
+    if (cudaMallocAsync(&st.S, n * 4, g_astream) != cudaSuccess) return -1;
+    cudaMemsetAsync(st.S, 0, n * 4, g_astream);
     size_t hn = (size_t) (kernel > 1 ? kernel - 1 : 1) * qo;
-    if (cudaMalloc(&st.hist, hn * 4) != cudaSuccess) { cudaFree(st.S); return -1; }
-    cudaMemset(st.hist, 0, hn * 4);
+    if (cudaMallocAsync(&st.hist, hn * 4, g_astream) != cudaSuccess) { cudaFreeAsync(st.S, g_astream); cudaStreamSynchronize(g_astream); return -1; }
+    cudaMemsetAsync(st.hist, 0, hn * 4, g_astream);
+    cudaStreamSynchronize(g_astream);   // block + memset ready for use on any stream
     st.qo = qo; st.kernel = kernel;
     if (!g_dnet_free.empty()) {
         int h = g_dnet_free.back(); g_dnet_free.pop_back();
@@ -806,8 +828,8 @@ extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel)
 extern "C" void aspida_gpu_dnet_free(int handle) {
     if (handle < 0 || handle >= (int) g_dnet.size()) return;
     DnetState &st = g_dnet[handle];
-    if (st.S)    { cudaFree(st.S); st.S = nullptr; }
-    if (st.hist) { cudaFree(st.hist); st.hist = nullptr; }
+    if (st.S)    { cudaFreeAsync(st.S, g_astream); st.S = nullptr; }
+    if (st.hist) { cudaFreeAsync(st.hist, g_astream); st.hist = nullptr; }
     g_dnet_free.push_back(handle);
 }
 
@@ -1050,11 +1072,13 @@ static std::vector<FattnState> g_fattn;
 static std::vector<int> g_fattn_free;     // freed slots for reuse
 
 extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
+    ensure_astream();
     FattnState st; st.max_len = max_len; st.kvd = kvd;
-    if (cudaMalloc(&st.K, (size_t) max_len * kvd * 4) != cudaSuccess) return -1;
-    if (cudaMalloc(&st.V, (size_t) max_len * kvd * 4) != cudaSuccess) { cudaFree(st.K); return -1; }
-    if (cudaMalloc(&st.scores, (size_t) nq * max_len * 4) != cudaSuccess) {
-        cudaFree(st.K); cudaFree(st.V); return -1; }
+    if (cudaMallocAsync(&st.K, (size_t) max_len * kvd * 4, g_astream) != cudaSuccess) return -1;
+    if (cudaMallocAsync(&st.V, (size_t) max_len * kvd * 4, g_astream) != cudaSuccess) { cudaFreeAsync(st.K, g_astream); cudaStreamSynchronize(g_astream); return -1; }
+    if (cudaMallocAsync(&st.scores, (size_t) nq * max_len * 4, g_astream) != cudaSuccess) {
+        cudaFreeAsync(st.K, g_astream); cudaFreeAsync(st.V, g_astream); cudaStreamSynchronize(g_astream); return -1; }
+    cudaStreamSynchronize(g_astream);   // blocks ready for use on any stream
     if (!g_fattn_free.empty()) {
         int h = g_fattn_free.back(); g_fattn_free.pop_back();
         g_fattn[h] = st; return h;
@@ -1068,9 +1092,9 @@ extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
 extern "C" void aspida_gpu_fattn_free(int handle) {
     if (handle < 0 || handle >= (int) g_fattn.size()) return;
     FattnState &st = g_fattn[handle];
-    if (st.K)      { cudaFree(st.K); st.K = nullptr; }
-    if (st.V)      { cudaFree(st.V); st.V = nullptr; }
-    if (st.scores) { cudaFree(st.scores); st.scores = nullptr; }
+    if (st.K)      { cudaFreeAsync(st.K, g_astream); st.K = nullptr; }
+    if (st.V)      { cudaFreeAsync(st.V, g_astream); st.V = nullptr; }
+    if (st.scores) { cudaFreeAsync(st.scores, g_astream); st.scores = nullptr; }
     g_fattn_free.push_back(handle);
 }
 
