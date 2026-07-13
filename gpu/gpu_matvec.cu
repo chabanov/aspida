@@ -2020,7 +2020,13 @@ static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
     //  B=PCH (256) -> WMMA; batched DECODE runs at B<=8 lanes -> the scalar
     //  warp-per-row kernel, which is weight-read-bound and far faster at low B.
     if (kind == 5) {
-        if (B >= 16) {
+        if (B == 1) {
+            //  Single-lane decode: k_q8_0_wb declares acc[MAXB] (32 regs)
+            //  regardless of B, which tanks occupancy at B=1 (213 vs 768 GB/s
+            //  measured). The single-vector kernel has no acc array and hits
+            //  ~80-100% of peak bandwidth — 3.6x faster, bit-identical.
+            k_q8_0_w<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out);
+        } else if (B >= 16) {
             dim3 grid((out + WMM_TN - 1) / WMM_TN, (B + WMM_TM - 1) / WMM_TM);
             k_q8_wmma<<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
         } else {
@@ -2090,6 +2096,15 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
     if (B < 1) return; if (B > BMAX) B = BMAX;
     chain_alloc_b();
     int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=gb_stream;
+    //  Opt-in decode profiler (env ASPIDA_DEC_PROF): per-phase GPU time summed
+    //  over layers, printed every 50 tokens. Per-phase syncs perturb wall so
+    //  measurement-only. Zero cost when unset.
+    static int dprof = getenv("ASPIDA_DEC_PROF") ? 1 : 0;
+    static cudaEvent_t dpa=nullptr,dpb=nullptr;
+    static double a_attn=0,a_moe=0,a_lm=0; static long a_n=0;
+    double l_attn=0,l_moe=0,l_lm=0;
+    if (dprof && !dpa) { cudaEventCreate(&dpa); cudaEventCreate(&dpb); }
+    #define DSEG(acc) do{ if(dprof){ cudaEventRecord(dpb,st); cudaEventSynchronize(dpb); float _m=0; cudaEventElapsedTime(&_m,dpa,dpb); (acc)+=_m; cudaEventRecord(dpa,st);} }while(0)
     cudaMemcpy(gb_rows, rows, (size_t)B*4, cudaMemcpyHostToDevice);
     cudaMemcpy(gb_pos, pos, (size_t)B*4, cudaMemcpyHostToDevice);
     //  Per-lane delta-net S pointers for every layer, assembled once (the host
@@ -2108,6 +2123,7 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
     cudaMemcpyAsync(gb_histptr, hHptr, (size_t) NL * B * sizeof(void*),
                     cudaMemcpyHostToDevice, st);
     k_embed_b<<<((size_t)dim*B+255)/256,256,0,st>>>(g_ch_embed, gb_rows, Hb, dim, B);
+    if (dprof) cudaEventRecord(dpa,st);
     for (int li=0; li<NL; ++li) {
         ChainLayer &L=g_chain[li];
         k_norm1_b<<<B,256,0,st>>>(Hb, L.attn_norm, nxb, dim, B);
@@ -2145,6 +2161,7 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
             launch_mv_b(L.fow, L.fow_k, att, dim, dattb, aob, B, st);
         }
         k_axpy_b<<<((size_t)dim*B+255)/256,256,0,st>>>(Hb, aob, dim, B);
+        DSEG(l_attn);
         if (L.has_moe) {
             k_norm1_b<<<B,256,0,st>>>(Hb, L.post_norm, nxb, dim, B);
             launch_mv_b(L.rw, L.rk, dim, L.n_exp, nxb, drlb, B, st);
@@ -2157,10 +2174,17 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
             k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, nxb, dhbb, drouteb, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, B);
             k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, dhbb, aob, drouteb, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, B);
             k_axpy_b<<<((size_t)dim*B+255)/256,256,0,st>>>(Hb, aob, dim, B);
+            DSEG(l_moe);
         }
     }
     k_norm1_b<<<B,256,0,st>>>(Hb, g_ch_fnorm, nxb, dim, B);
     launch_mv_b(g_ch_lm, g_ch_lm_k, dim, g_ch_vocab, nxb, dlogb, B, st);
+    DSEG(l_lm);
+    if (dprof) {
+        a_attn+=l_attn; a_moe+=l_moe; a_lm+=l_lm; ++a_n;
+        if (a_n%50==0) fprintf(stderr,"[DECPROF B=%d] per-tok: attn=%.3f moe=%.3f lm=%.3f sum=%.3f ms (n=%ld)\n",
+            B, a_attn/a_n, a_moe/a_n, a_lm/a_n, (a_attn+a_moe+a_lm)/a_n, a_n);
+    }
     cudaMemcpyAsync(logits, dlogb, (size_t)B*g_ch_vocab*4, cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
 }
