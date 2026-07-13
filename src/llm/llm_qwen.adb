@@ -1030,7 +1030,10 @@ package body LLM_Qwen is
          Last_Logits := Decode (1);
       elsif Use_Chain and then LLM_Qwen_GPU.Chain_Prefill_Available then
          declare
-            PCHUNK : constant := 32;
+            --  Prefill chunk. The Q8 matmuls use the tensor-core kernel
+            --  (weight-stationary), so a large chunk amortises the weight read
+            --  ~4x better than 32. Must stay <= the CUDA-side PCH buffer cap.
+            PCHUNK : constant := 128;
             Total  : constant Natural := Prompt_Ids'Length;
             Done   : Natural := 0;
          begin

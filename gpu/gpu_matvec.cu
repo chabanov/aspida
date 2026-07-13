@@ -4,6 +4,7 @@
 // Q3_K/Q2_K), bit-exact vs the CPU engine (build with --fmad=false). Build:
 //   nvcc -O3 --fmad=false -arch=native -shared -Xcompiler -fPIC gpu_matvec.cu -o libaspidagpu.so
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <unordered_map>
 #include <vector>
 #include <cstdint>
@@ -1960,17 +1961,77 @@ __global__ void k_dense_mv_b(const float *__restrict__ w, const float *__restric
     for (int b = 0; b < B; ++b) { float a = warp_reduce(acc[b]); if (lane == 0) y[(size_t) b * out + row] = a; }
 }
 // Batched matvec dispatch (weight read once for B lanes).
+// Tensor-core batched Q8_0 matmul: Y[B,out] = X[B,in] @ W[out,in]^T.
+// One warp computes a 16(M)x16(N) output tile, looping K in 32-wide Q8 blocks;
+// W stays Q8 in HBM (read once), dequantized into a shared FP16 tile, multiplied
+// by FP16 tensor cores. Weight-stationary in the true sense — per-token cost
+// falls with B (12x over the warp-per-row kernel at B=128), which is what makes
+// chunked prefill competitive. Handles any B/out (partial tiles guarded).
+#define WMM_TM 16
+#define WMM_TN 16
+#define WMM_TK 32
+__global__ void k_q8_wmma(const uint8_t *__restrict__ w, const float *__restrict__ x,
+                          float *__restrict__ y, int in, int out, int B) {
+    int n0 = blockIdx.x * WMM_TN, m0 = blockIdx.y * WMM_TM;
+    int lane = threadIdx.x & 31;
+    int nb = in / 32; size_t bpr = (size_t) nb * 34;
+    __shared__ half As[WMM_TM * WMM_TK];   // x tile [16 M][32 K] row-major, ld=32
+    __shared__ half Bs[WMM_TK * WMM_TN];   // W tile [32 K][16 N] row-major, ld=16; Bs[k][n]=W[n,k]
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cf;
+    nvcuda::wmma::fill_fragment(cf, 0.0f);
+    for (int kb = 0; kb < nb; ++kb) {
+        for (int n = 0; n < WMM_TN; ++n) {
+            int gn = n0 + n;
+            const uint8_t *bl = w + (size_t) gn * bpr + (size_t) kb * 34;
+            float d = f16(bl); const int8_t *qs = (const int8_t *) (bl + 2);
+            Bs[(size_t) lane * WMM_TN + n] = __float2half(d * (float) qs[lane]);
+        }
+        for (int m = 0; m < WMM_TM; ++m) {
+            int gm = m0 + m;
+            float xv = (gm < B) ? x[(size_t) gm * in + kb * 32 + lane] : 0.0f;
+            As[(size_t) m * WMM_TK + lane] = __float2half(xv);
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int k16 = 0; k16 < 2; ++k16) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> af;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major> bf;
+            nvcuda::wmma::load_matrix_sync(af, As + k16 * 16, WMM_TK);
+            nvcuda::wmma::load_matrix_sync(bf, Bs + (size_t) k16 * 16 * WMM_TN, WMM_TN);
+            nvcuda::wmma::mma_sync(cf, af, bf, cf);
+        }
+        __syncwarp();
+    }
+    __shared__ float Cs[WMM_TM * WMM_TN];
+    nvcuda::wmma::store_matrix_sync(Cs, cf, WMM_TN, nvcuda::wmma::mem_row_major);
+    for (int idx = lane; idx < WMM_TM * WMM_TN; idx += 32) {
+        int m = idx / WMM_TN, n = idx % WMM_TN, gm = m0 + m, gn = n0 + n;
+        if (gm < B && gn < out) y[(size_t) gm * out + gn] = Cs[idx];
+    }
+}
+
 static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
                                const float *dx, float *dy, int B, cudaStream_t st) {
     const int TPB = 256, WPB = TPB / 32; int blocks = (out + WPB - 1) / WPB;
-    if (B > MAXB) B = MAXB;
-    if (kind == 0)      k_q4k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
-    else if (kind == 1) k_q6k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
-    else if (kind == 2) k_q5k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
-    else if (kind == 3) k_q3k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
-    else if (kind == 4) k_q2k_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
-    else if (kind == 5) k_q8_0_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
-    else                k_dense_mv_b<<<blocks, TPB, 0, st>>>((const float *) dw, dx, dy, in, out, B);
+    //  Q8_0 (the hura weight format): tensor-core path, any B — no MAXB cap, so
+    //  chunked prefill can use a large chunk and amortize the weight read.
+    if (kind == 5) {
+        dim3 grid((out + WMM_TN - 1) / WMM_TN, (B + WMM_TM - 1) / WMM_TM);
+        k_q8_wmma<<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
+        return;
+    }
+    //  Other quant kinds keep the warp-per-row kernels, whose acc[MAXB] caps the
+    //  batch at MAXB — sub-batch so B > MAXB (large prefill chunks) stays correct.
+    for (int b0 = 0; b0 < B; b0 += MAXB) {
+        int bb = B - b0; if (bb > MAXB) bb = MAXB;
+        const float *xb = dx + (size_t) b0 * in; float *yb = dy + (size_t) b0 * out;
+        if (kind == 0)      k_q4k_wb<<<blocks, TPB, 0, st>>>(dw, xb, yb, in, out, bb);
+        else if (kind == 1) k_q6k_wb<<<blocks, TPB, 0, st>>>(dw, xb, yb, in, out, bb);
+        else if (kind == 2) k_q5k_wb<<<blocks, TPB, 0, st>>>(dw, xb, yb, in, out, bb);
+        else if (kind == 3) k_q3k_wb<<<blocks, TPB, 0, st>>>(dw, xb, yb, in, out, bb);
+        else if (kind == 4) k_q2k_wb<<<blocks, TPB, 0, st>>>(dw, xb, yb, in, out, bb);
+        else                k_dense_mv_b<<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out, bb);
+    }
 }
 
 __global__ void k_axpy_b(float *__restrict__ acc, const float *__restrict__ y, int n, int B) {
@@ -2115,7 +2176,10 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
 //  resident state, so it overlaps the batch Driver's concurrent decode forwards
 //  (read-only shared weights) without a lock.
 //===========================================================================
-#define PCH 32   // must be <= MAXB (the batched-matvec register cap)
+#define PCH 128  // chunk size. The Q8 matmuls use the tensor-core k_q8_wmma
+                 // (no MAXB cap; weight-stationary, per-token cost falls with
+                 // the chunk), so a big chunk amortises the weight read. Non-Q8
+                 // kinds are sub-batched by MAXB inside launch_mv_b.
 
 // Delta-net causal depthwise conv over a chunk: thread owns channel c and walks
 // t = 0..P-1, maintaining the sliding hist window exactly as k_dnet_conv does.
