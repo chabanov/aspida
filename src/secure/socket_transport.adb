@@ -21,7 +21,21 @@ package body Socket_Transport is
            Stream_Element (Data (I));
       end loop;
       while Sent < Buf'Last loop
-         Send_Socket (T.Sock, Buf (Sent + 1 .. Buf'Last), Last);
+         begin
+            Send_Socket (T.Sock, Buf (Sent + 1 .. Buf'Last), Last);
+         exception
+            --  A blocking send whose SO_SNDTIMEO expires raises Socket_Error
+            --  (errno EAGAIN/EWOULDBLOCK/ETIMEDOUT), and a peer that reset the
+            --  connection raises it too (EPIPE/ECONNRESET). On an established
+            --  streaming connection every one of these means "the peer is gone
+            --  or has stopped reading" — the exact condition the 15s send
+            --  deadline exists to break. Normalise them all to Connection_Closed
+            --  so the whole stack sees one "peer gone" signal (like Read does on
+            --  a 0-byte recv) instead of a raw Socket_Error slipping past any
+            --  layer that only guards Connection_Closed.
+            when Socket_Error =>
+               raise Connection_Closed with "send timed out or reset";
+         end;
          pragma Assert (Last <= Buf'Last);
          if Last < Sent + 1 then
             raise Connection_Closed with "send failed";

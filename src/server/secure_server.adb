@@ -110,6 +110,26 @@ procedure Secure_Server is
       return 10.0;
    end Handshake_Timeout;
 
+   --  Send deadline: how long a blocked send() may pin a handler when the
+   --  peer stops reading (client timed out / died mid-stream). This MUST be
+   --  short and separate from Idle_Timeout: with the old 600s value one dead
+   --  client froze its handler for 10 minutes, and a handful of platform
+   --  retries exhausted the whole pool — the prod "deadlock" (15 threads on
+   --  futex) of 2026-07-13. 15s passes any honest slow reader on a LAN/TLS
+   --  hop but frees a dead one fast. Override with ASPIDA_SEND_TIMEOUT.
+   function Send_Deadline return Duration is
+   begin
+      if Ada.Environment_Variables.Exists ("ASPIDA_SEND_TIMEOUT") then
+         begin
+            return Duration'Max (1.0, Duration'Value
+              (Ada.Environment_Variables.Value ("ASPIDA_SEND_TIMEOUT")));
+         exception
+            when others => null;
+         end;
+      end if;
+      return 15.0;
+   end Send_Deadline;
+
    function Env_Int (Name : String; D : Integer) return Integer is
    begin
       if Ada.Environment_Variables.Exists (Name) then
@@ -482,7 +502,7 @@ procedure Secure_Server is
          --  Handshake + first record are in: lift the short slowloris deadline
          --  back to the normal idle timeout for the rest of the session.
          Set_Socket_Option (Conn, Socket_Level, (Receive_Timeout, Idle_Timeout));
-         Set_Socket_Option (Conn, Socket_Level, (Send_Timeout, Idle_Timeout));
+         Set_Socket_Option (Conn, Socket_Level, (Send_Timeout, Send_Deadline));
 
          if Hello'Length >= 1 and then Hello (Hello'First) = Protocol.Tag_Session then
             for I in Hello'First + 1 .. Hello'Last loop
@@ -956,7 +976,7 @@ begin
                --  the receive timeout never fires while the handler is stuck in
                --  Emit/Send_Message. 8 such connections would exhaust the pool.
                Set_Socket_Option
-                 (Conn, Socket_Level, (Send_Timeout, Idle_Timeout));
+                 (Conn, Socket_Level, (Send_Timeout, Send_Deadline));
                Conn_Queue.Put (Conn);     -- a free handler will pick it up
             end if;
          end;
