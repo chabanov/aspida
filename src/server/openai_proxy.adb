@@ -94,12 +94,16 @@ procedure OpenAI_Proxy is
    Local_Port : constant Port_Type :=
      (if Argument_Count >= 4 then Port_Type'Value (Argument (4)) else 8080);
 
-   Sock : Socket_Type;                       -- to the server
-   CT   : aliased Socket_Transport.Sock_Transport;
-   Ch   : Secure_Channel.Channel;
-
-   Listener, Client : Socket_Type;           -- local HTTP
+   Listener : Socket_Type;                   -- local HTTP listener (main only)
    Model_Name : constant String := "aspida";
+
+   --  Concurrency: a pool of worker tasks, each serving one HTTP client at a
+   --  time over its OWN server channel. A long generation or a stuck client on
+   --  one worker no longer blocks the others (health checks, other users) — the
+   --  single serialized channel used before was the head-of-line bottleneck.
+   Max_Workers : constant := 8;              --  matches the server handler pool
+   Max_Queue   : constant := 64;
+   type Socket_Slots is array (1 .. Max_Queue) of Socket_Type;
 
    --  Raised when a write to the HTTP client fails because the client went
    --  away (killed curl, browser tab closed, gateway timeout). Propagating it
@@ -258,16 +262,18 @@ procedure OpenAI_Proxy is
 
    CRLF : constant String := Character'Val (13) & Character'Val (10);
 
-   --  (Re-)establish the shared encrypted channel to the server. All HTTP
-   --  clients are multiplexed over this single channel, so if a request aborts
-   --  mid-stream (e.g. Recv_Message raises, or a Tag_Done is left unconsumed)
-   --  the channel is left half-consumed and the NEXT request would read stale
-   --  records — cross-request response confusion. After any such error we tear
-   --  this down and call Open_Channel again to resync before serving the next
-   --  client. Raises Channel_Failed if the server is unreachable.
+   --  Each worker opens its OWN encrypted channel to the server per request and
+   --  closes it after, so nothing is multiplexed and a request that aborts
+   --  mid-stream can never leave a half-consumed record for another request to
+   --  trip over (the single reused channel was the 2026-07-13 desync deadlock).
+   --  Raises Channel_Failed if the server is unreachable.
    Channel_Failed : exception;
 
-   procedure Open_Channel is
+   procedure Open_Channel
+     (Sock : out Socket_Type;
+      Ch   : out Secure_Channel.Channel;
+      CT   : aliased in out Socket_Transport.Sock_Transport)
+   is
    begin
       Create_Socket (Sock);
       Connect_Socket (Sock, (Family_Inet, Inet_Addr (Argument (1)),
@@ -297,80 +303,56 @@ procedure OpenAI_Proxy is
    --  for the next request to trip over — the single shared, reused channel
    --  was the source of the 2026-07-13 desync deadlock where the proxy waited
    --  for a response frame the server had already finished and moved past.
-   procedure Close_Channel is
+   procedure Close_Channel
+     (Ch : in out Secure_Channel.Channel; Sock : Socket_Type) is
    begin
       begin Secure_Channel.Close (Ch); exception when others => null; end;
       begin Close_Socket (Sock); exception when others => null; end;
    end Close_Channel;
 
-begin
-   if Argument_Count < 3 then
-      Put_Line ("usage: openai_proxy <host> <port> <server_pub_hex> [local_port]");
-      GNAT.OS_Lib.OS_Exit (2);
-   end if;
+   --  Queue of accepted HTTP client sockets, drained by the worker pool. Same
+   --  bounded ring the server uses; Put blocks if the pool is saturated
+   --  (backpressure) rather than dropping clients.
+   protected Accept_Queue is
+      entry Put (S : Socket_Type);
+      entry Get (S : out Socket_Type);
+   private
+      Slots : Socket_Slots;
+      Cnt   : Natural := 0;
+      Hd    : Positive := 1;
+      Tl    : Positive := 1;
+   end Accept_Queue;
 
-   --  Validate connectivity + report the cipher suite once at startup, then
-   --  close it: real serving opens a fresh channel per request.
-   begin
-      Open_Channel;
-   exception
-      when Channel_Failed =>
-         Put_Line ("error: cannot reach the secure server");
-         GNAT.OS_Lib.OS_Exit (1);
-   end;
-
-   Put_Line ("  🔒 encrypted tunnel up: " & Secure_Channel.Cipher_Suite);
-   Put_Line ("  OpenAI-compatible endpoint: http://127.0.0.1:"
-             & Ada.Strings.Fixed.Trim (Local_Port'Image, Ada.Strings.Both) & "/v1");
-   Put_Line ("  (any api_key; requests are AEAD-sealed to the pinned server)");
-   Close_Channel;
-
-   --  Local HTTP listener, loopback only. Bind can transiently fail with
-   --  EADDRINUSE right after a restart while a predecessor's listen socket is
-   --  still in TIME_WAIT (or, historically, while a wedged predecessor still
-   --  held the port). Retry a few times; note this is the one bind that used
-   --  to escape unguarded — an EADDRINUSE here propagated to the runtime and
-   --  hung the process in finalize_global_tasks (it links non-terminating
-   --  library tasks), leaving the port held forever. The top-level handler
-   --  below now turns any escape into an immediate OS_Exit instead.
-   Create_Socket (Listener);
-   Set_Socket_Option (Listener, Socket_Level, (Reuse_Address, True));
-   declare
-      Bound : Boolean := False;
-   begin
-      for Attempt in 1 .. 20 loop
-         begin
-            Bind_Socket
-              (Listener, (Family_Inet, Inet_Addr ("127.0.0.1"), Local_Port));
-            Bound := True;
-            exit;
-         exception
-            when Socket_Error =>
-               if Attempt = 20 then
-                  raise;
-               end if;
-               delay 0.5;   --  let a predecessor's socket drain
-         end;
-      end loop;
-      pragma Assert (Bound);
-   end;
-   Listen_Socket (Listener);
-
-   loop
-      declare
-         Addr   : Sock_Addr_Type;
-         Method : String (1 .. 16);
-         Path   : String (1 .. 1024);
-         RBody  : String (1 .. 1_048_576);
-         ML, PL, BL, Err : Natural;
+   protected body Accept_Queue is
+      entry Put (S : Socket_Type) when Cnt < Max_Queue is
       begin
-         Accept_Socket (Listener, Client, Addr);
-         Read_Request (Client, Method, Path, RBody, ML, PL, BL, Err);
-         --  Fresh server channel per request: no state carries between clients,
-         --  so a mid-stream abort can't desync the next one. Raises
-         --  Channel_Failed if the server is unreachable (handled below).
-         Open_Channel;
-         declare
+         Slots (Tl) := S; Tl := Tl mod Max_Queue + 1; Cnt := Cnt + 1;
+      end Put;
+      entry Get (S : out Socket_Type) when Cnt > 0 is
+      begin
+         S := Slots (Hd); Hd := Hd mod Max_Queue + 1; Cnt := Cnt - 1;
+      end Get;
+   end Accept_Queue;
+
+   --  Serve one HTTP client on its OWN server channel, then close both. All the
+   --  channel state (Sock/Ch/CT) is local to this call, so concurrent workers
+   --  never share it. The 1 MB request buffers live on the worker task stack
+   --  (see Worker's Storage_Size).
+   procedure Serve (Client : Socket_Type) is
+      Sock   : Socket_Type;
+      CT     : aliased Socket_Transport.Sock_Transport;
+      Ch     : Secure_Channel.Channel;
+      Method : String (1 .. 16);
+      Path   : String (1 .. 1024);
+      RBody  : String (1 .. 1_048_576);
+      ML, PL, BL, Err : Natural;
+   begin
+      Read_Request (Client, Method, Path, RBody, ML, PL, BL, Err);
+      --  Fresh server channel per request: no state carries between clients,
+      --  so a mid-stream abort can't desync anything. Raises Channel_Failed if
+      --  the server is unreachable (handled below).
+      Open_Channel (Sock, Ch, CT);
+      declare
             Pth : constant String := Path (Path'First .. Path'First + PL - 1);
             Bdy : constant String := RBody (RBody'First .. RBody'First + BL - 1);
          begin
@@ -564,38 +546,130 @@ begin
                  OpenAI.Error_Response ("unknown route: " & Pth));
             end if;
          end;
-         Close_Channel;
+         Close_Channel (Ch, Sock);
          begin Close_Socket (Client); exception when others => null; end;
+   exception
+      when Channel_Failed =>
+         --  Could not open a channel for this request: the backend is down or
+         --  saturated. Tell the client and return — a single failed request
+         --  must not take a worker down (the health probe restarts the service
+         --  if the backend stays unreachable).
+         begin
+            Write_JSON (Client, "503 Service Unavailable",
+              OpenAI.Error_Response ("backend unavailable", "backend_unavailable"));
+         exception when others => null; end;
+         begin Close_Socket (Client); exception when others => null; end;
+      when others =>
+         --  Client vanished mid-stream, or a per-request error. Drop this
+         --  request's channel (which aborts the server-side generation) and its
+         --  client socket. No shared state survives, so nothing to resync.
+         Close_Channel (Ch, Sock);
+         begin Close_Socket (Client); exception when others => null; end;
+   end Serve;
+
+   --  Worker pool. Each worker serves one client at a time on its own channel,
+   --  so a slow generation or a stuck client on one worker never blocks the
+   --  others. Big stack: Serve holds two 1 MB request buffers.
+   task type Worker with Storage_Size => 16 * 1024 * 1024;
+   task body Worker is
+      Client : Socket_Type;
+   begin
+      loop
+         Accept_Queue.Get (Client);
+         --  A worker must never die (its slot would be lost). Serve cleans up
+         --  after itself; swallow anything that still escapes as a last resort.
+         begin
+            Serve (Client);
+         exception
+            when others =>
+               begin Close_Socket (Client); exception when others => null; end;
+         end;
+      end loop;
+   end Worker;
+
+   Workers : array (1 .. Max_Workers) of Worker;
+   pragma Unreferenced (Workers);
+
+begin
+   if Argument_Count < 3 then
+      Put_Line ("usage: openai_proxy <host> <port> <server_pub_hex> [local_port]");
+      GNAT.OS_Lib.OS_Exit (2);
+   end if;
+
+   --  Validate connectivity + report the cipher suite once at startup on a
+   --  throwaway channel, then close it: real serving opens one per request.
+   declare
+      VSock : Socket_Type;
+      VCT   : aliased Socket_Transport.Sock_Transport;
+      VCh   : Secure_Channel.Channel;
+   begin
+      Open_Channel (VSock, VCh, VCT);
+      Close_Channel (VCh, VSock);
+   exception
+      when Channel_Failed =>
+         Put_Line ("error: cannot reach the secure server");
+         GNAT.OS_Lib.OS_Exit (1);
+   end;
+
+   Put_Line ("  🔒 encrypted tunnel up: " & Secure_Channel.Cipher_Suite);
+   Put_Line ("  OpenAI-compatible endpoint: http://127.0.0.1:"
+             & Ada.Strings.Fixed.Trim (Local_Port'Image, Ada.Strings.Both) & "/v1");
+   Put_Line ("  (any api_key; requests are AEAD-sealed to the pinned server;"
+             & Max_Workers'Image & " workers)");
+
+   --  Local HTTP listener, loopback only. Bind can transiently fail with
+   --  EADDRINUSE right after a restart while a predecessor's listen socket is
+   --  still in TIME_WAIT (or, historically, while a wedged predecessor still
+   --  held the port). Retry a few times; note this is the one bind that used to
+   --  escape unguarded — an EADDRINUSE here propagated to the runtime and hung
+   --  the process in finalize_global_tasks (it links non-terminating library
+   --  tasks), leaving the port held forever. The top-level handler below now
+   --  turns any escape into an immediate OS_Exit instead.
+   Create_Socket (Listener);
+   Set_Socket_Option (Listener, Socket_Level, (Reuse_Address, True));
+   declare
+      Bound : Boolean := False;
+   begin
+      for Attempt in 1 .. 20 loop
+         begin
+            Bind_Socket
+              (Listener, (Family_Inet, Inet_Addr ("127.0.0.1"), Local_Port));
+            Bound := True;
+            exit;
+         exception
+            when Socket_Error =>
+               if Attempt = 20 then
+                  raise;
+               end if;
+               delay 0.5;   --  let a predecessor's socket drain
+         end;
+      end loop;
+      pragma Assert (Bound);
+   end;
+   Listen_Socket (Listener);
+
+   --  Accept and hand each client to a worker. The acceptor itself does no I/O
+   --  on the client, so it never blocks — a burst of clients queues (bounded)
+   --  and drains across the pool.
+   loop
+      declare
+         Addr : Sock_Addr_Type;
+         C    : Socket_Type;
+      begin
+         Accept_Socket (Listener, C, Addr);
+         Accept_Queue.Put (C);
       exception
-         when Channel_Failed =>
-            --  Could not open a channel for this request: the backend is down
-            --  or saturated. Tell the client and keep serving — a single
-            --  failed request must not take the proxy down (the health probe
-            --  will restart the service if the backend stays unreachable).
-            begin
-               Write_JSON (Client, "503 Service Unavailable",
-                 OpenAI.Error_Response ("backend unavailable", "backend_unavailable"));
-            exception when others => null; end;
-            begin Close_Socket (Client); exception when others => null; end;
          when others =>
-            --  Client vanished mid-stream, or a per-request error. Drop this
-            --  request's channel (which aborts the server-side generation) and
-            --  its client socket, then serve the next client. No shared state
-            --  survives, so nothing to resync.
-            Close_Channel;
-            begin Close_Socket (Client); exception when others => null; end;
+            --  A bad accept must not kill the acceptor loop.
+            null;
       end;
    end loop;
-   --  The loop never falls through (it only leaves via OS_Exit on a lost
-   --  server), so there is no normal-return path into finalize_global_tasks.
 exception
-   --  Last line of defence. ANY exception that reaches here (e.g. the listener
-   --  Bind's EADDRINUSE, a Storage_Error from the per-request buffers, an
-   --  error escaping the loop's own handler) must NOT unwind into
-   --  finalize_global_tasks — that blocks forever on this binary's
-   --  non-terminating library tasks and leaves :LOCAL_PORT held, which is the
-   --  shape of the 2026-07-13 proxy hang. Log and force-exit so systemd
-   --  restarts a clean instance.
+   --  Last line of defence. ANY exception that reaches here (the listener
+   --  Bind's EADDRINUSE, etc.) must NOT unwind into finalize_global_tasks —
+   --  that blocks forever on this binary's non-terminating library tasks and
+   --  leaves :LOCAL_PORT held, which is the shape of the 2026-07-13 proxy hang.
+   --  Log and force-exit so systemd restarts a clean instance.
    when E : others =>
       Put_Line ("proxy fatal: " & Exception_Name (E) & ": " & Exception_Message (E));
       Flush;   --  OS_Exit skips finalization; flush so the reason hits the log

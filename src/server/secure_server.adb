@@ -110,13 +110,17 @@ procedure Secure_Server is
       return 10.0;
    end Handshake_Timeout;
 
-   --  Send deadline: how long a blocked send() may pin a handler when the
-   --  peer stops reading (client timed out / died mid-stream). This MUST be
-   --  short and separate from Idle_Timeout: with the old 600s value one dead
-   --  client froze its handler for 10 minutes, and a handful of platform
-   --  retries exhausted the whole pool — the prod "deadlock" (15 threads on
-   --  futex) of 2026-07-13. 15s passes any honest slow reader on a LAN/TLS
-   --  hop but frees a dead one fast. Override with ASPIDA_SEND_TIMEOUT.
+   --  Send deadline: how long a blocked send() may pin a handler when the peer
+   --  stops reading (client timed out / died mid-stream). This MUST be short
+   --  and separate from Idle_Timeout: with the old 600s value one dead client
+   --  froze its handler for 10 minutes, and a handful of platform retries
+   --  exhausted the whole pool — the prod "deadlock" (15 threads on futex) of
+   --  2026-07-13. The peer is the loopback proxy, which reads promptly, so a
+   --  live client never approaches this; only an abandoned generation whose
+   --  channel the proxy already closed hits it, and after a disconnect storm
+   --  every such handler stays busy for this long before freeing. Keep it
+   --  short (5s) so the pool drains fast; a genuinely slower reader still gets
+   --  buffered by the kernel socket buffers. Override with ASPIDA_SEND_TIMEOUT.
    function Send_Deadline return Duration is
    begin
       if Ada.Environment_Variables.Exists ("ASPIDA_SEND_TIMEOUT") then
@@ -127,7 +131,7 @@ procedure Secure_Server is
             when others => null;
          end;
       end if;
-      return 15.0;
+      return 5.0;
    end Send_Deadline;
 
    function Env_Int (Name : String; D : Integer) return Integer is
