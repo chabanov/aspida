@@ -1169,7 +1169,7 @@ package body LLM_Qwen is
       Stats : access Gen_Stats) return Chat_Result
    is
       LF     : constant String := [1 => ASCII.LF];
-      P      : LLM_Chat_Parser.Parser := LLM_Chat_Parser.New_Parser;
+      P      : aliased LLM_Chat_Parser.Parser := LLM_Chat_Parser.New_Parser;
       Nullish : constant Null_Sink_Access := New_Null_Sink;
       function Resolve_Sink return access Chat_Sink'Class is
       begin
@@ -1180,6 +1180,43 @@ package body LLM_Qwen is
          end if;
       end Resolve_Sink;
       SinkRef : constant access Chat_Sink'Class := Resolve_Sink;
+
+      --  Live-streaming bridge: as Decode_Tokens produces each token it calls
+      --  Emit here, which feeds that token straight into the chat FSM parser,
+      --  so On_Reasoning / On_Text / On_Tool_Call fire on SinkRef AS tokens
+      --  arrive — true token-by-token streaming.
+      --
+      --  Replaces a generate-everything-then-parse design (Decode_Tokens with a
+      --  null sink, then one Feed over the whole Raw string): time-to-first-token
+      --  was the full generation time, a disconnected client was not noticed
+      --  until generation finished, and the handler kept a GPU busy producing
+      --  tokens nobody would read — the shape behind the 2026-07-13
+      --  disconnect-storm hang. Streaming live also gives cancellation for free:
+      --  when SinkRef writes to a dead client it raises, Decode_Tokens frees its
+      --  GPU state and re-raises, and generation stops within one token.
+      --
+      --  Declared local to Chat_Raw so its anonymous access components may point
+      --  at the local parser P.
+      type Parser_Bridge is new Token_Sink with record
+         Psr : access LLM_Chat_Parser.Parser;
+         Tgt : access Chat_Sink'Class;
+      end record;
+      overriding procedure Emit (S : in out Parser_Bridge; Piece : String);
+      overriding procedure Tick (S : in out Parser_Bridge);
+
+      overriding procedure Emit (S : in out Parser_Bridge; Piece : String) is
+      begin
+         LLM_Chat_Parser.Feed (S.Psr.all, Piece, S.Tgt);
+      end Emit;
+
+      overriding procedure Tick (S : in out Parser_Bridge) is
+      begin
+         --  Forward prefill heartbeats so the downstream sink keeps the channel
+         --  warm during prompt-eval (before the first token).
+         if S.Tgt /= null then
+            S.Tgt.Tick;
+         end if;
+      end Tick;
    begin
       --  Fall back to raw generation when the model has no ChatML tokens.
       if M.Im_Start_Id < 0 or else M.Im_End_Id < 0 then
@@ -1245,11 +1282,17 @@ package body LLM_Qwen is
                (M.Tok,
                 (if Params.Enable_Thinking then "assistant" & LF
                  else "assistant" & LF & "<think>" & LF & LF & "</think>" & LF & LF));
+         --  Feed each token into the parser AS it is generated (Bridge.Emit ->
+         --  Feed), so On_Text/On_Reasoning/On_Tool_Call fire live on SinkRef.
+         --  A dead downstream client makes SinkRef raise, Decode_Tokens frees
+         --  GPU state and re-raises, and generation stops within one token.
+         Bridge : aliased Parser_Bridge :=
+           (Token_Sink with Psr => P'Access, Tgt => SinkRef);
          Raw : constant String :=
            Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id,
-                          null, Params, Stats);
+                          Bridge'Access, Params, Stats);
+         pragma Unreferenced (Raw);  -- already fed to the parser live above
       begin
-         LLM_Chat_Parser.Feed (P, Raw, SinkRef);
          LLM_Chat_Parser.Finalize (P, SinkRef);
          declare
             NC : constant Natural := LLM_Chat_Parser.N_Tool_Calls (P);
