@@ -12,7 +12,9 @@
 
 with Ada.Command_Line;        use Ada.Command_Line;
 with Ada.Text_IO;             use Ada.Text_IO;
+with Ada.Exceptions;          use Ada.Exceptions;
 with Ada.Environment_Variables;
+with GNAT.OS_Lib;
 with Ada.Streams;             use Ada.Streams;
 with Ada.Strings.Fixed;
 with Ada.Strings.Unbounded;
@@ -287,7 +289,7 @@ procedure OpenAI_Proxy is
 begin
    if Argument_Count < 3 then
       Put_Line ("usage: openai_proxy <host> <port> <server_pub_hex> [local_port]");
-      return;
+      GNAT.OS_Lib.OS_Exit (2);
    end if;
 
    --  Open the encrypted channel to the server (pin its key) once.
@@ -296,7 +298,7 @@ begin
    exception
       when Channel_Failed =>
          Put_Line ("error: cannot reach the secure server");
-         return;
+         GNAT.OS_Lib.OS_Exit (1);
    end;
 
    Put_Line ("  🔒 encrypted tunnel up: " & Secure_Channel.Cipher_Suite);
@@ -304,10 +306,35 @@ begin
              & Ada.Strings.Fixed.Trim (Local_Port'Image, Ada.Strings.Both) & "/v1");
    Put_Line ("  (any api_key; requests are AEAD-sealed to the pinned server)");
 
-   --  Local HTTP listener, loopback only.
+   --  Local HTTP listener, loopback only. Bind can transiently fail with
+   --  EADDRINUSE right after a restart while a predecessor's listen socket is
+   --  still in TIME_WAIT (or, historically, while a wedged predecessor still
+   --  held the port). Retry a few times; note this is the one bind that used
+   --  to escape unguarded — an EADDRINUSE here propagated to the runtime and
+   --  hung the process in finalize_global_tasks (it links non-terminating
+   --  library tasks), leaving the port held forever. The top-level handler
+   --  below now turns any escape into an immediate OS_Exit instead.
    Create_Socket (Listener);
    Set_Socket_Option (Listener, Socket_Level, (Reuse_Address, True));
-   Bind_Socket (Listener, (Family_Inet, Inet_Addr ("127.0.0.1"), Local_Port));
+   declare
+      Bound : Boolean := False;
+   begin
+      for Attempt in 1 .. 20 loop
+         begin
+            Bind_Socket
+              (Listener, (Family_Inet, Inet_Addr ("127.0.0.1"), Local_Port));
+            Bound := True;
+            exit;
+         exception
+            when Socket_Error =>
+               if Attempt = 20 then
+                  raise;
+               end if;
+               delay 0.5;   --  let a predecessor's socket drain
+         end;
+      end loop;
+      pragma Assert (Bound);
+   end;
    Listen_Socket (Listener);
 
    loop
@@ -525,10 +552,28 @@ begin
                Reset_Channel;
             exception
                when Channel_Failed =>
-                  Put_Line ("error: lost the secure server; shutting down");
-                  exit;
+                  --  Server truly gone: die immediately so systemd restarts a
+                  --  fresh proxy. OS_Exit (not `exit`/return) is mandatory —
+                  --  a normal return would block forever in
+                  --  finalize_global_tasks waiting on the non-terminating
+                  --  library tasks this binary links, holding the port.
+                  Put_Line ("error: lost the secure server; exiting");
+                  GNAT.OS_Lib.OS_Exit (1);
             end;
       end;
    end loop;
-   begin Close_Socket (Listener); exception when others => null; end;
+   --  The loop never falls through (it only leaves via OS_Exit on a lost
+   --  server), so there is no normal-return path into finalize_global_tasks.
+exception
+   --  Last line of defence. ANY exception that reaches here (e.g. the listener
+   --  Bind's EADDRINUSE, a Storage_Error from the per-request buffers, an
+   --  error escaping the loop's own handler) must NOT unwind into
+   --  finalize_global_tasks — that blocks forever on this binary's
+   --  non-terminating library tasks and leaves :LOCAL_PORT held, which is the
+   --  shape of the 2026-07-13 proxy hang. Log and force-exit so systemd
+   --  restarts a clean instance.
+   when E : others =>
+      Put_Line ("proxy fatal: " & Exception_Name (E) & ": " & Exception_Message (E));
+      Flush;   --  OS_Exit skips finalization; flush so the reason hits the log
+      GNAT.OS_Lib.OS_Exit (1);
 end OpenAI_Proxy;
