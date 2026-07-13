@@ -173,7 +173,7 @@ package body LLM_Qwen_GPU is
    function To_CBatch is new Ada.Unchecked_Conversion (System.Address, Chain_Batch_Fn);
 
    type Chain_Prefill_Fn is access procedure
-     (P : int; Rows : System.Address; Pos_Start : int;
+     (Lane, P : int; Rows : System.Address; Pos_Start : int;
       Handles, Last_Logits : System.Address) with Convention => C;
    function To_CPre is new Ada.Unchecked_Conversion (System.Address, Chain_Prefill_Fn);
 
@@ -633,10 +633,10 @@ package body LLM_Qwen_GPU is
    end Chain_Prefill_Available;
 
    procedure Chain_Prefill
-     (P : Integer; Rows : System.Address; Pos_Start : Integer;
+     (Lane, P : Integer; Rows : System.Address; Pos_Start : Integer;
       Handles : System.Address; Last_Logits : System.Address) is
    begin
-      CPre_Fn (int (P), Rows, int (Pos_Start), Handles, Last_Logits);
+      CPre_Fn (int (Lane), int (P), Rows, int (Pos_Start), Handles, Last_Logits);
       Check_GPU;
    end Chain_Prefill;
 

@@ -227,8 +227,10 @@ package LLM_Qwen_GPU is
    --  the LAST position in Last_Logits — what the caller samples next. P must
    --  be <= 32 (the batched-matvec register cap); feed the prompt in chunks.
    --  Rows is C int[P] (0-based embedding rows); Handles is C int[n_layers].
+   --  Lane (0 .. 7) selects this generation's private prefill scratch so
+   --  concurrent generations never race — pass the batch lane (or 0 single).
    procedure Chain_Prefill
-     (P : Integer; Rows : System.Address; Pos_Start : Integer;
+     (Lane, P : Integer; Rows : System.Address; Pos_Start : Integer;
       Handles : System.Address; Last_Logits : System.Address);
 
 end LLM_Qwen_GPU;

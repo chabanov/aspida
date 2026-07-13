@@ -1050,7 +1050,8 @@ package body LLM_Qwen is
                        (Prompt_Ids (Prompt_Ids'First + Done + J - 1));
                   end loop;
                   LLM_Qwen_GPU.Chain_Prefill
-                    (P, Rows (1)'Address, Chain_Pos,
+                    ((if Batch_Mode then My_Lane else 0), P,
+                     Rows (1)'Address, Chain_Pos,
                      Handles (1)'Address, Data_Address (Last_Logits));
                   Chain_Pos := Chain_Pos + P;
                   Done := Done + P;

@@ -2288,47 +2288,62 @@ __global__ void k_fattn_attend_chunk(
 }
 
 // Prefill scratch (×PCH), separate from decode buffers so prefill can overlap
-// the Driver. Only the LM head runs once (last position), so no [PCH,vocab].
-static float *pHb=nullptr,*pnxb=nullptr,*paob=nullptr,*pdqkv=nullptr,*pdcq=nullptr,
-             *pdar=nullptr,*pdbr=nullptr,*pdz=nullptr,*pdg=nullptr,*pdb=nullptr,
-             *pdor=nullptr,*pdqg=nullptr,*pdkt=nullptr,*pdvt=nullptr,
-             *pdqa=nullptr,*pdga=nullptr,*pdatt=nullptr,*pdrl=nullptr,*pdhb=nullptr,
-             *pdlog=nullptr;
-static MoeRoute *pdroute=nullptr;
-static int *p_rows=nullptr, *p_pos=nullptr;   // [PCH] rows, [1] scalar pos
-static cudaStream_t p_stream=0;
+// the Driver. Held PER LANE (PMAXLANE): several generations can prefill at once
+// (the batcher's whole point). A SINGLE shared set raced when two requests
+// prefilled concurrently — garbage output (2026-07-13). Only the LM head runs
+// once per prefill (last position), so no [PCH,vocab] per position.
+#define PMAXLANE 8
+struct PScr {
+    float *Hb,*nxb,*aob,*dqkv,*dcq,*dar,*dbr,*dz,*dg,*db,*dor,*dqg,*dkt,*dvt,
+          *dqa,*dga,*datt,*drl,*dhb,*dlog;
+    MoeRoute *droute;
+    int *rows;
+    cudaStream_t stream;
+};
+static PScr g_ps[PMAXLANE];
 static int pch_inited=0;
 
 static void chain_alloc_p(void) {
     if (pch_inited) return;
     int dim=g_ch_dim; size_t Pd=(size_t)PCH;
-    cudaMalloc(&pHb, Pd*dim*4); cudaMalloc(&pnxb, Pd*dim*4); cudaMalloc(&paob, Pd*dim*4);
-    cudaMalloc(&pdlog, (size_t)g_ch_vocab*4);
-    if (g_mx_qo){ cudaMalloc(&pdqkv, Pd*g_mx_qo*4); cudaMalloc(&pdcq, Pd*g_mx_qo*4); }
-    if (g_mx_nv){ cudaMalloc(&pdar, Pd*g_mx_nv*4); cudaMalloc(&pdbr, Pd*g_mx_nv*4);
-                  cudaMalloc(&pdg, Pd*g_mx_nv*4); cudaMalloc(&pdb, Pd*g_mx_nv*4); }
-    if (g_mx_vd){ cudaMalloc(&pdz, Pd*g_mx_vd*4); cudaMalloc(&pdor, Pd*g_mx_vd*4); }
-    if (g_mx_qgd) cudaMalloc(&pdqg, Pd*g_mx_qgd*4);
-    if (g_mx_kvd){ cudaMalloc(&pdkt, Pd*g_mx_kvd*4); cudaMalloc(&pdvt, Pd*g_mx_kvd*4); }
-    if (g_mx_att){ cudaMalloc(&pdqa, Pd*g_mx_att*4); cudaMalloc(&pdga, Pd*g_mx_att*4);
-                   cudaMalloc(&pdatt, Pd*g_mx_att*4); }
-    if (g_mx_nexp) cudaMalloc(&pdrl, Pd*g_mx_nexp*4);
-    if (g_mx_hbuf) cudaMalloc(&pdhb, Pd*g_mx_hbuf*4);
-    cudaMalloc(&pdroute, Pd*sizeof(MoeRoute));
-    cudaMalloc(&p_rows, Pd*4); cudaMalloc(&p_pos, 4);
-    cudaStreamCreate(&p_stream);
+    for (int L=0; L<PMAXLANE; ++L) {
+        PScr &S = g_ps[L];
+        cudaMalloc(&S.Hb, Pd*dim*4); cudaMalloc(&S.nxb, Pd*dim*4); cudaMalloc(&S.aob, Pd*dim*4);
+        cudaMalloc(&S.dlog, (size_t)g_ch_vocab*4);
+        if (g_mx_qo){ cudaMalloc(&S.dqkv, Pd*g_mx_qo*4); cudaMalloc(&S.dcq, Pd*g_mx_qo*4); }
+        if (g_mx_nv){ cudaMalloc(&S.dar, Pd*g_mx_nv*4); cudaMalloc(&S.dbr, Pd*g_mx_nv*4);
+                      cudaMalloc(&S.dg, Pd*g_mx_nv*4); cudaMalloc(&S.db, Pd*g_mx_nv*4); }
+        if (g_mx_vd){ cudaMalloc(&S.dz, Pd*g_mx_vd*4); cudaMalloc(&S.dor, Pd*g_mx_vd*4); }
+        if (g_mx_qgd) cudaMalloc(&S.dqg, Pd*g_mx_qgd*4);
+        if (g_mx_kvd){ cudaMalloc(&S.dkt, Pd*g_mx_kvd*4); cudaMalloc(&S.dvt, Pd*g_mx_kvd*4); }
+        if (g_mx_att){ cudaMalloc(&S.dqa, Pd*g_mx_att*4); cudaMalloc(&S.dga, Pd*g_mx_att*4);
+                       cudaMalloc(&S.datt, Pd*g_mx_att*4); }
+        if (g_mx_nexp) cudaMalloc(&S.drl, Pd*g_mx_nexp*4);
+        if (g_mx_hbuf) cudaMalloc(&S.dhb, Pd*g_mx_hbuf*4);
+        cudaMalloc(&S.droute, Pd*sizeof(MoeRoute));
+        cudaMalloc(&S.rows, Pd*4);
+        cudaStreamCreate(&S.stream);
+    }
     pch_inited=1;
 }
 
-// Prefill P positions [pos_start .. pos_start+P-1] of ONE generation, updating
-// its resident per-layer state (handles[li]); return the LM-head logits of the
-// LAST position in last_logits (that is what the caller samples from). P must
-// be >= 1; the caller feeds the prompt in <= PCH-sized chunks.
-extern "C" void aspida_gpu_chain_prefill(int P, const int *rows, int pos_start,
+// Prefill P positions [pos_start .. pos_start+P-1] of ONE generation on LANE
+// `lane`, updating its resident per-layer state (handles[li]); return the
+// LM-head logits of the LAST position in last_logits (what the caller samples).
+// Each lane has private scratch, so concurrent lanes never race.
+extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int pos_start,
                                          const int *handles, float *last_logits) {
     if (P < 1) return; if (P > PCH) P = PCH;
+    if (lane < 0) lane = 0; if (lane >= PMAXLANE) lane = PMAXLANE - 1;
     chain_alloc_p();
-    int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=p_stream;
+    PScr &S = g_ps[lane];
+    float *pHb=S.Hb,*pnxb=S.nxb,*paob=S.aob,*pdqkv=S.dqkv,*pdcq=S.dcq,*pdar=S.dar,
+          *pdbr=S.dbr,*pdz=S.dz,*pdg=S.dg,*pdb=S.db,*pdor=S.dor,*pdqg=S.dqg,
+          *pdkt=S.dkt,*pdvt=S.dvt,*pdqa=S.dqa,*pdga=S.dga,*pdatt=S.datt,*pdrl=S.drl,
+          *pdhb=S.dhb,*pdlog=S.dlog;
+    MoeRoute *pdroute=S.droute;
+    int *p_rows=S.rows;
+    int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=S.stream;
     cudaMemcpyAsync(p_rows, rows, (size_t)P*4, cudaMemcpyHostToDevice, st);
     k_embed_b<<<((size_t)dim*P+255)/256,256,0,st>>>(g_ch_embed, p_rows, pHb, dim, P);
     for (int li=0; li<NL; ++li) {
