@@ -53,7 +53,12 @@ procedure Secure_Server is
    Sel_File     : constant String := "active_model";  -- persisted model choice
    Reload_Code  : constant := 75;   -- exit code: "switch model, supervisor reloads"
    Default_Port : constant := 8765;
-   Max_Clients  : constant := 8;     -- concurrent handler tasks
+   Max_Clients  : constant := 16;    -- concurrent handler tasks. Generation is
+                                     --  serialized (Infer_Lock), so extra slots
+                                     --  do not add generation throughput; they
+                                     --  keep cheap requests (/v1/models, the
+                                     --  handshake) responsive while a burst of
+                                     --  chats waits on the lock.
    Max_Queue    : constant := 64;    -- pending-connection backlog
 
    --  Generation cap per turn. Default 2048; override with ASPIDA_MAX_TOKENS

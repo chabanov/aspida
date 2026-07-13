@@ -101,7 +101,12 @@ procedure OpenAI_Proxy is
    --  time over its OWN server channel. A long generation or a stuck client on
    --  one worker no longer blocks the others (health checks, other users) — the
    --  single serialized channel used before was the head-of-line bottleneck.
-   Max_Workers : constant := 8;              --  matches the server handler pool
+   Max_Workers : constant := 16;             --  matches the server handler pool.
+                                             --  More workers than the server
+                                             --  generates at once (generation is
+                                             --  serialized) means a burst of
+                                             --  chats always leaves a free worker
+                                             --  to serve /v1/models instantly.
    Max_Queue   : constant := 64;
    type Socket_Slots is array (1 .. Max_Queue) of Socket_Type;
 
