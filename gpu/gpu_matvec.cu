@@ -898,6 +898,81 @@ __global__ void k_dnet_recur(float *S, const float *cq, const float *gate,
     o_row[h * vhd + v] = (osh[v] / rms) * norm_w[v] * (zz / (1.f + expf(-zz)));
 }
 
+// Batched delta-net recurrence: all B lanes in ONE launch (B*nv blocks) instead
+// of B separate nv-block launches. Each lane keeps its own resident state via
+// the S_arr pointer table; the per-lane inputs are contiguous [B, ...] buffers.
+// Removes B-1 launch overheads per layer AND lifts occupancy (nv=32 blocks was
+// far below the SM count; B*nv fills the device).
+__global__ void k_dnet_recur_b(float *const *__restrict__ S_arr, const float *cq,
+    const float *gate, const float *beta, const float *z, const float *norm_w,
+    float *o_row, int khd, int vhd, int q_dim, int n_k_heads, int nv, int qo, int v_dim) {
+    int lane = blockIdx.x / nv, h = blockIdx.x % nv, v = threadIdx.x;
+    float *S = S_arr[lane];
+    const float *cq_l = cq + (size_t) lane * qo;
+    const float *gate_l = gate + (size_t) lane * nv;
+    const float *beta_l = beta + (size_t) lane * nv;
+    const float *z_l = z + (size_t) lane * v_dim;
+    float *o_l = o_row + (size_t) lane * v_dim;
+    extern __shared__ float sh[];
+    float *Qr = sh, *Kr = sh + khd, *QN = sh + 2 * khd,
+          *KN = sh + 3 * khd, *Vv = sh + 4 * khd, *osh = sh + 4 * khd + vhd;
+    int k_head = h % n_k_heads;
+    Qr[v] = cq_l[k_head * khd + v];
+    Kr[v] = cq_l[q_dim + k_head * khd + v];
+    Vv[v] = cq_l[2 * q_dim + h * vhd + v];
+    __syncthreads();
+    float ssq = 0.f, ssk = 0.f;
+    for (int i = 0; i < khd; ++i) { ssq += Qr[i] * Qr[i]; ssk += Kr[i] * Kr[i]; }
+    QN[v] = Qr[v] * (1.f / (sqrtf(ssq) + 1e-6f));
+    KN[v] = Kr[v] * (1.f / (sqrtf(ssk) + 1e-6f));
+    __syncthreads();
+    float g = gate_l[h], b = beta_l[h], scale = 1.f / sqrtf((float) khd);
+    int base = h * khd;
+    float retr = 0.f;
+    for (int k = 0; k < khd; ++k) retr += g * S[(size_t)(base + k) * vhd + v] * KN[k];
+    float corr = b * (Vv[v] - retr);
+    for (int k = 0; k < khd; ++k)
+        S[(size_t)(base + k) * vhd + v] = g * S[(size_t)(base + k) * vhd + v] + KN[k] * corr;
+    float o = 0.f;
+    for (int k = 0; k < khd; ++k) o += S[(size_t)(base + k) * vhd + v] * QN[k];
+    osh[v] = o * scale;
+    __syncthreads();
+    float ss = 0.f;
+    for (int i = 0; i < vhd; ++i) ss += osh[i] * osh[i];
+    float rms = sqrtf(ss / (float) vhd + 1e-6f);
+    float zz = z_l[h * vhd + v];
+    o_l[h * vhd + v] = (osh[v] / rms) * norm_w[v] * (zz / (1.f + expf(-zz)));
+}
+
+// Batched causal conv (per-lane hist via pointer table) and gate transform.
+__global__ void k_dnet_conv_b(const float *__restrict__ qkv, float *const *__restrict__ hist_arr,
+                              const float *__restrict__ convw, float *__restrict__ cq,
+                              int qo, int kernel, int B) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x, lane = gid / qo, c = gid % qo;
+    if (lane >= B) return;
+    float *hist = hist_arr[lane];
+    const float *qkv_l = qkv + (size_t) lane * qo;
+    float *cq_l = cq + (size_t) lane * qo;
+    float acc = qkv_l[c] * convw[c * kernel + (kernel - 1)];
+    for (int k = 0; k < kernel - 1; ++k) acc += hist[(size_t) k * qo + c] * convw[c * kernel + k];
+    cq_l[c] = acc / (1.f + expf(-acc));
+    for (int k = 0; k + 1 < kernel - 1; ++k) hist[(size_t) k * qo + c] = hist[(size_t) (k + 1) * qo + c];
+    if (kernel >= 2) hist[(size_t) (kernel - 2) * qo + c] = qkv_l[c];
+}
+
+__global__ void k_dnet_gates_b(const float *__restrict__ ar, const float *__restrict__ br,
+                               const float *__restrict__ a, const float *__restrict__ dt,
+                               float *__restrict__ gate, float *__restrict__ beta, int nv, int B) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x, lane = gid / nv, h = gid % nv;
+    if (lane >= B) return;
+    const float *ar_l = ar + (size_t) lane * nv, *br_l = br + (size_t) lane * nv;
+    float *gate_l = gate + (size_t) lane * nv, *beta_l = beta + (size_t) lane * nv;
+    float xx = ar_l[h] + dt[h];
+    float sp = xx > 20.f ? xx : (xx < -20.f ? expf(xx) : logf(1.f + expf(xx)));
+    gate_l[h] = expf(a[h] * sp);
+    beta_l[h] = 1.f / (1.f + expf(-br_l[h]));
+}
+
 // One full delta-net decode layer on the device: h2d(x) -> qkv/alpha/beta/z
 // projections -> causal conv+SiLU (resident hist) -> gate/beta transform ->
 // per-head recurrence + gated RMSNorm (resident S_All) -> out projection ->
@@ -1396,6 +1471,108 @@ __global__ void k_moe_down_p(const uint8_t *__restrict__ ddw, const uint8_t *__r
     if (lane == 0) y[wid] = acc;
 }
 
+// ---- Batched MoE: all B lanes in one launch (lane = warp / rows-per-lane) ----
+// Each lane keeps its own routing (route_b[lane]) and its own I/O slice, so the
+// per-lane expert gather is unchanged — this only removes the B-way launch loop
+// and lifts occupancy (B x the blocks).
+__global__ void k_moe_gu_p_b(const uint8_t *__restrict__ gdw, const uint8_t *__restrict__ udw,
+                             const uint8_t *__restrict__ sgdw, const uint8_t *__restrict__ sudw,
+                             const float *__restrict__ x_b, float *__restrict__ h_b,
+                             const MoeRoute *__restrict__ route_b, int top_k, int dim, int intermed,
+                             long g_bpe, long u_bpe, int gk, int uk, int sgk, int suk, int B) {
+    int total = (top_k + 1) * intermed;
+    int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    int bl = gw / total, wid = gw % total;
+    if (bl >= B) return;
+    const MoeRoute *route = route_b + bl;
+    const float *x = x_b + (size_t) bl * dim;
+    float *h = h_b + (size_t) bl * (MOE_MAXK + 1) * intermed;
+    int k = wid / intermed, r = wid % intermed;
+    const uint8_t *grow, *urow; int gkind, ukind;
+    if (k < top_k) {
+        int e = route->idx[k];
+        grow = gdw + (size_t) e * g_bpe + (size_t) r * (dim / 256) * kq_bpb(gk);
+        urow = udw + (size_t) e * u_bpe + (size_t) r * (dim / 256) * kq_bpb(uk);
+        gkind = gk; ukind = uk;
+    } else {
+        grow = sgdw + (size_t) r * (dim / 256) * kq_bpb(sgk);
+        urow = sudw + (size_t) r * (dim / 256) * kq_bpb(suk);
+        gkind = sgk; ukind = suk;
+    }
+    float g = wrow(grow, gkind, x, dim, lane);
+    float u = wrow(urow, ukind, x, dim, lane);
+    if (lane == 0) h[(size_t) k * intermed + r] = (g / (1.f + expf(-g))) * u;
+}
+
+__global__ void k_moe_down_p_b(const uint8_t *__restrict__ ddw, const uint8_t *__restrict__ sddw,
+                               const float *__restrict__ h_b, float *__restrict__ y_b,
+                               const MoeRoute *__restrict__ route_b, int top_k, int intermed, int dim,
+                               long d_bpe, int dk, int sdk, int B) {
+    int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    int bl = gw / dim, wid = gw % dim;
+    if (bl >= B) return;
+    const MoeRoute *route = route_b + bl;
+    const float *h = h_b + (size_t) bl * (MOE_MAXK + 1) * intermed;
+    size_t bpr_d = (size_t) (intermed / 256) * kq_bpb(dk);
+    size_t bpr_s = (size_t) (intermed / 256) * kq_bpb(sdk);
+    float acc = 0.f;
+    for (int k = 0; k < top_k; ++k) {
+        const uint8_t *row = ddw + (size_t) route->idx[k] * d_bpe + (size_t) wid * bpr_d;
+        acc += route->w[k] * wrow(row, dk, h + (size_t) k * intermed, intermed, lane);
+    }
+    acc += route->w[MOE_MAXK]
+           * wrow(sddw + (size_t) wid * bpr_s, sdk, h + (size_t) top_k * intermed, intermed, lane);
+    if (lane == 0) y_b[(size_t) bl * dim + wid] = acc;
+}
+
+__global__ void k_moe_route_b(const float *__restrict__ rl_b, const float *__restrict__ x_b,
+                              const float *__restrict__ sgi, int sgi_len, int n_exp, int top_k,
+                              int dim, MoeRoute *__restrict__ route_b, int B) {
+    int bl = blockIdx.x; if (bl >= B) return;
+    const float *rl = rl_b + (size_t) bl * n_exp;
+    const float *x = x_b + (size_t) bl * dim;
+    MoeRoute *route = route_b + bl;
+    __shared__ float r[512]; __shared__ float red[256]; __shared__ int redi[256];
+    __shared__ float mx, sm;
+    int tid = threadIdx.x, nt = blockDim.x;
+    if (n_exp > 512) return;
+    float lmax = -3.402823466e38f;
+    for (int e = tid; e < n_exp; e += nt) { r[e] = rl[e]; if (r[e] > lmax) lmax = r[e]; }
+    red[tid] = lmax; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]); __syncthreads(); }
+    if (tid == 0) mx = red[0]; __syncthreads();
+    float ls = 0.f;
+    for (int e = tid; e < n_exp; e += nt) { r[e] = expf(r[e] - mx); ls += r[e]; }
+    red[tid] = ls; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; __syncthreads(); }
+    if (tid == 0) sm = red[0]; __syncthreads();
+    for (int e = tid; e < n_exp; e += nt) r[e] /= sm;
+    __syncthreads();
+    for (int kk = 0; kk < top_k; ++kk) {
+        float bv = -3.402823466e38f; int bi = 0;
+        for (int e = tid; e < n_exp; e += nt) if (r[e] > bv) { bv = r[e]; bi = e; }
+        red[tid] = bv; redi[tid] = bi; __syncthreads();
+        for (int o = nt / 2; o > 0; o >>= 1) {
+            if (tid < o && red[tid + o] > red[tid]) { red[tid] = red[tid + o]; redi[tid] = redi[tid + o]; }
+            __syncthreads();
+        }
+        if (tid == 0) { route->idx[kk] = redi[0]; route->w[kk] = red[0]; r[redi[0]] = -3.402823466e38f; }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float sw = 0.f;
+        for (int kk = 0; kk < top_k; ++kk) sw += route->w[kk];
+        for (int kk = 0; kk < top_k; ++kk) route->w[kk] /= sw;
+        for (int kk = top_k; kk < MOE_MAXK; ++kk) { route->idx[kk] = 0; route->w[kk] = 0.f; }
+    }
+    __syncthreads();
+    float gd = 0.f;
+    if (sgi_len > 1 && sgi) for (int d = tid; d < dim; d += nt) gd += sgi[d] * x[d];
+    red[tid] = gd; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; __syncthreads(); }
+    if (tid == 0) route->w[MOE_MAXK] = (sgi_len > 1 && sgi) ? 1.0f / (1.0f + expf(-red[0])) : 1.0f;
+}
+
 struct ChainLayer {
     int is_fattn;
     float *attn_norm, *post_norm;
@@ -1788,6 +1965,8 @@ static float *Hb=nullptr,*nxb=nullptr,*aob=nullptr,*dlogb=nullptr,*dqkvb=nullptr
              *dqab=nullptr,*dgab=nullptr,*dattb=nullptr,*drlb=nullptr,*dhbb=nullptr;
 static MoeRoute *drouteb=nullptr;
 static int *gb_rows=nullptr,*gb_pos=nullptr;
+static void **gb_Sptr=nullptr;    // device table of B per-lane delta-net S pointers
+static void **gb_histptr=nullptr; // device table of B per-lane conv hist pointers
 static int chb_inited=0;
 static cudaStream_t gb_stream=0;
 
@@ -1808,6 +1987,8 @@ static void chain_alloc_b(void) {
     if (g_mx_hbuf) cudaMalloc(&dhbb, Bd*g_mx_hbuf*4);
     cudaMalloc(&drouteb, Bd*sizeof(MoeRoute));
     cudaMalloc(&gb_rows, Bd*4); cudaMalloc(&gb_pos, Bd*4);
+    cudaMalloc(&gb_Sptr, (size_t) g_chain.size() * Bd * sizeof(void*));
+    cudaMalloc(&gb_histptr, (size_t) g_chain.size() * Bd * sizeof(void*));
     cudaStreamCreate(&gb_stream);
     chb_inited=1;
 }
@@ -1821,6 +2002,21 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
     int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=gb_stream;
     cudaMemcpy(gb_rows, rows, (size_t)B*4, cudaMemcpyHostToDevice);
     cudaMemcpy(gb_pos, pos, (size_t)B*4, cudaMemcpyHostToDevice);
+    //  Per-lane delta-net S pointers for every layer, assembled once (the host
+    //  staging is untouched for the rest of this forward, so the async copy is
+    //  race-free). k_dnet_recur_b then reads gb_Sptr[li*B + lane].
+    static void *hSptr[BMAX * 64], *hHptr[BMAX * 64];
+    for (int li = 0; li < NL; ++li)
+        if (!g_chain[li].is_fattn)
+            for (int b = 0; b < B; ++b) {
+                DnetState ds = g_dnet[handles[b * NL + li]];
+                hSptr[(size_t) li * B + b] = ds.S;
+                hHptr[(size_t) li * B + b] = ds.hist;
+            }
+    cudaMemcpyAsync(gb_Sptr, hSptr, (size_t) NL * B * sizeof(void*),
+                    cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(gb_histptr, hHptr, (size_t) NL * B * sizeof(void*),
+                    cudaMemcpyHostToDevice, st);
     k_embed_b<<<((size_t)dim*B+255)/256,256,0,st>>>(g_ch_embed, gb_rows, Hb, dim, B);
     for (int li=0; li<NL; ++li) {
         ChainLayer &L=g_chain[li];
@@ -1831,12 +2027,15 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
             launch_mv_b(L.be, L.be_k, dim, L.nv, nxb, dbrb, B, st);
             launch_mv_b(L.ga, L.ga_k, dim, L.v_dim, nxb, dzb, B, st);
             size_t shmem=(size_t)(4*L.khd+2*L.vhd)*4;
-            for (int b=0;b<B;++b) {
-                DnetState ds=g_dnet[handles[b*NL+li]];
-                k_dnet_conv<<<(L.qo+255)/256,256,0,st>>>(dqkvb+(size_t)b*L.qo, ds.hist, L.conv, dcqb+(size_t)b*L.qo, L.qo, L.kernel);
-                k_dnet_gates<<<(L.nv+255)/256,256,0,st>>>(darb+(size_t)b*L.nv, dbrb+(size_t)b*L.nv, L.aw, L.dtw, dgb+(size_t)b*L.nv, dbb+(size_t)b*L.nv, L.nv);
-                k_dnet_recur<<<L.nv,L.khd,shmem,st>>>(ds.S, dcqb+(size_t)b*L.qo, dgb+(size_t)b*L.nv, dbb+(size_t)b*L.nv, dzb+(size_t)b*L.v_dim, L.nw, dorb+(size_t)b*L.v_dim, L.khd,L.vhd,L.q_dim,L.nkh);
-            }
+            k_dnet_conv_b<<<((size_t)B*L.qo+255)/256,256,0,st>>>(
+                dqkvb, (float *const *) (gb_histptr + (size_t) li * B), L.conv, dcqb, L.qo, L.kernel, B);
+            k_dnet_gates_b<<<((size_t)B*L.nv+255)/256,256,0,st>>>(
+                darb, dbrb, L.aw, L.dtw, dgb, dbb, L.nv, B);
+            //  All B lanes' recurrence in one launch (B*nv blocks) — per-lane S
+            //  via the pointer table, per-lane I/O via the [B,...] buffers.
+            k_dnet_recur_b<<<B*L.nv, L.khd, shmem, st>>>(
+                (float *const *) (gb_Sptr + (size_t) li * B), dcqb, dgb, dbb, dzb,
+                L.nw, dorb, L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim);
             launch_mv_b(L.ow, L.ow_k, L.v_dim, dim, dorb, aob, B, st);
         } else {
             int kvd=L.nkv*L.hd, att=L.nq*L.hd, qgd=L.nq*2*L.hd;
@@ -1859,12 +2058,14 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
         if (L.has_moe) {
             k_norm1_b<<<B,256,0,st>>>(Hb, L.post_norm, nxb, dim, B);
             launch_mv_b(L.rw, L.rk, dim, L.n_exp, nxb, drlb, B, st);
-            for (int b=0;b<B;++b) {
-                k_moe_route<<<1,256,0,st>>>(drlb+(size_t)b*L.n_exp, nxb+(size_t)b*dim, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, drouteb+b);
-                int w1=(L.top_k+1)*L.intermed, b1=(w1*32+255)/256, b2=(dim*32+255)/256;
-                k_moe_gu_p<<<b1,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, nxb+(size_t)b*dim, dhbb+(size_t)b*(MOE_MAXK+1)*L.intermed, drouteb+b, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk);
-                k_moe_down_p<<<b2,256,0,st>>>(L.ddw,L.sddw, dhbb+(size_t)b*(MOE_MAXK+1)*L.intermed, aob+(size_t)b*dim, drouteb+b, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk);
-            }
+            //  All B lanes' MoE in three launches instead of 3*B (route, gate+up,
+            //  down). Per-lane routing/gather is unchanged — this removes the loop
+            //  overhead and fills the device.
+            k_moe_route_b<<<B,256,0,st>>>(drlb, nxb, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, drouteb, B);
+            int w1=(L.top_k+1)*L.intermed;
+            int b1b=((size_t)B*w1*32+255)/256, b2b=((size_t)B*dim*32+255)/256;
+            k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, nxb, dhbb, drouteb, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, B);
+            k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, dhbb, aob, drouteb, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, B);
             k_axpy_b<<<((size_t)dim*B+255)/256,256,0,st>>>(Hb, aob, dim, B);
         }
     }
