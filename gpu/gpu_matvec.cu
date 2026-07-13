@@ -2182,6 +2182,111 @@ __global__ void k_dnet_recur_chunk(float *__restrict__ S, const float *__restric
     }
 }
 
+// Batched prep for a chunk of P positions: block = (bt) where bt encodes
+// (which head/kv, position t). Writes K/V into the resident cache at
+// pos_start+t and the rotated Q into q_all_chunk[t]. Identical math to
+// k_fattn_prep, position by position, but all P in ONE launch.
+__global__ void k_fattn_prep_chunk(
+    const float *__restrict__ qg, const float *__restrict__ kt, const float *__restrict__ vt,
+    const float *__restrict__ q_norm, const float *__restrict__ k_norm,
+    float *__restrict__ q_all, float *__restrict__ g_all,
+    float *__restrict__ Kc, float *__restrict__ Vc,
+    int nq, int nkv, int hd, int kvd, int pos_start,
+    int rd, float base, float freq_scale, float m_scale,
+    int yarn_on, float corr_lo, float corr_hi,
+    const float *__restrict__ ff, int use_ff, int interleaved, int sec_total, int P) {
+    extern __shared__ float sh[];
+    float *nrm = sh;                       // [hd]
+    int nbt = nq + nkv;
+    int t = blockIdx.x / nbt, bb = blockIdx.x % nbt, d = threadIdx.x;
+    int pos = pos_start + t;
+    int qgd = nq * 2 * hd, att = nq * hd;
+    const float *qg_t = qg + (size_t) t * qgd;
+    const float *kt_t = kt + (size_t) t * kvd;
+    const float *vt_t = vt + (size_t) t * kvd;
+    int half = rd / 2;
+    bool is_q = bb < nq;
+    int head = is_q ? bb : bb - nq;
+    float v;
+    if (is_q) {
+        v = qg_t[head * 2 * hd + d];
+        g_all[(size_t) t * att + head * hd + d] = qg_t[head * 2 * hd + hd + d];
+    } else {
+        v = kt_t[head * hd + d];
+        Vc[(size_t) pos * kvd + head * hd + d] = vt_t[head * hd + d];
+    }
+    nrm[d] = v;
+    __syncthreads();
+    float ss = 0.f;
+    for (int i = 0; i < hd; ++i) ss += nrm[i] * nrm[i];
+    float rms = sqrtf(ss / (float) hd + 1e-6f);
+    float w = is_q ? q_norm[d] : k_norm[d];
+    float nv = (v / rms) * w;
+    __syncthreads();
+    nrm[d] = nv;
+    __syncthreads();
+    float out = nv;
+    if (d < rd) {
+        int i, other; bool first;
+        if (interleaved) { i = d / 2; first = (d % 2) == 0; other = first ? d + 1 : d - 1; }
+        else if (d < half) { i = d; first = true;  other = d + half; }
+        else               { i = d - half; first = false; other = d - half; }
+        int pos_eff = (i < sec_total) ? pos : 0;
+        float th = rope_theta(i, pos_eff, rd, base, freq_scale,
+                              yarn_on, corr_lo, corr_hi, ff, use_ff);
+        float c = cosf(th) * m_scale, s = sinf(th) * m_scale;
+        float x1 = first ? nrm[d] : nrm[other];
+        float x2 = first ? nrm[other] : nrm[d];
+        out = first ? (x1 * c - x2 * s) : (x2 * c + x1 * s);
+    }
+    if (is_q) q_all[(size_t) t * att + head * hd + d] = out;
+    else      Kc[(size_t) pos * kvd + head * hd + d] = out;
+}
+
+// Batched causal attention for a chunk: block = (h, t), threads = hd. Query
+// (head h, chunk-position t) attends over cache 0..pos_start+t with an ONLINE
+// (flash) softmax — no per-head scores scratch, one launch for all nq*P queries
+// instead of one per position. Numerically the running-max softmax differs from
+// the two-pass one only at the ~1e-6 float level; validated bit-exact end to
+// end. threads = hd (each owns output dim d and cooperates on each dot).
+__global__ void k_fattn_attend_chunk(
+    const float *__restrict__ q_all, const float *__restrict__ g_all,
+    const float *__restrict__ Kc, const float *__restrict__ Vc,
+    float *__restrict__ attn,
+    int nq, int nkv, int hd, int kvd, int pos_start) {
+    int t = blockIdx.x / nq, h = blockIdx.x % nq, d = threadIdx.x;
+    int len = pos_start + t + 1;
+    int rep = nq / nkv, kvh = h / rep;
+    int q_off = h * hd, kv_off = kvh * hd, att = nq * hd;
+    const float *q = q_all + (size_t) t * att + q_off;
+    float scale = rsqrtf((float) hd);
+    __shared__ float red[256];
+    __shared__ float qsh[256];
+    qsh[d] = q[d];
+    __syncthreads();
+    float m = -3.402823466e38f, l = 0.f, acc = 0.f;
+    for (int s = 0; s < len; ++s) {
+        const float *k = Kc + (size_t) s * kvd + kv_off;
+        float part = qsh[d] * k[d];
+        // block reduce (hd threads) -> dot in red[0], broadcast
+        red[d] = part; __syncthreads();
+        for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+            if (d < o) red[d] += red[d + o];
+            __syncthreads();
+        }
+        float dot = red[0] * scale;
+        __syncthreads();
+        float m_new = fmaxf(m, dot);
+        float corr = expf(m - m_new);
+        float p = expf(dot - m_new);
+        l = l * corr + p;
+        acc = acc * corr + p * Vc[(size_t) s * kvd + kv_off + d];
+        m = m_new;
+    }
+    float g = g_all[(size_t) t * att + q_off + d];
+    attn[(size_t) t * att + q_off + d] = (acc / l) * (1.f / (1.f + expf(-g)));
+}
+
 // Prefill scratch (×PCH), separate from decode buffers so prefill can overlap
 // the Driver. Only the LM head runs once (last position), so no [PCH,vocab].
 static float *pHb=nullptr,*pnxb=nullptr,*paob=nullptr,*pdqkv=nullptr,*pdcq=nullptr,
@@ -2248,21 +2353,16 @@ extern "C" void aspida_gpu_chain_prefill(int P, const int *rows, int pos_start,
             launch_mv_b(L.qw, L.qw_k, dim, qgd, pnxb, pdqg, P, st);
             launch_mv_b(L.kw, L.kw_k, dim, kvd, pnxb, pdkt, P, st);
             launch_mv_b(L.vw, L.vw_k, dim, kvd, pnxb, pdvt, P, st);
-            // Causal: write K/V then attend, position by position (K/V from
-            // earlier positions in this chunk must be resident before a later
-            // query attends over them).
-            for (int t=0;t<P;++t) {
-                int pos = pos_start + t;
-                cudaMemcpyAsync(p_pos, &pos, 4, cudaMemcpyHostToDevice, st);
-                k_fattn_prep<<<L.nq+L.nkv,L.hd,(size_t)L.hd*4,st>>>(
-                    pdqg+(size_t)t*qgd, pdkt+(size_t)t*kvd, pdvt+(size_t)t*kvd, L.qn, L.kn,
-                    pdqa+(size_t)t*att, pdga+(size_t)t*att, fs.K, fs.V,
-                    L.nq,L.nkv,L.hd,kvd, p_pos, L.rd,L.base,L.freq_scale,L.m_scale,
-                    L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total);
-                k_fattn_attend<<<L.nq,256,0,st>>>(
-                    pdqa+(size_t)t*att, pdga+(size_t)t*att, fs.K, fs.V, fs.scores, pdatt+(size_t)t*att,
-                    L.nq,L.nkv,L.hd,kvd, p_pos, fs.max_len);
-            }
+            //  Write ALL P positions' K/V + rotated Q in one launch, then attend
+            //  all nq*P queries in one launch (causal by pos_start+t). K/V of
+            //  earlier chunk positions are resident before later queries read
+            //  them because the prep launch completes before the attend launch.
+            k_fattn_prep_chunk<<<(size_t)(L.nq+L.nkv)*P, L.hd, (size_t)L.hd*4, st>>>(
+                pdqg, pdkt, pdvt, L.qn, L.kn, pdqa, pdga, fs.K, fs.V,
+                L.nq,L.nkv,L.hd,kvd, pos_start, L.rd,L.base,L.freq_scale,L.m_scale,
+                L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total, P);
+            k_fattn_attend_chunk<<<(size_t)L.nq*P, L.hd, 0, st>>>(
+                pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start);
             launch_mv_b(L.fow, L.fow_k, att, dim, pdatt, paob, P, st);
         }
         k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
