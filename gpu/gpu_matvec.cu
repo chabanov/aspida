@@ -1857,10 +1857,18 @@ extern "C" int aspida_gpu_last_error(void) {
 // replay it — one launch for the whole ~350-kernel token instead of 350.
 extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,
                                          const int *attn_handles, float *logits) {
+    // CUDA graph capture speeds the per-token chain (one launch vs ~350) but is
+    // FRAGILE when another CUDA context shares the device: a co-resident Ollama
+    // model (bge-m3) doing GPU work during the first-token capture corrupts the
+    // captured graph — garbage logits (immediate stop, 0 tokens) on Ada RTX, and
+    // a hard hang on an NVIDIA GPU (the 2026-07-13 prod first-inference hang). Set
+    // ASPIDA_NO_GRAPH to take the robust direct-launch path (same kernels, one
+    // launch each, no capture): slower but correct when the GPU is shared.
+    static int no_graph = getenv("ASPIDA_NO_GRAPH") ? 1 : 0;
     if (g_handles == nullptr) aspida_gpu_chain_begin(attn_handles);
     cudaMemcpy(g_d_row, &embed_row, 4, cudaMemcpyHostToDevice);
     cudaMemcpy(g_d_pos, &pos, 4, cudaMemcpyHostToDevice);
-    if (!g_captured) {
+    if (!no_graph && !g_captured) {
         cudaStreamBeginCapture(g_cstream, cudaStreamCaptureModeThreadLocal);
         chain_record(g_cstream);
         cudaStreamEndCapture(g_cstream, &g_graph);
@@ -1871,7 +1879,11 @@ extern "C" void aspida_gpu_chain_forward(int embed_row, int pos,
     static cudaEvent_t ev0 = nullptr, ev1 = nullptr;
     if (cprof && !ev0) { cudaEventCreate(&ev0); cudaEventCreate(&ev1); }
     if (cprof) cudaEventRecord(ev0, g_cstream);
-    cudaGraphLaunch(g_gexec, g_cstream);
+    if (no_graph) {
+        chain_record(g_cstream);          // launch the kernels directly
+    } else {
+        cudaGraphLaunch(g_gexec, g_cstream);
+    }
     cudaMemcpyAsync(logits, dlog, (size_t) g_ch_vocab * 4, cudaMemcpyDeviceToHost, g_cstream);
     if (cprof) cudaEventRecord(ev1, g_cstream);
     cudaStreamSynchronize(g_cstream);
