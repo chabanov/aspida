@@ -330,11 +330,20 @@ begin
             elsif Err = 413 then
                Write_JSON (Client, "413 Payload Too Large",
                  OpenAI.Error_Response ("request exceeds the proxy buffer"));
-            elsif Ada.Strings.Fixed.Index (Pth, "/chat/completions") > 0 then
-               Secure_Channel.Send_Message (Ch, CT'Access, Frame (Protocol.Tag_Chat, Bdy));
+            elsif Ada.Strings.Fixed.Index (Pth, "/chat/completions") > 0
+              or else Ada.Strings.Fixed.Index (Pth, "/api/chat") > 0
+            then
                --  React to the server's reply type: Tag_Resp = one JSON;
-               --  Tag_Token... / Tag_Done = streaming (emit SSE).
+               --  Tag_Token... / Tag_Done = streaming.
+               --  Ollama-native /api/chat: convert the request body and emit the
+               --  reply as newline-delimited JSON (message.content/.thinking)
+               --  instead of SSE. The /v1 path is unchanged (Ollama_Native=False).
                declare
+                  Ollama_Native : constant Boolean :=
+                    Ada.Strings.Fixed.Index (Pth, "/api/chat") > 0;
+                  NL      : constant String := [1 => ASCII.LF];
+                  CType   : constant String :=
+                    (if Ollama_Native then "application/x-ndjson" else "text/event-stream");
                   Streaming   : Boolean := False;
                   First       : Boolean := True;
                   --  Tracks which channel the next Tag_Token belongs to.
@@ -346,6 +355,13 @@ begin
                   Finish_Reason : Ada.Strings.Unbounded.Unbounded_String :=
                     Ada.Strings.Unbounded.To_Unbounded_String ("stop");
                begin
+                  declare
+                     Send_Body : constant String :=
+                       (if Ollama_Native then OpenAI.Ollama_Body_To_OpenAI (Bdy) else Bdy);
+                  begin
+                     Secure_Channel.Send_Message
+                       (Ch, CT'Access, Frame (Protocol.Tag_Chat, Send_Body));
+                  end;
                   loop
                      declare
                         Rec : constant Crypto.Byte_Array :=
@@ -353,12 +369,18 @@ begin
                      begin
                         exit when Rec'Length = 0;
                         if Rec (Rec'First) = Protocol.Tag_Resp then
-                           Write_JSON (Client, "200 OK", Body_Of (Rec));
+                           if Ollama_Native then
+                              Write_JSON (Client, "200 OK",
+                                OpenAI.Ollama_Response_From_OpenAI
+                                  (Body_Of (Rec), Model_Name));
+                           else
+                              Write_JSON (Client, "200 OK", Body_Of (Rec));
+                           end if;
                            exit;
                         elsif Rec (Rec'First) = Protocol.Tag_Reasoning_Begin then
                            if not Streaming then
                               Sock_Write (Client, "HTTP/1.1 200 OK" & CRLF
-                                & "Content-Type: text/event-stream" & CRLF
+                                & "Content-Type: " & CType & CRLF
                                 & "Cache-Control: no-cache" & CRLF
                                 & "Access-Control-Allow-Origin: *" & CRLF
                                 & "Connection: close" & CRLF & CRLF);
@@ -370,7 +392,7 @@ begin
                         elsif Rec (Rec'First) = Protocol.Tag_Tool_Call then
                            if not Streaming then
                               Sock_Write (Client, "HTTP/1.1 200 OK" & CRLF
-                                & "Content-Type: text/event-stream" & CRLF
+                                & "Content-Type: " & CType & CRLF
                                 & "Cache-Control: no-cache" & CRLF
                                 & "Access-Control-Allow-Origin: *" & CRLF
                                 & "Connection: close" & CRLF & CRLF);
@@ -388,28 +410,43 @@ begin
                                 and then JSON.Exists (JSON.Get (Idx, "name"))
                                 and then JSON.Exists (JSON.Get (Idx, "arguments"))
                               then
-                                 Sock_Write (Client, "data: "
-                                   & OpenAI.Tool_Call_Chunk
-                                       (Model_Name,
-                                        JSON.As_String (JSON.Get (Idx, "id")),
-                                        JSON.As_String (JSON.Get (Idx, "name")),
-                                        JSON.As_String (JSON.Get (Idx, "arguments")))
-                                   & CRLF & CRLF);
+                                 if Ollama_Native then
+                                    Sock_Write (Client,
+                                      OpenAI.Ollama_Tool_Chunk
+                                        (Model_Name,
+                                         JSON.As_String (JSON.Get (Idx, "id")),
+                                         JSON.As_String (JSON.Get (Idx, "name")),
+                                         JSON.As_String (JSON.Get (Idx, "arguments"))) & NL);
+                                 else
+                                    Sock_Write (Client, "data: "
+                                      & OpenAI.Tool_Call_Chunk
+                                          (Model_Name,
+                                           JSON.As_String (JSON.Get (Idx, "id")),
+                                           JSON.As_String (JSON.Get (Idx, "name")),
+                                           JSON.As_String (JSON.Get (Idx, "arguments")))
+                                      & CRLF & CRLF);
+                                 end if;
                               end if;
                            end;
                         elsif Rec (Rec'First) = Protocol.Tag_Token then
                            if not Streaming then
                               Sock_Write (Client, "HTTP/1.1 200 OK" & CRLF
-                                & "Content-Type: text/event-stream" & CRLF
+                                & "Content-Type: " & CType & CRLF
                                 & "Cache-Control: no-cache" & CRLF
                                 & "Access-Control-Allow-Origin: *" & CRLF
                                 & "Connection: close" & CRLF & CRLF);
                               Streaming := True;
                            end if;
-                           Sock_Write (Client, "data: "
-                             & OpenAI.Chat_Chunk
-                                 (Model_Name, Body_Of (Rec), First, In_Reasoning)
-                             & CRLF & CRLF);
+                           if Ollama_Native then
+                              Sock_Write (Client,
+                                OpenAI.Ollama_Chunk
+                                  (Model_Name, Body_Of (Rec), In_Reasoning) & NL);
+                           else
+                              Sock_Write (Client, "data: "
+                                & OpenAI.Chat_Chunk
+                                    (Model_Name, Body_Of (Rec), First, In_Reasoning)
+                                & CRLF & CRLF);
+                           end if;
                            First := False;
                            --  A reasoning block typically ends before the
                            --  next event. The natural signal is the
@@ -424,7 +461,7 @@ begin
                         elsif Rec (Rec'First) = Protocol.Tag_Done then
                            if not Streaming then
                               Sock_Write (Client, "HTTP/1.1 200 OK" & CRLF
-                                & "Content-Type: text/event-stream" & CRLF
+                                & "Content-Type: " & CType & CRLF
                                 & "Cache-Control: no-cache" & CRLF
                                 & "Access-Control-Allow-Origin: *" & CRLF
                                 & "Connection: close" & CRLF & CRLF);
@@ -443,13 +480,21 @@ begin
                                    (if Trunc then "length"
                                     else Ada.Strings.Unbounded.To_String (Finish_Reason));
                               begin
-                                 Sock_Write (Client, "data: "
-                                   & OpenAI.Chat_Done_Chunk
-                                       (Model_Name, PT, CT, Effective)
-                                   & CRLF & CRLF);
+                                 if Ollama_Native then
+                                    Sock_Write (Client,
+                                      OpenAI.Ollama_Done_Chunk
+                                        (Model_Name, PT, CT, Effective) & NL);
+                                 else
+                                    Sock_Write (Client, "data: "
+                                      & OpenAI.Chat_Done_Chunk
+                                          (Model_Name, PT, CT, Effective)
+                                      & CRLF & CRLF);
+                                 end if;
                               end;
                            end;
-                           Sock_Write (Client, "data: [DONE]" & CRLF & CRLF);
+                           if not Ollama_Native then
+                              Sock_Write (Client, "data: [DONE]" & CRLF & CRLF);
+                           end if;
                            exit;
                         end if;
                      end;

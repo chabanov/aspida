@@ -1233,10 +1233,18 @@ package body LLM_Qwen is
          --  recursion question (greedy, with a system prompt -> 0 tokens).
          --  Letting the model emit its own tags restores reasoning and fixes
          --  the degenerate stops.
+         --  Enable_Thinking=False (Ollama `think:false`): prefill the CANONICAL
+         --  closed empty think block, exactly as Qwen3.6's own chat template
+         --  does for no-think — the model then answers directly. (This is the
+         --  angle-bracketed form; the earlier degenerate loop came from bare
+         --  "think\n\nthink\n\n" without brackets, which primed the literal word.)
          Ids : constant LLM_Tokenizer.Token_Array :=
            Conv_Ids (M, Conversation, Conversation'First)
            & One (M.Im_Start_Id)
-           & LLM_Tokenizer.Encode (M.Tok, "assistant" & LF);
+           & LLM_Tokenizer.Encode
+               (M.Tok,
+                (if Params.Enable_Thinking then "assistant" & LF
+                 else "assistant" & LF & "<think>" & LF & LF & "</think>" & LF & LF));
          Raw : constant String :=
            Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id,
                           null, Params, Stats);

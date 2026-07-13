@@ -35,6 +35,10 @@ package LLM_Sampler is
       --  answers) is forced to emit real content first. 0 => disabled.
       Min_Tokens     : Integer  := 0;
       Seed           : Long_Long_Integer := 0;  -- 0 => fixed default seed
+      --  Adaptive thinking control (Ollama-native `think` / Qwen enable_thinking).
+      --  True  => let the model emit its own <think>…</think> reasoning.
+      --  False => prefill a closed empty think block so it answers directly.
+      Enable_Thinking : Boolean := True;
    end record;
 
    Greedy : constant Params := (others => <>);

@@ -10,6 +10,7 @@ with LLM_Catalog;
 package body OpenAI is
 
    use type LLM_Qwen.Role_Kind;
+   use type JSON.Value_Ref;
 
    ID_Str : constant String := "chatcmpl-aspida";
 
@@ -50,6 +51,9 @@ package body OpenAI is
          R.Params.Top_K            := JSON.As_Int   (JSON.Get (V, "top_k"), 20);
          R.Params.Min_P            := JSON.As_Float (JSON.Get (V, "min_p"), 0.0);
          R.Params.Presence_Penalty := JSON.As_Float (JSON.Get (V, "presence_penalty"), 1.5);
+         --  Ollama-native `think` maps to this on the /api/chat bridge; default
+         --  thinking ON (the model reasons unless the caller disables it).
+         R.Params.Enable_Thinking  := JSON.As_Bool (JSON.Get (V, "enable_thinking"), True);
          R.Params.Seed        :=
            Long_Long_Integer (JSON.As_Int (JSON.Get (V, "seed"), 0));
          if JSON.Exists (JSON.Get (V, "frequency_penalty")) then
@@ -254,6 +258,158 @@ package body OpenAI is
       JSON.Set (Root, "usage", Usage);
       return JSON.To_String (Root);
    end Chat_Done_Chunk;
+
+   function Ollama_Body_To_OpenAI (Raw : String) return String is
+      V     : JSON.Value_Ref;
+      Out_O : constant JSON.Value_Ref := JSON.New_Object;
+      Opts  : JSON.Value_Ref;
+   begin
+      begin
+         V := JSON.Parse (Raw);
+      exception when others => return Raw;
+      end;
+      if V = null then return Raw; end if;
+      if JSON.Exists (JSON.Get (V, "model")) then
+         JSON.Set (Out_O, "model", JSON.Get (V, "model"));
+      end if;
+      if JSON.Exists (JSON.Get (V, "messages")) then
+         JSON.Set (Out_O, "messages", JSON.Get (V, "messages"));
+      end if;
+      if JSON.Exists (JSON.Get (V, "tools")) then
+         JSON.Set (Out_O, "tools", JSON.Get (V, "tools"));
+      end if;
+      JSON.Set (Out_O, "stream", JSON.Bool (JSON.As_Bool (JSON.Get (V, "stream"), True)));
+      JSON.Set (Out_O, "enable_thinking",
+                JSON.Bool (JSON.As_Bool (JSON.Get (V, "think"), True)));
+      Opts := JSON.Get (V, "options");
+      if Opts /= null then
+         if JSON.Exists (JSON.Get (Opts, "temperature")) then
+            JSON.Set (Out_O, "temperature", JSON.Get (Opts, "temperature"));
+         end if;
+         if JSON.Exists (JSON.Get (Opts, "num_predict")) then
+            JSON.Set (Out_O, "max_tokens", JSON.Get (Opts, "num_predict"));
+         end if;
+         if JSON.Exists (JSON.Get (Opts, "top_p")) then
+            JSON.Set (Out_O, "top_p", JSON.Get (Opts, "top_p"));
+         end if;
+         if JSON.Exists (JSON.Get (Opts, "top_k")) then
+            JSON.Set (Out_O, "top_k", JSON.Get (Opts, "top_k"));
+         end if;
+      end if;
+      return JSON.To_String (Out_O);
+   end Ollama_Body_To_OpenAI;
+
+   function Ollama_Chunk (Model, Piece : String; Reason : Boolean) return String is
+      Root : constant JSON.Value_Ref := JSON.New_Object;
+      Msg  : constant JSON.Value_Ref := JSON.New_Object;
+   begin
+      JSON.Set (Msg, "role", JSON.Str ("assistant"));
+      if Reason then
+         JSON.Set (Msg, "thinking", JSON.Str (Piece));
+      else
+         JSON.Set (Msg, "content", JSON.Str (Piece));
+      end if;
+      JSON.Set (Root, "model", JSON.Str (Model));
+      JSON.Set (Root, "message", Msg);
+      JSON.Set (Root, "done", JSON.Bool (False));
+      return JSON.To_String (Root);
+   end Ollama_Chunk;
+
+   function Ollama_Tool_Chunk (Model, Id, Name, Arguments : String) return String is
+      Root : constant JSON.Value_Ref := JSON.New_Object;
+      Msg  : constant JSON.Value_Ref := JSON.New_Object;
+      Arr  : constant JSON.Value_Ref := JSON.New_Array;
+      TC   : constant JSON.Value_Ref := JSON.New_Object;
+      Fn   : constant JSON.Value_Ref := JSON.New_Object;
+      Args : JSON.Value_Ref;
+   begin
+      JSON.Set (Fn, "name", JSON.Str (Name));
+      --  Ollama tool arguments are an OBJECT; parse when the model gave valid
+      --  JSON, else fall back to the raw string (the platform accepts both).
+      begin
+         Args := (if Arguments'Length > 0 then JSON.Parse (Arguments) else JSON.New_Object);
+      exception when others => Args := JSON.Str (Arguments);
+      end;
+      JSON.Set (Fn, "arguments", Args);
+      JSON.Set (TC, "function", Fn);
+      if Id'Length > 0 then JSON.Set (TC, "id", JSON.Str (Id)); end if;
+      JSON.Append (Arr, TC);
+      JSON.Set (Msg, "role", JSON.Str ("assistant"));
+      JSON.Set (Msg, "tool_calls", Arr);
+      JSON.Set (Root, "model", JSON.Str (Model));
+      JSON.Set (Root, "message", Msg);
+      JSON.Set (Root, "done", JSON.Bool (False));
+      return JSON.To_String (Root);
+   end Ollama_Tool_Chunk;
+
+   function Ollama_Response_From_OpenAI (Raw, Model : String) return String is
+      V    : JSON.Value_Ref;
+      Root : constant JSON.Value_Ref := JSON.New_Object;
+      Msg  : constant JSON.Value_Ref := JSON.New_Object;
+   begin
+      begin V := JSON.Parse (Raw); exception when others => return Raw; end;
+      if V = null then return Raw; end if;
+      declare
+         Choices : constant JSON.Value_Ref := JSON.Get (V, "choices");
+         C0   : constant JSON.Value_Ref :=
+           (if Choices /= null and then JSON.Length (Choices) >= 1
+            then JSON.Item (Choices, 1) else null);
+         OMsg : constant JSON.Value_Ref :=
+           (if C0 /= null then JSON.Get (C0, "message") else null);
+         Usage : constant JSON.Value_Ref := JSON.Get (V, "usage");
+      begin
+         JSON.Set (Msg, "role", JSON.Str ("assistant"));
+         if OMsg /= null then
+            if JSON.Exists (JSON.Get (OMsg, "content")) then
+               JSON.Set (Msg, "content", JSON.Get (OMsg, "content"));
+            else
+               JSON.Set (Msg, "content", JSON.Str (""));
+            end if;
+            if JSON.Exists (JSON.Get (OMsg, "reasoning_content")) then
+               JSON.Set (Msg, "thinking", JSON.Get (OMsg, "reasoning_content"));
+            end if;
+            if JSON.Exists (JSON.Get (OMsg, "tool_calls")) then
+               JSON.Set (Msg, "tool_calls", JSON.Get (OMsg, "tool_calls"));
+            end if;
+         else
+            JSON.Set (Msg, "content", JSON.Str (""));
+         end if;
+         JSON.Set (Root, "model", JSON.Str (Model));
+         JSON.Set (Root, "message", Msg);
+         JSON.Set (Root, "done", JSON.Bool (True));
+         JSON.Set (Root, "done_reason",
+           (if C0 /= null and then JSON.Exists (JSON.Get (C0, "finish_reason"))
+            then JSON.Get (C0, "finish_reason") else JSON.Str ("stop")));
+         if Usage /= null then
+            JSON.Set (Root, "prompt_eval_count",
+              (if JSON.Exists (JSON.Get (Usage, "prompt_tokens"))
+               then JSON.Get (Usage, "prompt_tokens") else JSON.Int (0)));
+            JSON.Set (Root, "eval_count",
+              (if JSON.Exists (JSON.Get (Usage, "completion_tokens"))
+               then JSON.Get (Usage, "completion_tokens") else JSON.Int (0)));
+         end if;
+         return JSON.To_String (Root);
+      end;
+   end Ollama_Response_From_OpenAI;
+
+   function Ollama_Done_Chunk
+     (Model : String;
+      Prompt_Tokens, Completion_Tokens : Natural := 0;
+      Finish : String := "stop") return String
+   is
+      Root : constant JSON.Value_Ref := JSON.New_Object;
+      Msg  : constant JSON.Value_Ref := JSON.New_Object;
+   begin
+      JSON.Set (Msg, "role", JSON.Str ("assistant"));
+      JSON.Set (Msg, "content", JSON.Str (""));
+      JSON.Set (Root, "model", JSON.Str (Model));
+      JSON.Set (Root, "message", Msg);
+      JSON.Set (Root, "done", JSON.Bool (True));
+      JSON.Set (Root, "done_reason", JSON.Str (Finish));
+      JSON.Set (Root, "prompt_eval_count", JSON.Int (Prompt_Tokens));
+      JSON.Set (Root, "eval_count", JSON.Int (Completion_Tokens));
+      return JSON.To_String (Root);
+   end Ollama_Done_Chunk;
 
    function Models_Response (Model_Id : String) return String is
       Root : constant JSON.Value_Ref := JSON.New_Object;

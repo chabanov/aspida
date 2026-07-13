@@ -67,6 +67,32 @@ package OpenAI is
       Prompt_Tokens, Completion_Tokens : Natural := 0;
       Finish : String := "stop") return String;
 
+   --  Convert an Ollama `/api/chat` request body into the OpenAI
+   --  `/v1/chat/completions` shape the secure server parses: messages/tools
+   --  pass through; options.temperature -> temperature, options.num_predict ->
+   --  max_tokens, `think` -> enable_thinking. Malformed input returns Body as-is.
+   function Ollama_Body_To_OpenAI (Raw : String) return String;
+
+   --  Ollama-native `/api/chat` streaming chunks (bare newline-delimited JSON):
+   --    {"model":M,"message":{"content"|"thinking":Piece},"done":false}
+   --  Reason=True routes the piece to message.thinking, else message.content.
+   function Ollama_Chunk (Model, Piece : String; Reason : Boolean) return String;
+
+   --  Ollama tool-call delta: {"model":M,"message":{"tool_calls":[…]},"done":false}
+   function Ollama_Tool_Chunk (Model, Id, Name, Arguments : String) return String;
+
+   --  Convert a non-streaming OpenAI chat response into Ollama's single-object
+   --  reply: choices[0].message.content/.reasoning_content/.tool_calls ->
+   --  message.content/.thinking/.tool_calls, usage -> prompt_eval_count/eval_count.
+   function Ollama_Response_From_OpenAI (Raw, Model : String) return String;
+
+   --  Ollama terminal chunk: {"model":M,"message":{"content":""},"done":true,
+   --    "done_reason":Finish,"prompt_eval_count":PT,"eval_count":CT}
+   function Ollama_Done_Chunk
+     (Model : String;
+      Prompt_Tokens, Completion_Tokens : Natural := 0;
+      Finish : String := "stop") return String;
+
    --  /v1/models list response (single active model).
    function Models_Response (Model_Id : String) return String;
 
