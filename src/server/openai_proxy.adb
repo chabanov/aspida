@@ -662,6 +662,21 @@ begin
          C    : Socket_Type;
       begin
          Accept_Socket (Listener, C, Addr);
+         --  Bound how long a worker may block on this client. Without a timeout
+         --  a slow/stuck-but-open peer (one that stops reading our stream, or
+         --  never finishes sending its request) pins a worker forever in
+         --  Sock_Write / Read_Request — dead peers abort fast via RST, but a
+         --  wedged reader does not. Enough of those exhaust the pool. On the
+         --  loopback hop 30s is far longer than any healthy request or stream
+         --  chunk; on expiry Send/Receive raise Socket_Error, which Sock_Write
+         --  turns into Client_Gone and Read_Request propagates — freeing the
+         --  worker either way.
+         begin
+            Set_Socket_Option (C, Socket_Level, (Send_Timeout, 30.0));
+            Set_Socket_Option (C, Socket_Level, (Receive_Timeout, 30.0));
+         exception
+            when others => null;
+         end;
          Accept_Queue.Put (C);
       exception
          when others =>
