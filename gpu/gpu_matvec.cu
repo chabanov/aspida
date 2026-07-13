@@ -2176,7 +2176,7 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
 //  resident state, so it overlaps the batch Driver's concurrent decode forwards
 //  (read-only shared weights) without a lock.
 //===========================================================================
-#define PCH 128  // chunk size. The Q8 matmuls use the tensor-core k_q8_wmma
+#define PCH 256  // chunk size. The Q8 matmuls use the tensor-core k_q8_wmma
                  // (no MAXB cap; weight-stationary, per-token cost falls with
                  // the chunk), so a big chunk amortises the weight read. Non-Q8
                  // kinds are sub-batched by MAXB inside launch_mv_b.
@@ -2362,6 +2362,7 @@ struct PScr {
           *dqa,*dga,*datt,*drl,*dhb,*dlog;
     MoeRoute *droute;
     int *rows;
+    int *mg_pos, *mg_k, *mg_cnt;   // expert-grouped MoE: positions/slots per expert + counts
     cudaStream_t stream;
 };
 static PScr g_ps[PMAXLANE];
@@ -2386,9 +2387,100 @@ static void chain_alloc_p(void) {
         if (g_mx_hbuf) cudaMalloc(&S.dhb, Pd*g_mx_hbuf*4);
         cudaMalloc(&S.droute, Pd*sizeof(MoeRoute));
         cudaMalloc(&S.rows, Pd*4);
+        if (g_mx_nexp){ cudaMalloc(&S.mg_pos, (size_t)g_mx_nexp*Pd*4);
+                        cudaMalloc(&S.mg_k, (size_t)g_mx_nexp*Pd*4);
+                        cudaMalloc(&S.mg_cnt, (size_t)g_mx_nexp*4); }
         cudaStreamCreate(&S.stream);
     }
     pch_inited=1;
+}
+
+// Expert-grouped MoE for chunked prefill. The per-position kernel k_moe_gu_p_b
+// re-reads each expert's weight once PER position that routed to it; at a large
+// chunk that is ~chunk/n_exp x redundant. Instead: bucket the chunk's (position,
+// slot) pairs by expert, then run ONE tensor-core GEMM per expert over its
+// bucket — the expert weight is read once and reused across all its positions.
+//
+// k_moe_group builds the buckets: mg_pos[e*Pstride + s] / mg_k[...] list the
+// positions (and their routing slot) that chose expert e; mg_cnt[e] the count.
+__global__ void k_moe_group(const MoeRoute *__restrict__ route_b, int P, int top_k,
+                            int *__restrict__ mg_pos, int *__restrict__ mg_k,
+                            int *__restrict__ mg_cnt, int Pstride) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x; if (p >= P) return;
+    const MoeRoute *route = route_b + p;
+    for (int k = 0; k < top_k; ++k) {
+        int e = route->idx[k];
+        int s = atomicAdd(&mg_cnt[e], 1);
+        if (s < Pstride) { mg_pos[(size_t) e * Pstride + s] = p; mg_k[(size_t) e * Pstride + s] = k; }
+    }
+}
+
+// Grouped gate+up+SwiGLU on tensor cores. Each warp computes a 16(position) x
+// 16(intermed) tile for one expert (blockIdx.z), gathering its bucket's x rows
+// and dequantizing the Q8 gate/up weights into shared FP16 tiles. mode 0 =
+// routed experts (buckets from mg_*); mode 1 = the shared expert (all P
+// positions, slot MOE_MAXK, gdw/udw already point at the shared weights).
+// Writes h_b[p][slot][r] = silu(gate)*up — the exact layout k_moe_down_p_b reads.
+__global__ void k_moe_gu_grouped(
+    const uint8_t *__restrict__ gdw, const uint8_t *__restrict__ udw,
+    const float *__restrict__ x_b, float *__restrict__ h_b,
+    const int *__restrict__ mg_pos, const int *__restrict__ mg_k,
+    const int *__restrict__ mg_cnt,
+    long g_bpe, long u_bpe, int dim, int intermed, int Pstride,
+    int top_k, int P, int mode) {
+    int e = blockIdx.z;
+    int cnt = (mode == 0) ? mg_cnt[e] : P;
+    int m0 = blockIdx.y * 16; if (m0 >= cnt) return;
+    int n0 = blockIdx.x * 16;
+    int lane = threadIdx.x & 31;
+    int nb = dim / 32; size_t bpr = (size_t) nb * 34;
+    const uint8_t *gW = (mode == 0) ? gdw + (size_t) e * g_bpe : gdw;
+    const uint8_t *uW = (mode == 0) ? udw + (size_t) e * u_bpe : udw;
+    __shared__ half As[16 * 32];
+    __shared__ half Gs[32 * 16], Us[32 * 16];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cg, cu;
+    nvcuda::wmma::fill_fragment(cg, 0.0f); nvcuda::wmma::fill_fragment(cu, 0.0f);
+    for (int kb = 0; kb < nb; ++kb) {
+        for (int m = 0; m < 16; ++m) {
+            int gm = m0 + m;
+            int p = (gm < cnt) ? ((mode == 0) ? mg_pos[(size_t) e * Pstride + gm] : gm) : -1;
+            float xv = (p >= 0) ? x_b[(size_t) p * dim + kb * 32 + lane] : 0.0f;
+            As[(size_t) m * 32 + lane] = __float2half(xv);
+        }
+        for (int n = 0; n < 16; ++n) {
+            int gn = n0 + n;
+            const uint8_t *blG = gW + (size_t) gn * bpr + (size_t) kb * 34;
+            float dG = f16(blG); const int8_t *qG = (const int8_t *) (blG + 2);
+            Gs[(size_t) lane * 16 + n] = __float2half(dG * (float) qG[lane]);
+            const uint8_t *blU = uW + (size_t) gn * bpr + (size_t) kb * 34;
+            float dU = f16(blU); const int8_t *qU = (const int8_t *) (blU + 2);
+            Us[(size_t) lane * 16 + n] = __float2half(dU * (float) qU[lane]);
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int k16 = 0; k16 < 2; ++k16) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> af;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major> bg, bu;
+            nvcuda::wmma::load_matrix_sync(af, As + k16 * 16, 32);
+            nvcuda::wmma::load_matrix_sync(bg, Gs + (size_t) k16 * 16 * 16, 16);
+            nvcuda::wmma::load_matrix_sync(bu, Us + (size_t) k16 * 16 * 16, 16);
+            nvcuda::wmma::mma_sync(cg, af, bg, cg);
+            nvcuda::wmma::mma_sync(cu, af, bu, cu);
+        }
+        __syncwarp();
+    }
+    __shared__ float Cg[16 * 16], Cu[16 * 16];
+    nvcuda::wmma::store_matrix_sync(Cg, cg, 16, nvcuda::wmma::mem_row_major);
+    nvcuda::wmma::store_matrix_sync(Cu, cu, 16, nvcuda::wmma::mem_row_major);
+    for (int idx = lane; idx < 256; idx += 32) {
+        int m = idx / 16, n = idx % 16, gm = m0 + m;
+        if (gm < cnt && (n0 + n) < intermed) {
+            int p = (mode == 0) ? mg_pos[(size_t) e * Pstride + gm] : gm;
+            int k = (mode == 0) ? mg_k[(size_t) e * Pstride + gm] : top_k;
+            float g = Cg[idx], u = Cu[idx];
+            h_b[((size_t) p * (MOE_MAXK + 1) + k) * intermed + n0 + n] = (g / (1.f + expf(-g))) * u;
+        }
+    }
 }
 
 // Prefill P positions [pos_start .. pos_start+P-1] of ONE generation on LANE
@@ -2407,6 +2499,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
           *pdhb=S.dhb,*pdlog=S.dlog;
     MoeRoute *pdroute=S.droute;
     int *p_rows=S.rows;
+    int *pmg_pos=S.mg_pos,*pmg_k=S.mg_k,*pmg_cnt=S.mg_cnt;
     int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=S.stream;
     //  Opt-in per-phase profiler (env ASPIDA_PREFILL_PROF): splits GPU time
     //  into the attention/dnet block vs the MoE block, aggregated over layers.
@@ -2464,7 +2557,20 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             k_moe_route_b<<<P,256,0,st>>>(pdrl, pnxb, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, pdroute, P);
             int w1=(L.top_k+1)*L.intermed;
             int b1b=((size_t)P*w1*32+255)/256, b2b=((size_t)P*dim*32+255)/256;
-            k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
+            if (L.gk==5 && L.uk==5 && L.sgk==5 && L.suk==5 && pmg_cnt) {
+                //  Expert-grouped tensor-core gate+up: one GEMM per expert over
+                //  the chunk positions that routed to it (weight read once).
+                cudaMemsetAsync(pmg_cnt, 0, (size_t)L.n_exp*4, st);
+                k_moe_group<<<(P+255)/256,256,0,st>>>(pdroute, P, L.top_k, pmg_pos, pmg_k, pmg_cnt, PCH);
+                dim3 grR((L.intermed+15)/16, (PCH+15)/16, L.n_exp);
+                k_moe_gu_grouped<<<grR,32,0,st>>>(L.gdw,L.udw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
+                    L.g_bpe,L.u_bpe, dim,L.intermed, PCH, L.top_k, P, 0);
+                dim3 grS((L.intermed+15)/16, (P+15)/16, 1);
+                k_moe_gu_grouped<<<grS,32,0,st>>>(L.sgdw,L.sudw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
+                    0,0, dim,L.intermed, PCH, L.top_k, P, 1);
+            } else {
+                k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
+            }
             k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
             k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
             if (pprof) { cudaEventRecord(pe2, st); cudaEventSynchronize(pe2);

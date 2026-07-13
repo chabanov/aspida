@@ -1033,7 +1033,7 @@ package body LLM_Qwen is
             --  Prefill chunk. The Q8 matmuls use the tensor-core kernel
             --  (weight-stationary), so a large chunk amortises the weight read
             --  ~4x better than 32. Must stay <= the CUDA-side PCH buffer cap.
-            PCHUNK : constant := 128;
+            PCHUNK : constant := 256;
             Total  : constant Natural := Prompt_Ids'Length;
             Done   : Natural := 0;
          begin
