@@ -217,4 +217,18 @@ package LLM_Qwen_GPU is
    procedure Chain_Forward_Batch
      (B : Integer; Rows, Pos, Handles, Logits : System.Address);
 
+   --  True iff the resident shim exports the chunked-prefill entry point.
+   function Chain_Prefill_Available return Boolean;
+
+   --  Chunked PREFILL: advance ONE generation's resident state over P
+   --  sequence positions [Pos_Start .. Pos_Start+P-1] in a single call (the
+   --  bandwidth-bound matmuls batch over the chunk; the sequential parts loop
+   --  internally, bit-identical to per-token). Returns the LM-head logits of
+   --  the LAST position in Last_Logits — what the caller samples next. P must
+   --  be <= 32 (the batched-matvec register cap); feed the prompt in chunks.
+   --  Rows is C int[P] (0-based embedding rows); Handles is C int[n_layers].
+   procedure Chain_Prefill
+     (P : Integer; Rows : System.Address; Pos_Start : Integer;
+      Handles : System.Address; Last_Logits : System.Address);
+
 end LLM_Qwen_GPU;

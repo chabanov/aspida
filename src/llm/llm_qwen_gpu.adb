@@ -172,6 +172,11 @@ package body LLM_Qwen_GPU is
      (B : int; Rows, Pos, Handles, Logits : System.Address) with Convention => C;
    function To_CBatch is new Ada.Unchecked_Conversion (System.Address, Chain_Batch_Fn);
 
+   type Chain_Prefill_Fn is access procedure
+     (P : int; Rows : System.Address; Pos_Start : int;
+      Handles, Last_Logits : System.Address) with Convention => C;
+   function To_CPre is new Ada.Unchecked_Conversion (System.Address, Chain_Prefill_Fn);
+
    Fn       : MoE_Fn := null;
    DNew_Fn  : Dnet_New_Fn := null;
    DStep_Fn : Dnet_Step_Fn := null;
@@ -190,6 +195,7 @@ package body LLM_Qwen_GPU is
    CEnd_Fn   : Void_Fn := null;
    CBatch_Fn : Chain_Batch_Fn := null;
    CErr_Fn   : Int_Fn := null;   --  aspida_gpu_last_error
+   CPre_Fn   : Chain_Prefill_Fn := null;
 
    protected Init_Guard is
       procedure Run;
@@ -306,6 +312,8 @@ package body LLM_Qwen_GPU is
                if A /= System.Null_Address then CBatch_Fn := To_CBatch (A); end if;
                Look ("aspida_gpu_last_error", A);
                if A /= System.Null_Address then CErr_Fn := To_Int (A); end if;
+               Look ("aspida_gpu_chain_prefill", A);
+               if A /= System.Null_Address then CPre_Fn := To_CPre (A); end if;
             end;
          end;
       end Run;
@@ -613,6 +621,24 @@ package body LLM_Qwen_GPU is
       Init;
       return CBatch_Fn /= null;
    end Chain_Batch_Available;
+
+   function Chain_Prefill_Available return Boolean is
+   begin
+      Init;
+      --  ASPIDA_NO_PREFILL forces the per-token path (A/B bit-exactness check).
+      if Ada.Environment_Variables.Exists ("ASPIDA_NO_PREFILL") then
+         return False;
+      end if;
+      return CPre_Fn /= null;
+   end Chain_Prefill_Available;
+
+   procedure Chain_Prefill
+     (P : Integer; Rows : System.Address; Pos_Start : Integer;
+      Handles : System.Address; Last_Logits : System.Address) is
+   begin
+      CPre_Fn (int (P), Rows, int (Pos_Start), Handles, Last_Logits);
+      Check_GPU;
+   end Chain_Prefill;
 
    procedure Chain_Forward_Batch
      (B : Integer; Rows, Pos, Handles, Logits : System.Address) is

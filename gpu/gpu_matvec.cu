@@ -2095,3 +2095,192 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
     cudaMemcpyAsync(logits, dlogb, (size_t)B*g_ch_vocab*4, cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
 }
+
+//===========================================================================
+//  Chunked PREFILL — process P sequence positions per launch instead of one.
+//
+//  The per-token forward is dominated (~90%) by weight-bandwidth-bound matmuls
+//  (projections + MoE); each reads the whole weight for ONE position. Running
+//  the prompt one token at a time made prefill of a real agent request (5-25k
+//  tokens) take 1-2 minutes and time out. Here the matmuls are batched over a
+//  chunk of PCH positions via the same launch_mv_b that batches decode lanes
+//  (weight read once for up to MAXB rows), while the genuinely sequential parts
+//  — the delta-net conv (sliding hist) and recurrence (state S carried
+//  position→position) and the causal attention (K/V written then attended) —
+//  reuse the EXACT single-position math, looped over the chunk. So the output
+//  is bit-identical to the sequential path; only the matmul bandwidth is
+//  amortised (~MAXB×).
+//
+//  Runs on its OWN stream + scratch, touching only this generation's per-lane
+//  resident state, so it overlaps the batch Driver's concurrent decode forwards
+//  (read-only shared weights) without a lock.
+//===========================================================================
+#define PCH 32   // must be <= MAXB (the batched-matvec register cap)
+
+// Delta-net causal depthwise conv over a chunk: thread owns channel c and walks
+// t = 0..P-1, maintaining the sliding hist window exactly as k_dnet_conv does.
+__global__ void k_dnet_conv_chunk(const float *__restrict__ qkv, float *__restrict__ hist,
+                                  const float *__restrict__ convw, float *__restrict__ cq,
+                                  int qo, int kernel, int P) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x; if (c >= qo) return;
+    for (int t = 0; t < P; ++t) {
+        const float *x = qkv + (size_t) t * qo;
+        float *o = cq + (size_t) t * qo;
+        float acc = x[c] * convw[c * kernel + (kernel - 1)];
+        for (int k = 0; k < kernel - 1; ++k)
+            acc += hist[(size_t) k * qo + c] * convw[c * kernel + k];
+        o[c] = acc / (1.f + expf(-acc));
+        for (int k = 0; k + 1 < kernel - 1; ++k)
+            hist[(size_t) k * qo + c] = hist[(size_t) (k + 1) * qo + c];
+        if (kernel >= 2) hist[(size_t) (kernel - 2) * qo + c] = x[c];
+    }
+}
+
+// Delta-net recurrence over a chunk: block = head, thread = column v, walks
+// t = 0..P-1 keeping the state matrix S resident (identical math + ascending
+// sum order to k_dnet_recur). Chunk buffers are [P, ...] row-major.
+__global__ void k_dnet_recur_chunk(float *__restrict__ S, const float *__restrict__ cq,
+    const float *__restrict__ gate, const float *__restrict__ beta,
+    const float *__restrict__ z, const float *__restrict__ norm_w, float *__restrict__ o_row,
+    int khd, int vhd, int q_dim, int n_k_heads, int nv, int qo, int v_dim, int P) {
+    int h = blockIdx.x;
+    int v = threadIdx.x;                  // 0..khd-1 (== vhd-1)
+    extern __shared__ float sh[];
+    float *Qr = sh, *Kr = sh + khd, *QN = sh + 2 * khd,
+          *KN = sh + 3 * khd, *Vv = sh + 4 * khd, *osh = sh + 4 * khd + vhd;
+    int k_head = h % n_k_heads;
+    int base = h * khd;
+    float scale = 1.f / sqrtf((float) khd);
+    for (int t = 0; t < P; ++t) {
+        const float *cq_t = cq + (size_t) t * qo;
+        Qr[v] = cq_t[k_head * khd + v];
+        Kr[v] = cq_t[q_dim + k_head * khd + v];
+        Vv[v] = cq_t[2 * q_dim + h * vhd + v];
+        __syncthreads();
+        float ssq = 0.f, ssk = 0.f;
+        for (int i = 0; i < khd; ++i) { ssq += Qr[i] * Qr[i]; ssk += Kr[i] * Kr[i]; }
+        QN[v] = Qr[v] * (1.f / (sqrtf(ssq) + 1e-6f));
+        KN[v] = Kr[v] * (1.f / (sqrtf(ssk) + 1e-6f));
+        __syncthreads();
+        float g = gate[(size_t) t * nv + h], b = beta[(size_t) t * nv + h];
+        float retr = 0.f;
+        for (int k = 0; k < khd; ++k) retr += g * S[(size_t)(base + k) * vhd + v] * KN[k];
+        float corr = b * (Vv[v] - retr);
+        for (int k = 0; k < khd; ++k)
+            S[(size_t)(base + k) * vhd + v] = g * S[(size_t)(base + k) * vhd + v] + KN[k] * corr;
+        float o = 0.f;
+        for (int k = 0; k < khd; ++k) o += S[(size_t)(base + k) * vhd + v] * QN[k];
+        osh[v] = o * scale;
+        __syncthreads();
+        float ss = 0.f;
+        for (int i = 0; i < vhd; ++i) ss += osh[i] * osh[i];
+        float rms = sqrtf(ss / (float) vhd + 1e-6f);
+        float zz = z[(size_t) t * v_dim + h * vhd + v];
+        o_row[(size_t) t * v_dim + h * vhd + v] =
+            (osh[v] / rms) * norm_w[v] * (zz / (1.f + expf(-zz)));
+        __syncthreads();
+    }
+}
+
+// Prefill scratch (×PCH), separate from decode buffers so prefill can overlap
+// the Driver. Only the LM head runs once (last position), so no [PCH,vocab].
+static float *pHb=nullptr,*pnxb=nullptr,*paob=nullptr,*pdqkv=nullptr,*pdcq=nullptr,
+             *pdar=nullptr,*pdbr=nullptr,*pdz=nullptr,*pdg=nullptr,*pdb=nullptr,
+             *pdor=nullptr,*pdqg=nullptr,*pdkt=nullptr,*pdvt=nullptr,
+             *pdqa=nullptr,*pdga=nullptr,*pdatt=nullptr,*pdrl=nullptr,*pdhb=nullptr,
+             *pdlog=nullptr;
+static MoeRoute *pdroute=nullptr;
+static int *p_rows=nullptr, *p_pos=nullptr;   // [PCH] rows, [1] scalar pos
+static cudaStream_t p_stream=0;
+static int pch_inited=0;
+
+static void chain_alloc_p(void) {
+    if (pch_inited) return;
+    int dim=g_ch_dim; size_t Pd=(size_t)PCH;
+    cudaMalloc(&pHb, Pd*dim*4); cudaMalloc(&pnxb, Pd*dim*4); cudaMalloc(&paob, Pd*dim*4);
+    cudaMalloc(&pdlog, (size_t)g_ch_vocab*4);
+    if (g_mx_qo){ cudaMalloc(&pdqkv, Pd*g_mx_qo*4); cudaMalloc(&pdcq, Pd*g_mx_qo*4); }
+    if (g_mx_nv){ cudaMalloc(&pdar, Pd*g_mx_nv*4); cudaMalloc(&pdbr, Pd*g_mx_nv*4);
+                  cudaMalloc(&pdg, Pd*g_mx_nv*4); cudaMalloc(&pdb, Pd*g_mx_nv*4); }
+    if (g_mx_vd){ cudaMalloc(&pdz, Pd*g_mx_vd*4); cudaMalloc(&pdor, Pd*g_mx_vd*4); }
+    if (g_mx_qgd) cudaMalloc(&pdqg, Pd*g_mx_qgd*4);
+    if (g_mx_kvd){ cudaMalloc(&pdkt, Pd*g_mx_kvd*4); cudaMalloc(&pdvt, Pd*g_mx_kvd*4); }
+    if (g_mx_att){ cudaMalloc(&pdqa, Pd*g_mx_att*4); cudaMalloc(&pdga, Pd*g_mx_att*4);
+                   cudaMalloc(&pdatt, Pd*g_mx_att*4); }
+    if (g_mx_nexp) cudaMalloc(&pdrl, Pd*g_mx_nexp*4);
+    if (g_mx_hbuf) cudaMalloc(&pdhb, Pd*g_mx_hbuf*4);
+    cudaMalloc(&pdroute, Pd*sizeof(MoeRoute));
+    cudaMalloc(&p_rows, Pd*4); cudaMalloc(&p_pos, 4);
+    cudaStreamCreate(&p_stream);
+    pch_inited=1;
+}
+
+// Prefill P positions [pos_start .. pos_start+P-1] of ONE generation, updating
+// its resident per-layer state (handles[li]); return the LM-head logits of the
+// LAST position in last_logits (that is what the caller samples from). P must
+// be >= 1; the caller feeds the prompt in <= PCH-sized chunks.
+extern "C" void aspida_gpu_chain_prefill(int P, const int *rows, int pos_start,
+                                         const int *handles, float *last_logits) {
+    if (P < 1) return; if (P > PCH) P = PCH;
+    chain_alloc_p();
+    int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=p_stream;
+    cudaMemcpyAsync(p_rows, rows, (size_t)P*4, cudaMemcpyHostToDevice, st);
+    k_embed_b<<<((size_t)dim*P+255)/256,256,0,st>>>(g_ch_embed, p_rows, pHb, dim, P);
+    for (int li=0; li<NL; ++li) {
+        ChainLayer &L=g_chain[li];
+        k_norm1_b<<<P,256,0,st>>>(pHb, L.attn_norm, pnxb, dim, P);
+        if (!L.is_fattn) {
+            DnetState ds = g_dnet[handles[li]];
+            launch_mv_b(L.qkv, L.qkv_k, dim, L.qo, pnxb, pdqkv, P, st);
+            launch_mv_b(L.al, L.al_k, dim, L.nv, pnxb, pdar, P, st);
+            launch_mv_b(L.be, L.be_k, dim, L.nv, pnxb, pdbr, P, st);
+            launch_mv_b(L.ga, L.ga_k, dim, L.v_dim, pnxb, pdz, P, st);
+            size_t shmem=(size_t)(4*L.khd+2*L.vhd)*4;
+            k_dnet_conv_chunk<<<(L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.conv, pdcq, L.qo, L.kernel, P);
+            k_dnet_gates_b<<<((size_t)P*L.nv+255)/256,256,0,st>>>(pdar, pdbr, L.aw, L.dtw, pdg, pdb, L.nv, P);
+            k_dnet_recur_chunk<<<L.nv, L.khd, shmem, st>>>(
+                ds.S, pdcq, pdg, pdb, pdz, L.nw, pdor,
+                L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim, P);
+            launch_mv_b(L.ow, L.ow_k, L.v_dim, dim, pdor, paob, P, st);
+        } else {
+            FattnState fs = g_fattn[handles[li]];
+            int kvd=L.nkv*L.hd, att=L.nq*L.hd, qgd=L.nq*2*L.hd;
+            launch_mv_b(L.qw, L.qw_k, dim, qgd, pnxb, pdqg, P, st);
+            launch_mv_b(L.kw, L.kw_k, dim, kvd, pnxb, pdkt, P, st);
+            launch_mv_b(L.vw, L.vw_k, dim, kvd, pnxb, pdvt, P, st);
+            // Causal: write K/V then attend, position by position (K/V from
+            // earlier positions in this chunk must be resident before a later
+            // query attends over them).
+            for (int t=0;t<P;++t) {
+                int pos = pos_start + t;
+                cudaMemcpyAsync(p_pos, &pos, 4, cudaMemcpyHostToDevice, st);
+                k_fattn_prep<<<L.nq+L.nkv,L.hd,(size_t)L.hd*4,st>>>(
+                    pdqg+(size_t)t*qgd, pdkt+(size_t)t*kvd, pdvt+(size_t)t*kvd, L.qn, L.kn,
+                    pdqa+(size_t)t*att, pdga+(size_t)t*att, fs.K, fs.V,
+                    L.nq,L.nkv,L.hd,kvd, p_pos, L.rd,L.base,L.freq_scale,L.m_scale,
+                    L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total);
+                k_fattn_attend<<<L.nq,256,0,st>>>(
+                    pdqa+(size_t)t*att, pdga+(size_t)t*att, fs.K, fs.V, fs.scores, pdatt+(size_t)t*att,
+                    L.nq,L.nkv,L.hd,kvd, p_pos, fs.max_len);
+            }
+            launch_mv_b(L.fow, L.fow_k, att, dim, pdatt, paob, P, st);
+        }
+        k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
+        if (L.has_moe) {
+            k_norm1_b<<<P,256,0,st>>>(pHb, L.post_norm, pnxb, dim, P);
+            launch_mv_b(L.rw, L.rk, dim, L.n_exp, pnxb, pdrl, P, st);
+            k_moe_route_b<<<P,256,0,st>>>(pdrl, pnxb, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, pdroute, P);
+            int w1=(L.top_k+1)*L.intermed;
+            int b1b=((size_t)P*w1*32+255)/256, b2b=((size_t)P*dim*32+255)/256;
+            k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
+            k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
+            k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
+        }
+    }
+    // LM head on the LAST position only.
+    const float *last_h = pHb + (size_t)(P - 1) * dim;
+    k_norm1<<<1,256,0,st>>>((float *) last_h, g_ch_fnorm, pnxb, dim);
+    launch_mv_st(g_ch_lm, g_ch_lm_k, dim, g_ch_vocab, pnxb, pdlog, st);
+    cudaMemcpyAsync(last_logits, pdlog, (size_t)g_ch_vocab*4, cudaMemcpyDeviceToHost, st);
+    cudaStreamSynchronize(st);
+}

@@ -1021,9 +1021,45 @@ package body LLM_Qwen is
       end if;
 
       --  Prefill (row = id + 1: ids are 0-based, embedding rows 1-based).
-      --  Tick per token so a UI shows progress before the first output token.
+      --  Chunked GPU prefill when available: advance the resident state 32
+      --  positions per call (matmuls batched over the chunk), instead of one
+      --  token per forward — a 5-25k-token agent prompt went from 1-2 minutes
+      --  (every request timed out) to seconds. Bit-identical to the per-token
+      --  path. Falls back to per-token for the CPU path / empty prompt.
       if Prompt_Ids'Length = 0 then
          Last_Logits := Decode (1);
+      elsif Use_Chain and then LLM_Qwen_GPU.Chain_Prefill_Available then
+         declare
+            PCHUNK : constant := 32;
+            Total  : constant Natural := Prompt_Ids'Length;
+            Done   : Natural := 0;
+         begin
+            Last_Logits := New_Tensor ([1, M.Vocab_Sz]);
+            while Done < Total loop
+               declare
+                  P    : constant Natural :=
+                    Integer'Min (PCHUNK, Total - Done);
+                  Rows : array (1 .. P) of Interfaces.C.int;
+               begin
+                  if Chain_Pos + P > Cap then
+                     raise Constraint_Error with "chain KV overflow at"
+                       & Integer'Image (Chain_Pos);
+                  end if;
+                  for J in 1 .. P loop
+                     Rows (J) := Interfaces.C.int
+                       (Prompt_Ids (Prompt_Ids'First + Done + J - 1));
+                  end loop;
+                  LLM_Qwen_GPU.Chain_Prefill
+                    (P, Rows (1)'Address, Chain_Pos,
+                     Handles (1)'Address, Data_Address (Last_Logits));
+                  Chain_Pos := Chain_Pos + P;
+                  Done := Done + P;
+                  if Sink /= null then
+                     Sink.Tick;
+                  end if;
+               end;
+            end loop;
+         end;
       else
          for I in Prompt_Ids'Range loop
             Last_Logits := Decode (Prompt_Ids (I) + 1);
