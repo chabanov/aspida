@@ -719,8 +719,14 @@ procedure Secure_Server is
                                             & "  ""function"": {" & ASCII.LF
                                             & "    ""name"": """ &
                                                To_String (R.Tool_Calls (I).Name) & """," & ASCII.LF
-                                            & "    ""arguments"": """ &
-                                               To_String (R.Tool_Calls (I).Arguments_JS) & """" & ASCII.LF
+                                            & "    ""arguments"": " &
+                                               --  arguments is a JSON string whose VALUE is itself JSON
+                                               --  ({"city":"Kyiv"}); embed it via JSON.Str so the inner
+                                               --  quotes are escaped (raw concat produced invalid JSON ->
+                                               --  Chat_Response's JSON.Parse raised -> "bad request").
+                                               JSON.To_String
+                                                 (JSON.Str (To_String (R.Tool_Calls (I).Arguments_JS)))
+                                            & ASCII.LF
                                             & "  }" & ASCII.LF
                                             & "}";
                                        end loop;
