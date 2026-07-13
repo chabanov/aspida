@@ -319,25 +319,33 @@ procedure Secure_Server is
    Secret   : constant Crypto.X25519.Key_256 := Load_Or_Create_Key;
    Listener : Socket_Type;
 
-   --  Generations no longer serialize as a whole. Correctness (shared GPU
-   --  buffers + the all-core worker pool) is now enforced per forward step by
-   --  LLM_Step_Lock, so concurrent sessions INTERLEAVE token-by-token instead
-   --  of one waiting behind the other. These stay as no-ops so the handler's
-   --  existing acquire/release structure is unchanged. (Concurrency is still
-   --  bounded by Max_Clients connection slots.)
+   --  Whole-generation mutex. The per-forward-step LLM_Step_Lock is NOT enough
+   --  to let concurrent sessions interleave on the default resident path: they
+   --  share the resident chain-KV buffer (Chain_Forward addresses it by a
+   --  single position counter) and other GPU scratch, so two interleaved
+   --  generations corrupt each other's KV — and an aborted one (client
+   --  disconnect) can leave that shared state wedged, after which EVERY later
+   --  generation fails with "internal error" (observed once the concurrent
+   --  proxy actually drove 8 sessions at once, 2026-07-13). Serialising whole
+   --  generations matches how Ollama served this model and is safe; true
+   --  multi-session throughput is the batcher's job (ASPIDA_BATCH_SERVE), which
+   --  owns its own per-lane KV. /v1/models and the handshake never take this
+   --  lock, so they stay responsive while a generation runs.
    protected Infer_Lock is
-      procedure Acquire;
+      entry Acquire;
       procedure Release;
+   private
+      Held : Boolean := False;
    end Infer_Lock;
 
    protected body Infer_Lock is
-      procedure Acquire is
+      entry Acquire when not Held is
       begin
-         null;
+         Held := True;
       end Acquire;
       procedure Release is
       begin
-         null;
+         Held := False;
       end Release;
    end Infer_Lock;
 
