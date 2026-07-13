@@ -21,6 +21,7 @@ with LLM_Qwen_GPU;
 with System;
 with Interfaces.C;
 with LLM_Step_Lock;
+with LLM_Batcher;
 with LLM_RMSNorm;
 with LLM_FullAttn;
 with LLM_DeltaNet_Blk;
@@ -859,12 +860,26 @@ package body LLM_Qwen is
       --  Phase C chain: per-generation state handles + token position.
       Use_Chain : Boolean := False;
       Chain_Pos : Natural := 0;
+
+      --  Continuous batching (env ASPIDA_BATCH_SERVE): when a lane is claimed,
+      --  each token's forward is submitted to the shared batch Driver instead
+      --  of running a serialised single-request forward.
+      Batch_Mode : Boolean := False;
+      My_Lane    : Integer := -1;
       Handles   : array (1 .. M.N_Blocks) of Interfaces.C.int :=
         [others => Interfaces.C.int (Integer'(-1))];
 
       procedure Free_States is
       begin
-         LLM_Qwen_GPU.Chain_End;
+         if Batch_Mode then
+            LLM_Batcher.End_Gen (My_Lane);
+            My_Lane := -1; Batch_Mode := False;
+         else
+            LLM_Qwen_GPU.Chain_End;
+         end if;
+         --  Freeing device state mutates shared GPU vectors — serialise it in
+         --  batch-serve mode (same reason as allocation).
+         if LLM_Batcher.Enabled then LLM_Batcher.Alloc_Lock; end if;
          for I in Cache'Range loop
             if Cache (I).Is_Full then
                LLM_Qwen_GPU.Fattn_Free (Cache (I).Full_St.GPU_Handle);
@@ -874,6 +889,7 @@ package body LLM_Qwen is
                Cache (I).DNet_St.GPU_Handle := -1;
             end if;
          end loop;
+         if LLM_Batcher.Enabled then LLM_Batcher.Alloc_Unlock; end if;
       end Free_States;
 
       --  One forward step under the shared step lock, released between steps
@@ -882,6 +898,23 @@ package body LLM_Qwen is
          H  : Tensor := New_Tensor ([1, Dim]);
          TS : Ada.Real_Time.Time;
       begin
+         --  Batched path: submit the step to the shared Driver (no step lock —
+         --  the Driver is the sole GPU forward caller and serialises internally).
+         if Batch_Mode then
+            declare
+               R : constant Tensor := New_Tensor ([1, M.Vocab_Sz]);
+            begin
+               if Chain_Pos >= Cap then
+                  raise Constraint_Error with "chain KV overflow at"
+                    & Integer'Image (Chain_Pos);
+               end if;
+               LLM_Batcher.Step
+                 (My_Lane, Embed_Row - 1, Chain_Pos, M.N_Blocks,
+                  Handles (1)'Address, Data_Address (R));
+               Chain_Pos := Chain_Pos + 1;
+               return R;
+            end;
+         end if;
          LLM_Step_Lock.Acquire;
          if Use_Chain then
             declare
@@ -944,13 +977,23 @@ package body LLM_Qwen is
 
       Last_Logits : Tensor;
    begin
-      for I in 1 .. M.N_Blocks loop
-         Cache (I) := LLM_Qwen_Blk.Init_State (M.Blocks (I).all, Cap);
-      end loop;
-
-      --  Phase C: use the resident chain when the model is registered and
-      --  every layer's device state was allocated.
-      Register_Chain (M);
+      --  Device-state allocation (Dnet_New/Fattn_New push to shared GPU vectors)
+      --  is serialised in batch-serve mode, where several handler tasks set up
+      --  generations concurrently.
+      if LLM_Batcher.Enabled then LLM_Batcher.Alloc_Lock; end if;
+      begin
+         for I in 1 .. M.N_Blocks loop
+            Cache (I) := LLM_Qwen_Blk.Init_State (M.Blocks (I).all, Cap);
+         end loop;
+         --  Phase C: use the resident chain when the model is registered and
+         --  every layer's device state was allocated.
+         Register_Chain (M);
+         if LLM_Batcher.Enabled then LLM_Batcher.Alloc_Unlock; end if;
+      exception
+         when others =>
+            if LLM_Batcher.Enabled then LLM_Batcher.Alloc_Unlock; end if;
+            raise;
+      end;
       Use_Chain := Chain_OK;
       for I in 1 .. M.N_Blocks loop
          declare
@@ -964,7 +1007,13 @@ package body LLM_Qwen is
             Handles (I) := Interfaces.C.int (Hn);
          end;
       end loop;
-      if Use_Chain then
+      --  Claim a batch lane; if the pool is full, fall back to the single path.
+      if Use_Chain and then LLM_Batcher.Enabled then
+         LLM_Batcher.Configure (M.N_Blocks, M.Vocab_Sz);
+         LLM_Batcher.Begin_Gen (My_Lane);
+         Batch_Mode := My_Lane >= 0;
+      end if;
+      if Use_Chain and then not Batch_Mode then
          LLM_Qwen_GPU.Chain_Begin (Handles (1)'Address);
       end if;
 
