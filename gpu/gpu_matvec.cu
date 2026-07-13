@@ -2221,8 +2221,18 @@ __global__ void k_dnet_recur_chunk(float *__restrict__ S, const float *__restric
         Kr[v] = cq_t[q_dim + k_head * khd + v];
         Vv[v] = cq_t[2 * q_dim + h * vhd + v];
         __syncthreads();
-        float ssq = 0.f, ssk = 0.f;
-        for (int i = 0; i < khd; ++i) { ssq += Qr[i] * Qr[i]; ssk += Kr[i] * Kr[i]; }
+        //  L2 norms via ONE parallel reduction each (was: every thread summed
+        //  the whole khd vector — khd-way redundant). Reuse QN/KN as scratch
+        //  (not yet written). Tree order differs from the sequential sum only
+        //  at the float-rounding level. Assumes blockDim.x (=khd) a power of 2.
+        QN[v] = Qr[v] * Qr[v]; KN[v] = Kr[v] * Kr[v];
+        __syncthreads();
+        for (int o = khd >> 1; o > 0; o >>= 1) {
+            if (v < o) { QN[v] += QN[v + o]; KN[v] += KN[v + o]; }
+            __syncthreads();
+        }
+        float ssq = QN[0], ssk = KN[0];
+        __syncthreads();
         QN[v] = Qr[v] * (1.f / (sqrtf(ssq) + 1e-6f));
         KN[v] = Kr[v] * (1.f / (sqrtf(ssk) + 1e-6f));
         __syncthreads();
@@ -2236,9 +2246,15 @@ __global__ void k_dnet_recur_chunk(float *__restrict__ S, const float *__restric
         for (int k = 0; k < khd; ++k) o += S[(size_t)(base + k) * vhd + v] * QN[k];
         osh[v] = o * scale;
         __syncthreads();
-        float ss = 0.f;
-        for (int i = 0; i < vhd; ++i) ss += osh[i] * osh[i];
-        float rms = sqrtf(ss / (float) vhd + 1e-6f);
+        //  RMS via one reduction (was vhd-way redundant). Reuse Qr as scratch.
+        Qr[v] = osh[v] * osh[v];
+        __syncthreads();
+        for (int o2 = vhd >> 1; o2 > 0; o2 >>= 1) {
+            if (v < o2) Qr[v] += Qr[v + o2];
+            __syncthreads();
+        }
+        float rms = sqrtf(Qr[0] / (float) vhd + 1e-6f);
+        __syncthreads();
         float zz = z[(size_t) t * v_dim + h * vhd + v];
         o_row[(size_t) t * v_dim + h * vhd + v] =
             (osh[v] / rms) * norm_w[v] * (zz / (1.f + expf(-zz)));
