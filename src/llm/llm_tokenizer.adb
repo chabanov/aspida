@@ -11,6 +11,7 @@
 with Ada.Containers.Indefinite_Ordered_Maps;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Strings.Fixed;
+with Ada.Unchecked_Deallocation;
 
 package body LLM_Tokenizer is
 
@@ -290,9 +291,9 @@ package body LLM_Tokenizer is
 
    function Encode (T : Tokenizer; Text : String) return Token_Array is
    begin
-      --  Cap input length first: greedy BPE below is ~O(N^2..N^3), so a single
-      --  huge prompt could pin a CPU before the engine's context clamp runs.
-      --  Reject loudly (the cap is far above any real context window).
+      --  Cap input length first: even at O(N log N) a pathological input
+      --  should be rejected loudly before the engine's context clamp runs
+      --  (the cap is far above any real context window).
       if Text'Length > Max_Encode_Len then
          raise Input_Too_Long
            with "Encode input length" & Integer'Image (Text'Length)
@@ -312,10 +313,27 @@ package body LLM_Tokenizer is
          return Empty : Token_Array (1 .. 0);
       end if;
 
-      -- Greedy byte-pair encoding by merge rank.
+      -- Greedy byte-pair encoding by merge rank. The initial pieces are
+      -- appended straight into the working text WU with their lengths in a
+      -- heap array (one input character yields at most one piece — a multi-
+      -- byte UTF-8 char that falls back to byte tokens yields one piece per
+      -- BYTE, still bounded by Text'Length): no per-piece Unbounded_String
+      -- array on the task stack (a 100 KB prompt would overflow it).
       declare
-         Pieces : array (1 .. Text'Length) of Unbounded_String;
-         N      : Natural := Text'Length;
+         type Nat_Arr is array (Positive range <>) of Natural;
+         type Nat_Ptr is access Nat_Arr;
+         procedure Free is new Ada.Unchecked_Deallocation (Nat_Arr, Nat_Ptr);
+
+         Lens : Nat_Ptr := new Nat_Arr (1 .. Integer'Max (1, Text'Length));
+         WU   : Unbounded_String := Null_Unbounded_String;
+         N    : Natural := 0;
+
+         procedure Add_Piece (P : String) is
+         begin
+            N := N + 1;
+            Lens (N) := P'Length;
+            Append (WU, P);
+         end Add_Piece;
 
          function Byte_Token (B : Natural) return String is
             Hx : constant String := "0123456789ABCDEF";
@@ -326,13 +344,12 @@ package body LLM_Tokenizer is
          if T.Gemma_Mode then
             --  SentencePiece: space -> U+2581, then per-UTF-8-character initial
             --  pieces, falling back to <0xHH> byte tokens for unknown chars.
-            N := 0;
             declare
                I : Integer := Text'First;
             begin
                while I <= Text'Last loop
                   if Text (I) = ' ' then
-                     N := N + 1; Pieces (N) := To_Unbounded_String (SP_Space);
+                     Add_Piece (SP_Space);
                      I := I + 1;
                   else
                      declare
@@ -346,12 +363,10 @@ package body LLM_Tokenizer is
                         Ch   : constant String := Text (I .. LB);
                      begin
                         if T.Vocab.Contains (Ch) then
-                           N := N + 1; Pieces (N) := To_Unbounded_String (Ch);
+                           Add_Piece (Ch);
                         else
                            for J in I .. LB loop
-                              N := N + 1;
-                              Pieces (N) := To_Unbounded_String
-                                (Byte_Token (Character'Pos (Text (J))));
+                              Add_Piece (Byte_Token (Character'Pos (Text (J))));
                            end loop;
                         end if;
                         I := LB + 1;
@@ -365,59 +380,204 @@ package body LLM_Tokenizer is
                   B : constant Natural := Character'Pos (Text (Text'First + I - 1));
                begin
                   if T.Byte_Level then
-                     Pieces (I) := To_Unbounded_String (Byte_To_Piece (B));
+                     Add_Piece (Byte_To_Piece (B));
                   else
-                     Pieces (I) := To_Unbounded_String
-                       (Text (Text'First + I - 1 .. Text'First + I - 1));
+                     Add_Piece (Text (Text'First + I - 1 .. Text'First + I - 1));
                   end if;
                end;
             end loop;
          end if;
 
-         loop
+         --  Greedy merge by rank, O(N log N): a doubly-linked list of symbols
+         --  (each a slice of the concatenated working text W — merges of
+         --  adjacent slices are just span extensions, no string building) and
+         --  a min-heap of candidate pairs ordered by (rank, position). Stale
+         --  heap entries (a side already merged away) are detected by
+         --  comparing the recorded span snapshots and skipped. This replaces
+         --  a scan-all-pairs-per-merge loop that was O(N^2) map lookups with
+         --  a fresh key string each — ~90+ seconds for a 20 KB prompt, which
+         --  made every real agent request (25-100 KB of context) time out.
+         --  The merge ORDER is identical: global lowest rank first, leftmost
+         --  on ties — so the output tokens are bit-identical to the old loop.
+         declare
+         begin
             declare
-               Best_Rank : Integer := Integer'Last;
-               Best_I    : Natural := 0;
-            begin
-               for I in 1 .. N - 1 loop
+               W : constant String := To_String (WU);
+
+               type Sym is record
+                  From, To : Integer := 0;   -- span in W
+                  Prev, Nxt : Natural := 0;  -- linked list, 0 = none
+                  Alive     : Boolean := False;
+               end record;
+               type Sym_Arr is array (Natural range <>) of Sym;
+               type Sym_Ptr is access Sym_Arr;
+               procedure Free is new Ada.Unchecked_Deallocation (Sym_Arr, Sym_Ptr);
+
+               type Cand is record
+                  Rank   : Integer := 0;
+                  L      : Natural := 0;     -- left symbol index
+                  LT, RT : Integer := 0;     -- span snapshots for staleness
+               end record;
+               type Cand_Arr is array (Positive range <>) of Cand;
+               type Cand_Ptr is access Cand_Arr;
+               procedure Free is new Ada.Unchecked_Deallocation (Cand_Arr, Cand_Ptr);
+
+               S  : Sym_Ptr := new Sym_Arr (1 .. N);
+               --  Each merge enqueues at most 2 new candidates; N-1 initial.
+               H  : Cand_Ptr := new Cand_Arr (1 .. 3 * N + 8);
+               HN : Natural := 0;
+
+               function Less (A, B : Cand) return Boolean is
+                 (A.Rank < B.Rank
+                  or else (A.Rank = B.Rank and then A.L < B.L));
+
+               procedure Push (C : Cand) is
+                  I : Natural := HN + 1;
+               begin
+                  HN := I;
+                  H (I) := C;
+                  while I > 1 and then Less (H (I), H (I / 2)) loop
+                     declare
+                        Tmp : constant Cand := H (I / 2);
+                     begin
+                        H (I / 2) := H (I); H (I) := Tmp;
+                     end;
+                     I := I / 2;
+                  end loop;
+               end Push;
+
+               procedure Pop (C : out Cand) is
+                  I : Natural := 1;
+               begin
+                  C := H (1);
+                  H (1) := H (HN);
+                  HN := HN - 1;
+                  loop
+                     declare
+                        Sm : Natural := I;
+                     begin
+                        if 2 * I <= HN and then Less (H (2 * I), H (Sm)) then
+                           Sm := 2 * I;
+                        end if;
+                        if 2 * I + 1 <= HN and then Less (H (2 * I + 1), H (Sm))
+                        then
+                           Sm := 2 * I + 1;
+                        end if;
+                        exit when Sm = I;
+                        declare
+                           Tmp : constant Cand := H (Sm);
+                        begin
+                           H (Sm) := H (I); H (I) := Tmp;
+                        end;
+                        I := Sm;
+                     end;
+                  end loop;
+               end Pop;
+
+               --  Queue (L, Nxt(L)) if that pair has a merge rank.
+               procedure Try_Push (L : Natural) is
+               begin
+                  if L = 0 or else S (L).Nxt = 0 then
+                     return;
+                  end if;
                   declare
+                     R   : constant Natural := S (L).Nxt;
                      Key : constant String :=
-                       To_String (Pieces (I)) & NUL & To_String (Pieces (I + 1));
+                       W (S (L).From .. S (L).To) & NUL
+                       & W (S (R).From .. S (R).To);
                   begin
-                     if T.Merges.Contains (Key)
-                       and then T.Merges.Element (Key) < Best_Rank
-                     then
-                        Best_Rank := T.Merges.Element (Key);
-                        Best_I := I;
+                     if T.Merges.Contains (Key) then
+                        Push ((Rank => T.Merges.Element (Key), L => L,
+                               LT => S (L).To, RT => S (R).To));
                      end if;
+                  end;
+               end Try_Push;
+
+               Pos : Integer := W'First;
+            begin
+               for I in 1 .. N loop
+                  S (I) := (From => Pos, To => Pos + Lens (I) - 1,
+                            Prev => (if I > 1 then I - 1 else 0),
+                            Nxt  => (if I < N then I + 1 else 0),
+                            Alive => True);
+                  Pos := Pos + Lens (I);
+               end loop;
+               for I in 1 .. N - 1 loop
+                  Try_Push (I);
+               end loop;
+
+               while HN > 0 loop
+                  declare
+                     C : Cand;
+                  begin
+                     Pop (C);
+                     declare
+                        L : constant Natural := C.L;
+                        R : constant Natural :=
+                          (if S (L).Alive then S (L).Nxt else 0);
+                     begin
+                        --  Merges always deactivate the RIGHT symbol, so the
+                        --  span snapshots fully determine staleness.
+                        if R /= 0 and then S (R).Alive
+                          and then S (L).To = C.LT and then S (R).To = C.RT
+                        then
+                           S (L).To    := S (R).To;
+                           S (R).Alive := False;
+                           S (L).Nxt   := S (R).Nxt;
+                           if S (R).Nxt /= 0 then
+                              S (S (R).Nxt).Prev := L;
+                           end if;
+                           Try_Push (S (L).Prev);
+                           Try_Push (L);
+                        end if;
+                     end;
                   end;
                end loop;
 
-               exit when Best_I = 0;
-
-               Pieces (Best_I) := Pieces (Best_I) & Pieces (Best_I + 1);
-               for J in Best_I + 1 .. N - 1 loop
-                  Pieces (J) := Pieces (J + 1);
-               end loop;
-               N := N - 1;
-            end;
-         end loop;
-
-         return R : Token_Array (1 .. N) do
-            for I in 1 .. N loop
+               --  Walk the surviving symbols (symbol 1 is never the right
+               --  side of a merge, so it is always the list head).
                declare
-                  P : constant String := To_String (Pieces (I));
+                  Cnt : Natural := 0;
+                  I   : Natural := 1;
                begin
-                  if T.Vocab.Contains (P) then
-                     R (I) := T.Vocab.Element (P);
-                  elsif T.Unk_Id >= 0 then
-                     R (I) := T.Unk_Id;        -- the model's real UNK token
-                  else
-                     R (I) := 0;               -- last resort (no UNK defined)
-                  end if;
+                  while I /= 0 loop
+                     Cnt := Cnt + 1;
+                     I := S (I).Nxt;
+                  end loop;
+                  declare
+                     R2 : Token_Array (1 .. Cnt);
+                     K  : Natural := 0;
+                  begin
+                     I := 1;
+                     while I /= 0 loop
+                        K := K + 1;
+                        declare
+                           P : constant String := W (S (I).From .. S (I).To);
+                        begin
+                           if T.Vocab.Contains (P) then
+                              R2 (K) := T.Vocab.Element (P);
+                           elsif T.Unk_Id >= 0 then
+                              R2 (K) := T.Unk_Id;  -- the model's real UNK token
+                           else
+                              R2 (K) := 0;         -- last resort (no UNK)
+                           end if;
+                        end;
+                        I := S (I).Nxt;
+                     end loop;
+                     Free (S);
+                     Free (H);
+                     Free (Lens);
+                     return R2;
+                  end;
                end;
-            end loop;
-         end return;
+            exception
+               when others =>
+                  Free (S);
+                  Free (H);
+                  Free (Lens);
+                  raise;
+            end;
+         end;
       end;
    end Encode;
 
