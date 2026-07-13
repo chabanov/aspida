@@ -81,6 +81,159 @@ package body LLM_Sampler is
          end;
       end if;
 
+      --  Fast sampled path (the production config: temperature + top-k and/or
+      --  top-p, no min-p). ONE ordered pass over the logits with an
+      --  incremental top-K insertion buffer, then softmax over just the K kept
+      --  candidates — the top-k -> softmax -> top-p order this package header
+      --  documents (llama.cpp/ollama do exactly this; the tail beyond top-k is
+      --  discarded there too). The general path below instead did ~25 full
+      --  passes over the vocab per token (copy, softmax with 248k Exp calls,
+      --  and an O(N*K) selection with K full scans) plus ~1.25 MB of heap
+      --  allocation — ~16.6 ms/token at vocab 248k, dwarfing the 7 ms GPU
+      --  forward (40 tok/s instead of ~117). Penalties are applied on the fly
+      --  via a cursor over a small index-sorted penalised set, replaying the
+      --  exact same math as the general path.
+      if S.P.Temperature > 0.0 and then S.P.Min_P = 0.0
+        and then (S.P.Top_K > 0 or else S.P.Top_P < 1.0)
+      then
+         declare
+            type Flat_View is array (1 .. N) of Float;
+            LV : Flat_View
+              with Import, Address => LLM_Tensor.Data_Address (Logits);
+            EffK : constant Integer :=
+              (if S.P.Top_K > 0 then Integer'Min (S.P.Top_K, N)
+               else Integer'Min (N, 256));
+            --  Penalised set: distinct recent ids (1-based) with their fully
+            --  adjusted logits. Bounded by the recency window (small).
+            Max_Pen : constant Natural := Recent'Length;
+            PIdx : array (1 .. Max_Pen) of Integer := [others => 0];
+            PVal : array (1 .. Max_Pen) of Float   := [others => 0.0];
+            NP   : Natural := 0;
+            --  Kept candidates, KV sorted descending.
+            KI : array (1 .. EffK) of Integer := [others => 0];
+            KV : array (1 .. EffK) of Float   := [others => 0.0];
+            Kn  : Natural := 0;
+            Cur : Natural := 1;
+         begin
+            --  Repetition penalty per OCCURRENCE (same as the general path's
+            --  `for R of Recent` loop: duplicates are penalised repeatedly).
+            for R of Recent loop
+               if R >= 0 and then R + 1 <= N then
+                  declare
+                     Pos : Natural := 0;
+                  begin
+                     for J in 1 .. NP loop
+                        if PIdx (J) = R + 1 then Pos := J; exit; end if;
+                     end loop;
+                     if Pos = 0 then
+                        NP := NP + 1; Pos := NP;
+                        PIdx (Pos) := R + 1; PVal (Pos) := LV (R + 1);
+                     end if;
+                     if S.P.Repeat_Penalty /= 1.0 then
+                        if PVal (Pos) > 0.0 then
+                           PVal (Pos) := PVal (Pos) / S.P.Repeat_Penalty;
+                        else
+                           PVal (Pos) := PVal (Pos) * S.P.Repeat_Penalty;
+                        end if;
+                     end if;
+                  end;
+               end if;
+            end loop;
+            --  Presence penalty once per DISTINCT recent token.
+            if S.P.Presence_Penalty /= 0.0 then
+               for J in 1 .. NP loop
+                  PVal (J) := PVal (J) - S.P.Presence_Penalty;
+               end loop;
+            end if;
+            --  Sort the penalised set by index for the cursor walk below.
+            for A in 2 .. NP loop
+               declare
+                  TI : constant Integer := PIdx (A);
+                  TV : constant Float   := PVal (A);
+                  B  : Natural := A;
+               begin
+                  while B > 1 and then PIdx (B - 1) > TI loop
+                     PIdx (B) := PIdx (B - 1); PVal (B) := PVal (B - 1);
+                     B := B - 1;
+                  end loop;
+                  PIdx (B) := TI; PVal (B) := TV;
+               end;
+            end loop;
+
+            --  THE pass: adjusted logit per element (cursor gives penalised
+            --  values in index order), invalid values skipped (so the kept set
+            --  is all-valid and KI(1) doubles as the greedy fallback).
+            for I in 1 .. N loop
+               declare
+                  A : Float := LV (I);
+               begin
+                  if Cur <= NP and then PIdx (Cur) = I then
+                     A := PVal (Cur); Cur := Cur + 1;
+                  end if;
+                  if A'Valid and then (Kn < EffK or else A > KV (Kn)) then
+                     declare
+                        Pos : Natural := (if Kn < EffK then Kn + 1 else EffK);
+                     begin
+                        while Pos > 1 and then A > KV (Pos - 1) loop
+                           KV (Pos) := KV (Pos - 1); KI (Pos) := KI (Pos - 1);
+                           Pos := Pos - 1;
+                        end loop;
+                        KV (Pos) := A; KI (Pos) := I;
+                        if Kn < EffK then Kn := Kn + 1; end if;
+                     end;
+                  end if;
+               end;
+            end loop;
+
+            if Kn = 0 then
+               return 0;          --  every logit invalid: emit token 0
+            end if;
+
+            --  Temperature + numerically stable softmax over the K kept only,
+            --  then nucleus cut and draw (renormalised over the survivors).
+            declare
+               T   : constant Float := S.P.Temperature;
+               Mx  : constant Float := KV (1) / T;
+               E   : array (1 .. Kn) of Float;
+               Den : Float := 0.0;
+               Keep : Natural := Kn;
+            begin
+               for R in 1 .. Kn loop
+                  E (R) := Exp (KV (R) / T - Mx);
+                  Den := Den + E (R);
+               end loop;
+               if (not Den'Valid) or else Den <= 0.0 then
+                  return KI (1) - 1;   --  greedy fallback
+               end if;
+               if S.P.Top_P < 1.0 then
+                  declare
+                     Cum : Float := 0.0;
+                  begin
+                     for R in 1 .. Kn loop
+                        Cum := Cum + E (R) / Den;
+                        if Cum >= S.P.Top_P then Keep := R; exit; end if;
+                     end loop;
+                  end;
+               end if;
+               declare
+                  KDen : Float := 0.0;
+                  U    : constant Float := Next_Float (S);
+                  Acc  : Float := 0.0;
+               begin
+                  for R in 1 .. Keep loop KDen := KDen + E (R); end loop;
+                  if KDen <= 0.0 then
+                     return KI (1) - 1;
+                  end if;
+                  for R in 1 .. Keep loop
+                     Acc := Acc + E (R) / KDen;
+                     if U <= Acc then return KI (R) - 1; end if;
+                  end loop;
+                  return KI (Keep) - 1;   --  rounding fallback
+               end;
+            end;
+         end;
+      end if;
+
       L := new Float_Arr (1 .. N);
       for I in 1 .. N loop L (I) := Get_Flat (Logits, I); end loop;
 
