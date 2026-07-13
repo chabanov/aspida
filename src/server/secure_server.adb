@@ -34,6 +34,7 @@ with Crypto.SHA256;
 with Secure_Channel;
 with Socket_Transport;
 with Session_Store;
+with LLM_Batcher;
 with Encrypting_Sink;
 with Protocol;
 with LLM_Qwen;
@@ -332,10 +333,18 @@ procedure Secure_Server is
    --  disconnect) can leave that shared state wedged, after which EVERY later
    --  generation fails with "internal error" (observed once the concurrent
    --  proxy actually drove 8 sessions at once, 2026-07-13). Serialising whole
-   --  generations matches how Ollama served this model and is safe; true
-   --  multi-session throughput is the batcher's job (ASPIDA_BATCH_SERVE), which
-   --  owns its own per-lane KV. /v1/models and the handshake never take this
-   --  lock, so they stay responsive while a generation runs.
+   --  generations matches how Ollama served this model and is safe.
+   --
+   --  With the batcher live (ASPIDA_BATCH_SERVE) this lock must NOT serialise:
+   --  concurrent generations are the whole point — each owns a batch lane with
+   --  per-lane device state, the single Driver task is the only GPU forward
+   --  caller, and admission is bounded by the lane pool itself (Begin_Gen
+   --  blocks when all lanes are busy, it never falls back to the shared single
+   --  path). So the lock passes through when batching, and serialises exactly
+   --  as before when not. /v1/models and the handshake never take this lock,
+   --  so they stay responsive while generations run either way.
+   Batch_On : constant Boolean := LLM_Batcher.Enabled;
+
    protected Infer_Lock is
       entry Acquire;
       procedure Release;
@@ -344,9 +353,11 @@ procedure Secure_Server is
    end Infer_Lock;
 
    protected body Infer_Lock is
-      entry Acquire when not Held is
+      entry Acquire when Batch_On or else not Held is
       begin
-         Held := True;
+         if not Batch_On then
+            Held := True;
+         end if;
       end Acquire;
       procedure Release is
       begin

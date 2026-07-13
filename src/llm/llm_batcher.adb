@@ -35,6 +35,7 @@ package body LLM_Batcher is
       In_Use   : Boolean := False;
       Pending  : Boolean := False;
       Ready    : Boolean := False;
+      Failed   : Boolean := False;  -- the forward covering this lane raised
       Row, Pos : Integer := 0;
       H_Addr   : System.Address := System.Null_Address;
       NL       : Integer := 0;
@@ -46,15 +47,20 @@ package body LLM_Batcher is
    --  Pool — coordinates handler lanes with the single Driver task.
    --------------------------------------------------------------------------
    protected Pool is
-      procedure Claim (Lane : out Integer);
+      --  Blocks while every lane is in use: queued admission, never a fallback
+      --  to the (unsafe-when-concurrent) single-request path.
+      entry Claim (Lane : out Integer);
       procedure Free  (L : Integer);
       procedure Post  (L, Row, Pos, NL : Integer; H, Lg : System.Address);
-      entry Wait_Done (Lane_Id);
+      entry Wait_Done (Lane_Id) (Failed : out Boolean);
       entry Wait_Pending;                       -- gate: ≥1 lane posted
       function All_Pending return Boolean;       -- every active lane is pending
       procedure Take (Lanes, Rows, Poss, NLs : out Int_Arr;
                       H, Logs : out Addr_Arr; N : out Integer);
       procedure Mark_Done (Lanes : Int_Arr; N : Integer);
+      --  The forward covering these lanes raised: wake the callers with the
+      --  Failed flag so each aborts its own generation (Step raises).
+      procedure Mark_Failed (Lanes : Int_Arr; N : Integer);
    private
       S : Lane_Array;
       Pending_Count : Natural := 0;
@@ -62,7 +68,7 @@ package body LLM_Batcher is
    end Pool;
 
    protected body Pool is
-      procedure Claim (Lane : out Integer) is
+      entry Claim (Lane : out Integer) when Active_Count < Max_Lanes is
       begin
          Lane := -1;
          for L in Lane_Id loop
@@ -92,9 +98,12 @@ package body LLM_Batcher is
       end Post;
 
       --  A handler blocks here until the forward covering its lane is done.
-      entry Wait_Done (for L in Lane_Id) when S (L).Ready is
+      entry Wait_Done (for L in Lane_Id) (Failed : out Boolean)
+        when S (L).Ready is
       begin
-         S (L).Ready := False;
+         S (L).Ready  := False;
+         Failed       := S (L).Failed;
+         S (L).Failed := False;
       end Wait_Done;
 
       --  The Driver waits here for the first pending lane, then (after a short
@@ -137,6 +146,14 @@ package body LLM_Batcher is
             S (Lane_Id (Lanes (I))).Ready := True;
          end loop;
       end Mark_Done;
+
+      procedure Mark_Failed (Lanes : Int_Arr; N : Integer) is
+      begin
+         for I in 0 .. N - 1 loop
+            S (Lane_Id (Lanes (I))).Failed := True;
+            S (Lane_Id (Lanes (I))).Ready  := True;
+         end loop;
+      end Mark_Failed;
    end Pool;
 
    --------------------------------------------------------------------------
@@ -197,28 +214,41 @@ package body LLM_Batcher is
                   & " max_B=" & Integer'Image (Max_B));
             end if;
          end if;
-         --  Assemble the batched inputs from each lane's snapshot.
-         for I in 0 .. N - 1 loop
-            CRows (I) := Interfaces.C.int (Rows (I));
-            CPos (I)  := Interfaces.C.int (Poss (I));
-            declare
-               Src : C_Int_Arr (0 .. NLs (I) - 1) with Import, Address => H (I);
-            begin
-               CHandles (I * Cfg_NL .. I * Cfg_NL + NLs (I) - 1) := Src;
-            end;
-         end loop;
-         LLM_Qwen_GPU.Chain_Forward_Batch
-           (N, CRows.all'Address, CPos.all'Address, CHandles.all'Address,
-            Batch_Log.all'Address);
-         --  Scatter each lane's logit slice back to its caller's buffer.
-         for I in 0 .. N - 1 loop
-            declare
-               Dst : F_Arr (0 .. Cfg_Vocab - 1) with Import, Address => Logs (I);
-            begin
-               Dst := Batch_Log (I * Cfg_Vocab .. I * Cfg_Vocab + Cfg_Vocab - 1);
-            end;
-         end loop;
-         Pool.Mark_Done (Lanes, N);
+         --  The forward + scatter must NEVER kill this task: with the Driver
+         --  dead every batch client would block in Wait_Done forever (a whole-
+         --  server wedge). Chain_Forward_Batch can raise GPU_Error (the CUDA
+         --  error check) — on any exception wake the covered lanes with the
+         --  Failed flag so each caller aborts its own generation cleanly, and
+         --  keep driving the next batch.
+         begin
+            --  Assemble the batched inputs from each lane's snapshot.
+            for I in 0 .. N - 1 loop
+               CRows (I) := Interfaces.C.int (Rows (I));
+               CPos (I)  := Interfaces.C.int (Poss (I));
+               declare
+                  Src : C_Int_Arr (0 .. NLs (I) - 1)
+                    with Import, Address => H (I);
+               begin
+                  CHandles (I * Cfg_NL .. I * Cfg_NL + NLs (I) - 1) := Src;
+               end;
+            end loop;
+            LLM_Qwen_GPU.Chain_Forward_Batch
+              (N, CRows.all'Address, CPos.all'Address, CHandles.all'Address,
+               Batch_Log.all'Address);
+            --  Scatter each lane's logit slice back to its caller's buffer.
+            for I in 0 .. N - 1 loop
+               declare
+                  Dst : F_Arr (0 .. Cfg_Vocab - 1)
+                    with Import, Address => Logs (I);
+               begin
+                  Dst := Batch_Log (I * Cfg_Vocab .. I * Cfg_Vocab + Cfg_Vocab - 1);
+               end;
+            end loop;
+            Pool.Mark_Done (Lanes, N);
+         exception
+            when others =>
+               Pool.Mark_Failed (Lanes, N);
+         end;
       end loop;
    end Driver;
 
@@ -248,9 +278,13 @@ package body LLM_Batcher is
 
    procedure Step (Lane, Embed_Row, Pos, N_Layers : Integer;
                    Handles, Logits : System.Address) is
+      Failed : Boolean;
    begin
       Pool.Post (Lane, Embed_Row, Pos, N_Layers, Handles, Logits);
-      Pool.Wait_Done (Lane_Id (Lane));
+      Pool.Wait_Done (Lane_Id (Lane)) (Failed);
+      if Failed then
+         raise Batch_Failed with "batched GPU forward failed";
+      end if;
    end Step;
 
 end LLM_Batcher;

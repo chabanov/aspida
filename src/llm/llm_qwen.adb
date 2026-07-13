@@ -1007,7 +1007,10 @@ package body LLM_Qwen is
             Handles (I) := Interfaces.C.int (Hn);
          end;
       end loop;
-      --  Claim a batch lane; if the pool is full, fall back to the single path.
+      --  Claim a batch lane. Begin_Gen BLOCKS until one is free — falling back
+      --  to the single path while the batcher is live would drive the shared
+      --  resident chain state concurrently with the Driver (cross-generation
+      --  KV corruption), so excess requests queue on the lane pool instead.
       if Use_Chain and then LLM_Batcher.Enabled then
          LLM_Batcher.Configure (M.N_Blocks, M.Vocab_Sz);
          LLM_Batcher.Begin_Gen (My_Lane);

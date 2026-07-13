@@ -17,11 +17,21 @@ package LLM_Batcher is
    --  Enabled by env ASPIDA_BATCH_SERVE (falls back to the single-request path).
    function Enabled return Boolean;
 
+   --  Raised by Step in every caller of a batch whose GPU forward failed (see
+   --  the Driver's handler): the generation must abort — its logits were never
+   --  produced. Callers unwind through Decode_Tokens (which frees GPU state)
+   --  to the handler (which releases its locks and reports internal error).
+   Batch_Failed : exception;
+
    --  Called once after the resident chain is registered (model load).
    procedure Configure (N_Layers, Vocab : Integer);
 
-   --  Claim a batch lane for the lifetime of one generation. Lane = -1 if the
-   --  pool is full (caller should fall back to the single-request path).
+   --  Claim a batch lane for the lifetime of one generation. BLOCKS until a
+   --  lane is free when the pool is full: falling back to the single-request
+   --  path while the batcher is live is NOT safe (the single path drives the
+   --  shared resident chain state concurrently with the Driver — the exact
+   --  cross-generation KV corruption the batcher exists to avoid), so excess
+   --  requests queue here instead. Lane is always >= 0 on return.
    procedure Begin_Gen (Lane : out Integer);
    procedure End_Gen (Lane : Integer);
 
@@ -35,6 +45,8 @@ package LLM_Batcher is
    --  that includes this lane completes and its logits are in Logits.
    --  Handles -> N_Layers C ints (this request's per-layer state handles).
    --  Logits  -> Vocab floats, filled on return.
+   --  Raises Batch_Failed if that forward raised (e.g. a CUDA error): the
+   --  logits were not produced and this generation must abort.
    procedure Step (Lane, Embed_Row, Pos, N_Layers : Integer;
                    Handles, Logits : System.Address);
 
