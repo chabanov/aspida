@@ -919,7 +919,26 @@ begin
 
    Create_Socket (Listener);
    Set_Socket_Option (Listener, Socket_Level, (Reuse_Address, True));
-   Bind_Socket (Listener, (Family_Inet, Bind_Addr, Port));
+   --  Bind can transiently fail with EADDRINUSE right after a restart while a
+   --  predecessor's listen socket drains. Retry rather than die on the race.
+   declare
+      Bound : Boolean := False;
+   begin
+      for Attempt in 1 .. 20 loop
+         begin
+            Bind_Socket (Listener, (Family_Inet, Bind_Addr, Port));
+            Bound := True;
+            exit;
+         exception
+            when Socket_Error =>
+               if Attempt = 20 then
+                  raise;
+               end if;
+               delay 0.5;
+         end;
+      end loop;
+      pragma Assert (Bound);
+   end;
    Listen_Socket (Listener);
    Put_Line ("listening on port" & Port_Type'Image (Port)
      & " (up to" & Integer'Image (Max_Clients) & " concurrent clients)");
@@ -980,6 +999,23 @@ begin
                Conn_Queue.Put (Conn);     -- a free handler will pick it up
             end if;
          end;
+      exception
+         when others =>
+            --  A transient error handling one incoming connection (accept,
+            --  rate-limit, a socket option on a peer that vanished) must never
+            --  break the accept loop — that would end main and hang the process
+            --  in finalize_global_tasks on the non-terminating library tasks.
+            begin Close_Socket (Conn); exception when others => null; end;
       end;
    end loop;
+exception
+   --  The accept loop is infinite, so this only fires if something outside the
+   --  per-connection guard escapes (e.g. the listener Bind's EADDRINUSE, or a
+   --  fault in Accept itself). Exit immediately rather than returning into
+   --  finalize_global_tasks, which blocks forever on this binary's library
+   --  tasks and leaves the port held — the shape of the 2026-07-13 hang.
+   when E : others =>
+      Put_Line ("server fatal: " & Exception_Name (E) & ": " & Exception_Message (E));
+      Flush;
+      GNAT.OS_Lib.OS_Exit (1);
 end Secure_Server;

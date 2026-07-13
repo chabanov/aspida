@@ -101,6 +101,13 @@ procedure OpenAI_Proxy is
    Listener, Client : Socket_Type;           -- local HTTP
    Model_Name : constant String := "aspida";
 
+   --  Raised when a write to the HTTP client fails because the client went
+   --  away (killed curl, browser tab closed, gateway timeout). Propagating it
+   --  lets the request loop tear down THIS request's server channel promptly,
+   --  which makes the server's next token-send fail and abort generation —
+   --  instead of silently draining the whole response into a dead socket.
+   Client_Gone : exception;
+
    ----------------------------------------------------------------
    -- Minimal HTTP over a connected client socket
    ----------------------------------------------------------------
@@ -117,8 +124,15 @@ procedure OpenAI_Proxy is
       --  is sent, else the final SSE chunk / [DONE] / JSON tail can be dropped
       --  (the answer "cuts off at the end").
       while Pos <= Buf'Last loop
-         Send_Socket (S, Buf (Pos .. Buf'Last), Last);
-         exit when Last < Pos;          -- nothing sent -> peer gone; give up
+         begin
+            Send_Socket (S, Buf (Pos .. Buf'Last), Last);
+         exception
+            when Socket_Error =>          -- EPIPE / ECONNRESET: peer went away
+               raise Client_Gone;
+         end;
+         if Last < Pos then               -- nothing sent -> peer gone
+            raise Client_Gone;
+         end if;
          Pos := Last + 1;
       end loop;
    end Sock_Write;
@@ -277,14 +291,17 @@ procedure OpenAI_Proxy is
          raise Channel_Failed;
    end Open_Channel;
 
-   --  Tear down the current channel/socket (best effort) and rebuild it. Used
-   --  in the request-loop error path to clear any half-consumed record state.
-   procedure Reset_Channel is
+   --  Tear down the current channel/socket (best effort). Each HTTP request
+   --  now uses its OWN fresh channel (opened per request, closed here), so a
+   --  request that aborts mid-stream can NEVER leave a half-consumed record
+   --  for the next request to trip over — the single shared, reused channel
+   --  was the source of the 2026-07-13 desync deadlock where the proxy waited
+   --  for a response frame the server had already finished and moved past.
+   procedure Close_Channel is
    begin
       begin Secure_Channel.Close (Ch); exception when others => null; end;
       begin Close_Socket (Sock); exception when others => null; end;
-      Open_Channel;
-   end Reset_Channel;
+   end Close_Channel;
 
 begin
    if Argument_Count < 3 then
@@ -292,7 +309,8 @@ begin
       GNAT.OS_Lib.OS_Exit (2);
    end if;
 
-   --  Open the encrypted channel to the server (pin its key) once.
+   --  Validate connectivity + report the cipher suite once at startup, then
+   --  close it: real serving opens a fresh channel per request.
    begin
       Open_Channel;
    exception
@@ -305,6 +323,7 @@ begin
    Put_Line ("  OpenAI-compatible endpoint: http://127.0.0.1:"
              & Ada.Strings.Fixed.Trim (Local_Port'Image, Ada.Strings.Both) & "/v1");
    Put_Line ("  (any api_key; requests are AEAD-sealed to the pinned server)");
+   Close_Channel;
 
    --  Local HTTP listener, loopback only. Bind can transiently fail with
    --  EADDRINUSE right after a restart while a predecessor's listen socket is
@@ -347,6 +366,10 @@ begin
       begin
          Accept_Socket (Listener, Client, Addr);
          Read_Request (Client, Method, Path, RBody, ML, PL, BL, Err);
+         --  Fresh server channel per request: no state carries between clients,
+         --  so a mid-stream abort can't desync the next one. Raises
+         --  Channel_Failed if the server is unreachable (handled below).
+         Open_Channel;
          declare
             Pth : constant String := Path (Path'First .. Path'First + PL - 1);
             Bdy : constant String := RBody (RBody'First .. RBody'First + BL - 1);
@@ -541,25 +564,26 @@ begin
                  OpenAI.Error_Response ("unknown route: " & Pth));
             end if;
          end;
-         Close_Socket (Client);
+         Close_Channel;
+         begin Close_Socket (Client); exception when others => null; end;
       exception
-         when others =>
-            begin Close_Socket (Client); exception when others => null; end;
-            --  The shared channel may be half-consumed (an exception fired
-            --  mid-record); rebuild it so the next client does not read stale
-            --  records. If the server is unreachable, exit cleanly.
+         when Channel_Failed =>
+            --  Could not open a channel for this request: the backend is down
+            --  or saturated. Tell the client and keep serving — a single
+            --  failed request must not take the proxy down (the health probe
+            --  will restart the service if the backend stays unreachable).
             begin
-               Reset_Channel;
-            exception
-               when Channel_Failed =>
-                  --  Server truly gone: die immediately so systemd restarts a
-                  --  fresh proxy. OS_Exit (not `exit`/return) is mandatory —
-                  --  a normal return would block forever in
-                  --  finalize_global_tasks waiting on the non-terminating
-                  --  library tasks this binary links, holding the port.
-                  Put_Line ("error: lost the secure server; exiting");
-                  GNAT.OS_Lib.OS_Exit (1);
-            end;
+               Write_JSON (Client, "503 Service Unavailable",
+                 OpenAI.Error_Response ("backend unavailable", "backend_unavailable"));
+            exception when others => null; end;
+            begin Close_Socket (Client); exception when others => null; end;
+         when others =>
+            --  Client vanished mid-stream, or a per-request error. Drop this
+            --  request's channel (which aborts the server-side generation) and
+            --  its client socket, then serve the next client. No shared state
+            --  survives, so nothing to resync.
+            Close_Channel;
+            begin Close_Socket (Client); exception when others => null; end;
       end;
    end loop;
    --  The loop never falls through (it only leaves via OS_Exit on a lost
