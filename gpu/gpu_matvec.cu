@@ -2344,10 +2344,18 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     MoeRoute *pdroute=S.droute;
     int *p_rows=S.rows;
     int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=S.stream;
+    //  Opt-in per-phase profiler (env ASPIDA_PREFILL_PROF): splits GPU time
+    //  into the attention/dnet block vs the MoE block, aggregated over layers.
+    //  Zero cost when the env is unset. Per-layer event syncs perturb wall
+    //  time (~2x) so use it only for measurement, never in a serving config.
+    static int pprof = getenv("ASPIDA_PREFILL_PROF") ? 1 : 0;
+    cudaEvent_t pe0=0,pe1=0,pe2=0; double acc_attn=0, acc_moe=0, acc_dnet=0, acc_fattn=0, acc_dproj=0, acc_recur=0;
+    if (pprof) { cudaEventCreate(&pe0); cudaEventCreate(&pe1); cudaEventCreate(&pe2); }
     cudaMemcpyAsync(p_rows, rows, (size_t)P*4, cudaMemcpyHostToDevice, st);
     k_embed_b<<<((size_t)dim*P+255)/256,256,0,st>>>(g_ch_embed, p_rows, pHb, dim, P);
     for (int li=0; li<NL; ++li) {
         ChainLayer &L=g_chain[li];
+        if (pprof) cudaEventRecord(pe0, st);
         k_norm1_b<<<P,256,0,st>>>(pHb, L.attn_norm, pnxb, dim, P);
         if (!L.is_fattn) {
             DnetState ds = g_dnet[handles[li]];
@@ -2358,9 +2366,11 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             size_t shmem=(size_t)(4*L.khd+2*L.vhd)*4;
             k_dnet_conv_chunk<<<(L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.conv, pdcq, L.qo, L.kernel, P);
             k_dnet_gates_b<<<((size_t)P*L.nv+255)/256,256,0,st>>>(pdar, pdbr, L.aw, L.dtw, pdg, pdb, L.nv, P);
+            if (pprof) { cudaEventRecord(pe1, st); cudaEventSynchronize(pe1); float p=0; cudaEventElapsedTime(&p, pe0, pe1); acc_dproj += p; }
             k_dnet_recur_chunk<<<L.nv, L.khd, shmem, st>>>(
                 ds.S, pdcq, pdg, pdb, pdz, L.nw, pdor,
                 L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim, P);
+            if (pprof) { cudaEventRecord(pe2, st); cudaEventSynchronize(pe2); float r=0; cudaEventElapsedTime(&r, pe1, pe2); acc_recur += r; }
             launch_mv_b(L.ow, L.ow_k, L.v_dim, dim, pdor, paob, P, st);
         } else {
             FattnState fs = g_fattn[handles[li]];
@@ -2381,6 +2391,9 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             launch_mv_b(L.fow, L.fow_k, att, dim, pdatt, paob, P, st);
         }
         k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
+        if (pprof) { cudaEventRecord(pe1, st); cudaEventSynchronize(pe1);
+            float a=0; cudaEventElapsedTime(&a, pe0, pe1);
+            acc_attn += a; if (L.is_fattn) acc_fattn += a; else acc_dnet += a; }
         if (L.has_moe) {
             k_norm1_b<<<P,256,0,st>>>(pHb, L.post_norm, pnxb, dim, P);
             launch_mv_b(L.rw, L.rk, dim, L.n_exp, pnxb, pdrl, P, st);
@@ -2390,7 +2403,16 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
             k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
             k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
+            if (pprof) { cudaEventRecord(pe2, st); cudaEventSynchronize(pe2);
+                float m=0; cudaEventElapsedTime(&m, pe1, pe2); acc_moe += m; }
         }
+    }
+    if (pprof) {
+        fprintf(stderr, "[PREFILLPROF] P=%d NL=%d | attn-block=%.2fms (dnet=%.2f [dproj=%.2f recur=%.2f] fattn=%.2f) "
+            "moe=%.2fms total=%.2fms | per-tok: attn=%.3f moe=%.3f sum=%.3f ms\n",
+            P, NL, acc_attn, acc_dnet, acc_dproj, acc_recur, acc_fattn, acc_moe, acc_attn+acc_moe,
+            acc_attn/P, acc_moe/P, (acc_attn+acc_moe)/P);
+        cudaEventDestroy(pe0); cudaEventDestroy(pe1); cudaEventDestroy(pe2);
     }
     // LM head on the LAST position only.
     const float *last_h = pHb + (size_t)(P - 1) * dim;
