@@ -40,6 +40,12 @@ package body LLM_Batcher is
       H_Addr   : System.Address := System.Null_Address;
       NL       : Integer := 0;
       Log_Addr : System.Address := System.Null_Address;
+      --  Generation epoch. Bumped on every Claim (and on Abandon). A batch's
+      --  Take snapshots each lane's Seq; Mark_Done / the scatter only touch a
+      --  lane whose Seq still matches — so a step whose handler already timed
+      --  out and freed (or reused) the lane cannot wake the wrong generation
+      --  or scatter into a buffer the abandoned handler has released.
+      Seq      : Natural := 0;
    end record;
    type Lane_Array is array (Lane_Id) of Lane_Rec;
 
@@ -55,12 +61,20 @@ package body LLM_Batcher is
       entry Wait_Done (Lane_Id) (Failed : out Boolean);
       entry Wait_Pending;                       -- gate: ≥1 lane posted
       function All_Pending return Boolean;       -- every active lane is pending
-      procedure Take (Lanes, Rows, Poss, NLs : out Int_Arr;
+      procedure Take (Lanes, Rows, Poss, NLs, Seqs : out Int_Arr;
                       H, Logs : out Addr_Arr; N : out Integer);
-      procedure Mark_Done (Lanes : Int_Arr; N : Integer);
+      --  True iff lane L is still the same generation the batch snapshotted
+      --  (In_Use and Seq unchanged) — gates the Driver's scatter so it never
+      --  writes into a buffer an abandoned/reused lane no longer owns.
+      function Live (L, Seq : Integer) return Boolean;
+      procedure Mark_Done (Lanes, Seqs : Int_Arr; N : Integer);
       --  The forward covering these lanes raised: wake the callers with the
       --  Failed flag so each aborts its own generation (Step raises).
-      procedure Mark_Failed (Lanes : Int_Arr; N : Integer);
+      procedure Mark_Failed (Lanes, Seqs : Int_Arr; N : Integer);
+      --  A handler timed out waiting for its step: drop any pending step and
+      --  bump the epoch so the in-flight batch (if any) can no longer touch
+      --  this lane. The handler then frees the lane and aborts.
+      procedure Abandon (L : Integer);
    private
       S : Lane_Array;
       Pending_Count : Natural := 0;
@@ -73,7 +87,9 @@ package body LLM_Batcher is
          Lane := -1;
          for L in Lane_Id loop
             if not S (L).In_Use then
-               S (L) := (In_Use => True, others => <>);
+               --  New epoch for this generation (preserve the monotonic Seq
+               --  across the reset so a stale in-flight step is rejected).
+               S (L) := (In_Use => True, Seq => S (L).Seq + 1, others => <>);
                Lane := Integer (L);
                Active_Count := Active_Count + 1;
                exit;
@@ -82,11 +98,29 @@ package body LLM_Batcher is
       end Claim;
 
       procedure Free (L : Integer) is
+         Id : constant Lane_Id := Lane_Id (L);
+         Keep : constant Natural := S (Id).Seq;
       begin
-         if S (Lane_Id (L)).Pending then Pending_Count := Pending_Count - 1; end if;
-         if S (Lane_Id (L)).In_Use then Active_Count := Active_Count - 1; end if;
-         S (Lane_Id (L)) := (In_Use => False, others => <>);
+         if S (Id).Pending then Pending_Count := Pending_Count - 1; end if;
+         if S (Id).In_Use then Active_Count := Active_Count - 1; end if;
+         S (Id) := (In_Use => False, Seq => Keep, others => <>);
       end Free;
+
+      procedure Abandon (L : Integer) is
+         Id : constant Lane_Id := Lane_Id (L);
+      begin
+         if S (Id).Pending then
+            S (Id).Pending := False;
+            Pending_Count := Pending_Count - 1;
+         end if;
+         --  Invalidate any in-flight batch's claim on this lane.
+         S (Id).Seq := S (Id).Seq + 1;
+      end Abandon;
+
+      function Live (L, Seq : Integer) return Boolean is
+      begin
+         return S (Lane_Id (L)).In_Use and then S (Lane_Id (L)).Seq = Seq;
+      end Live;
 
       procedure Post (L, Row, Pos, NL : Integer; H, Lg : System.Address) is
          Id : constant Lane_Id := Lane_Id (L);
@@ -121,7 +155,7 @@ package body LLM_Batcher is
          return Active_Count > 0 and then Pending_Count >= Active_Count;
       end All_Pending;
 
-      procedure Take (Lanes, Rows, Poss, NLs : out Int_Arr;
+      procedure Take (Lanes, Rows, Poss, NLs, Seqs : out Int_Arr;
                       H, Logs : out Addr_Arr; N : out Integer) is
       begin
          N := 0;
@@ -131,6 +165,7 @@ package body LLM_Batcher is
                Rows (N)  := S (L).Row;
                Poss (N)  := S (L).Pos;
                NLs (N)   := S (L).NL;
+               Seqs (N)  := S (L).Seq;
                H (N)     := S (L).H_Addr;
                Logs (N)  := S (L).Log_Addr;
                S (L).Pending := False;
@@ -140,18 +175,24 @@ package body LLM_Batcher is
          Pending_Count := 0;
       end Take;
 
-      procedure Mark_Done (Lanes : Int_Arr; N : Integer) is
+      procedure Mark_Done (Lanes, Seqs : Int_Arr; N : Integer) is
       begin
          for I in 0 .. N - 1 loop
-            S (Lane_Id (Lanes (I))).Ready := True;
+            --  Skip a lane whose handler timed out and freed/reused it (epoch
+            --  changed) — waking it would hand the wrong generation these logits.
+            if S (Lane_Id (Lanes (I))).Seq = Seqs (I) then
+               S (Lane_Id (Lanes (I))).Ready := True;
+            end if;
          end loop;
       end Mark_Done;
 
-      procedure Mark_Failed (Lanes : Int_Arr; N : Integer) is
+      procedure Mark_Failed (Lanes, Seqs : Int_Arr; N : Integer) is
       begin
          for I in 0 .. N - 1 loop
-            S (Lane_Id (Lanes (I))).Failed := True;
-            S (Lane_Id (Lanes (I))).Ready  := True;
+            if S (Lane_Id (Lanes (I))).Seq = Seqs (I) then
+               S (Lane_Id (Lanes (I))).Failed := True;
+               S (Lane_Id (Lanes (I))).Ready  := True;
+            end if;
          end loop;
       end Mark_Failed;
    end Pool;
@@ -180,7 +221,7 @@ package body LLM_Batcher is
    task Driver;
 
    task body Driver is
-      Lanes, Rows, Poss, NLs : Int_Arr;
+      Lanes, Rows, Poss, NLs, Seqs : Int_Arr;
       H, Logs : Addr_Arr;
       N : Integer;
       Fwd_Count, Sum_B, Max_B : Integer := 0;
@@ -202,7 +243,7 @@ package body LLM_Batcher is
                Waited := Waited + 1;
             end loop;
          end;
-         Pool.Take (Lanes, Rows, Poss, NLs, H, Logs, N);
+         Pool.Take (Lanes, Rows, Poss, NLs, Seqs, H, Logs, N);
          if Ada.Environment_Variables.Exists ("ASPIDA_BATCH_LOG") then
             Fwd_Count := Fwd_Count + 1; Sum_B := Sum_B + N;
             if N > Max_B then Max_B := N; end if;
@@ -235,19 +276,25 @@ package body LLM_Batcher is
             LLM_Qwen_GPU.Chain_Forward_Batch
               (N, CRows.all'Address, CPos.all'Address, CHandles.all'Address,
                Batch_Log.all'Address);
-            --  Scatter each lane's logit slice back to its caller's buffer.
+            --  Scatter each lane's logit slice back to its caller's buffer —
+            --  but ONLY while the lane still belongs to the generation we
+            --  snapshotted. If its handler timed out and freed (or reused) the
+            --  lane, Logs (I) points at a buffer that generation no longer
+            --  owns; Live gates the write out.
             for I in 0 .. N - 1 loop
-               declare
-                  Dst : F_Arr (0 .. Cfg_Vocab - 1)
-                    with Import, Address => Logs (I);
-               begin
-                  Dst := Batch_Log (I * Cfg_Vocab .. I * Cfg_Vocab + Cfg_Vocab - 1);
-               end;
+               if Pool.Live (Lanes (I), Seqs (I)) then
+                  declare
+                     Dst : F_Arr (0 .. Cfg_Vocab - 1)
+                       with Import, Address => Logs (I);
+                  begin
+                     Dst := Batch_Log (I * Cfg_Vocab .. I * Cfg_Vocab + Cfg_Vocab - 1);
+                  end;
+               end if;
             end loop;
-            Pool.Mark_Done (Lanes, N);
+            Pool.Mark_Done (Lanes, Seqs, N);
          exception
             when others =>
-               Pool.Mark_Failed (Lanes, N);
+               Pool.Mark_Failed (Lanes, Seqs, N);
          end;
       end loop;
    end Driver;
@@ -276,12 +323,44 @@ package body LLM_Batcher is
       if Lane >= 0 then Pool.Free (Lane); end if;
    end End_Gen;
 
+   --  Per-token liveness deadline. A single batched forward is milliseconds;
+   --  if a lane's step is not served within this many seconds it is wedged (a
+   --  lost wakeup / stuck forward), so the handler abandons it, FREES ITS LANE
+   --  and aborts — turning what used to be a permanent whole-server wedge
+   --  (leaked lanes until all 8 are gone) into one failed request. 0 disables
+   --  the watchdog (legacy unbounded wait). Env ASPIDA_GEN_STEP_TIMEOUT_S.
+   function Read_Step_Timeout return Duration is
+   begin
+      if Ada.Environment_Variables.Exists ("ASPIDA_GEN_STEP_TIMEOUT_S") then
+         return Duration'Value
+           (Ada.Environment_Variables.Value ("ASPIDA_GEN_STEP_TIMEOUT_S"));
+      end if;
+      return 30.0;
+   exception
+      when others => return 30.0;
+   end Read_Step_Timeout;
+
+   Step_Timeout : constant Duration := Read_Step_Timeout;
+
    procedure Step (Lane, Embed_Row, Pos, N_Layers : Integer;
                    Handles, Logits : System.Address) is
       Failed : Boolean;
    begin
       Pool.Post (Lane, Embed_Row, Pos, N_Layers, Handles, Logits);
-      Pool.Wait_Done (Lane_Id (Lane)) (Failed);
+      if Step_Timeout > 0.0 then
+         select
+            Pool.Wait_Done (Lane_Id (Lane)) (Failed);
+         or
+            delay Step_Timeout;
+            --  Stuck: drop this lane's pending step, bump its epoch so the
+            --  in-flight batch (if any) can no longer scatter into our buffer
+            --  or wake us, then abort. End_Gen frees the lane on unwind.
+            Pool.Abandon (Lane);
+            raise Batch_Failed with "batched forward timed out (lane wedged)";
+         end select;
+      else
+         Pool.Wait_Done (Lane_Id (Lane)) (Failed);
+      end if;
       if Failed then
          raise Batch_Failed with "batched GPU forward failed";
       end if;

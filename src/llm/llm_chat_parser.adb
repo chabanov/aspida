@@ -172,18 +172,24 @@ package body LLM_Chat_Parser is
                begin
                   VES := QE;
                end;
-               if VES > 0 then
-                  declare
-                     Key : constant String := Blk (KS .. KE - 1);
-                     Val : constant String := Blk (Tail .. VES - 1);
-                  begin
-                     if not First then
-                        Result := Result & ",";
-                     end if;
-                     First := False;
-                     Result := Result & Quote (Key) & ": " & Quote (Val);
-                  end;
-               end if;
+               --  No closing </parameter> (a truncated / still-streaming tool
+               --  call — e.g. the model was cut off mid-argument). STOP: emit
+               --  what parsed so far. Falling through to `Pos := VES + 1` with
+               --  VES = 0 rewinds Pos to Blk'First, so the same <parameter= is
+               --  re-found every iteration — an INFINITE LOOP that spins a core,
+               --  never releases the generation's batch lane, and after 8 such
+               --  hangs wedges the whole server (2026-07-14).
+               exit when VES = 0;
+               declare
+                  Key : constant String := Blk (KS .. KE - 1);
+                  Val : constant String := Blk (Tail .. VES - 1);
+               begin
+                  if not First then
+                     Result := Result & ",";
+                  end if;
+                  First := False;
+                  Result := Result & Quote (Key) & ": " & Quote (Val);
+               end;
                Pos := VES + 1;
             end;
          end;
