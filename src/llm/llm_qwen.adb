@@ -962,10 +962,16 @@ package body LLM_Qwen is
       --  force-emit </think> so the model concludes and answers. 0 disables.
       Think_Open_Id  : constant Integer := LLM_Tokenizer.Token_To_Id (M.Tok, "<think>");
       Think_Close_Id : constant Integer := LLM_Tokenizer.Token_To_Id (M.Tok, "</think>");
-      Think_Budget   : constant Natural :=
+      --  Absolute cap, but never let reasoning eat the whole reply budget:
+      --  also cap at 3/4 of Max_New_Tokens so a low max_tokens request still
+      --  leaves room for the answer (else it reasons to the cap -> empty).
+      Think_Budget_Env : constant Natural :=
         (if Ada.Environment_Variables.Exists ("ASPIDA_THINK_BUDGET")
          then Natural'Value (Ada.Environment_Variables.Value ("ASPIDA_THINK_BUDGET"))
          else 512);
+      Think_Budget   : constant Natural :=
+        Natural'Min (Think_Budget_Env,
+                     Natural'Max (32, (Max_New_Tokens * 3) / 4));
       In_Reason    : Boolean := Reason_Seeded;   -- prompt opened <think>?
       Reason_Start : Natural := 0;               -- Produced when reasoning began
       Think_Forced : Boolean := False;           -- already forced the close
