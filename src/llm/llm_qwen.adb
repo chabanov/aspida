@@ -824,6 +824,101 @@ package body LLM_Qwen is
       end if;
    end Register_Chain;
 
+   --  ---- Prefix KV-cache registry (phase 3) -------------------------------
+   --  Maps a leading-system-prompt token prefix (64-bit FNV-1a hash + length)
+   --  to the retained per-layer GPU snapshot slots captured after that prefix
+   --  was prefilled once. A later request with the SAME system prompt restores
+   --  those slots and prefills only the short varying suffix (user turn +
+   --  assistant opener), turning a ~13.5s TTFT into ~sub-second. Gated by
+   --  ASPIDA_PREFIX_CACHE and validated bit-exact (prefix-cache logits ==
+   --  full-prefill logits) before it is trusted in serving.
+   Prefix_Cache_On : constant Boolean :=
+     Ada.Environment_Variables.Exists ("ASPIDA_PREFIX_CACHE");
+
+   Max_Prefix_Layers  : constant := 128;   -- >= any model's block count
+   Max_Prefix_Entries : constant := 16;    -- distinct system prompts cached
+
+   type Slot_Storage is array (1 .. Max_Prefix_Layers) of Integer;
+   Empty_Slots : constant Slot_Storage := [others => -1];
+
+   type Key_Array  is array (1 .. Max_Prefix_Entries) of Interfaces.Unsigned_64;
+   type Len_Array  is array (1 .. Max_Prefix_Entries) of Natural;
+   type Bool_Array is array (1 .. Max_Prefix_Entries) of Boolean;
+   type Snap_Array is array (1 .. Max_Prefix_Entries) of Slot_Storage;
+
+   function Prefix_Hash (Ids : LLM_Tokenizer.Token_Array; N : Natural)
+      return Interfaces.Unsigned_64
+   is
+      use type Interfaces.Unsigned_64;
+      H : Interfaces.Unsigned_64 := 16#cbf29ce484222325#;  -- FNV-1a offset
+   begin
+      for I in Ids'First .. Ids'First + N - 1 loop
+         H := (H xor Interfaces.Unsigned_64 (Ids (I))) * 16#100000001b3#;
+      end loop;
+      return H;
+   end Prefix_Hash;
+
+   use type Interfaces.Unsigned_64;
+
+   --  Serialised registry. Reserve picks a target entry (recycling an evicted
+   --  entry's CUDA slots so nothing leaks), the caller snapshots into those
+   --  slots, then Commit stores the actual slot ids. Lookup returns a hit's
+   --  slots for restore. Single-path prefill is already serialised by the
+   --  server's Infer_Lock, but the protected object keeps it safe regardless.
+   protected Prefix_Reg is
+      procedure Lookup (Key : Interfaces.Unsigned_64; N : Natural;
+                        Found : out Boolean; Slots : out Slot_Storage);
+      procedure Reserve (Key : Interfaces.Unsigned_64; N : Natural;
+                         Idx : out Natural; Target : out Slot_Storage);
+      procedure Commit (Idx : Natural; Key : Interfaces.Unsigned_64;
+                        N : Natural; Slots : Slot_Storage);
+   private
+      Keys   : Key_Array  := [others => 0];
+      Lens   : Len_Array  := [others => 0];
+      Valid  : Bool_Array := [others => False];
+      Snaps  : Snap_Array := [others => Empty_Slots];
+      Round  : Natural := 0;  -- round-robin eviction cursor
+   end Prefix_Reg;
+
+   protected body Prefix_Reg is
+      procedure Lookup (Key : Interfaces.Unsigned_64; N : Natural;
+                        Found : out Boolean; Slots : out Slot_Storage) is
+      begin
+         Found := False; Slots := Empty_Slots;
+         for I in Keys'Range loop
+            if Valid (I) and then Keys (I) = Key and then Lens (I) = N then
+               Found := True; Slots := Snaps (I); return;
+            end if;
+         end loop;
+      end Lookup;
+
+      procedure Reserve (Key : Interfaces.Unsigned_64; N : Natural;
+                         Idx : out Natural; Target : out Slot_Storage) is
+      begin
+         --  Reuse an existing entry for this exact key if present.
+         for I in Keys'Range loop
+            if Keys (I) = Key and then Lens (I) = N then
+               Idx := I; Target := Snaps (I); return;
+            end if;
+         end loop;
+         Round := (Round mod Max_Prefix_Entries) + 1;
+         Idx := Round;
+         --  Recycle the evicted entry's CUDA slots (snapshot overwrites them);
+         --  fresh slots (-1) are allocated by the CUDA side on first use.
+         Target := Snaps (Idx);
+         Valid (Idx) := False;   -- invalid until Commit
+      end Reserve;
+
+      procedure Commit (Idx : Natural; Key : Interfaces.Unsigned_64;
+                        N : Natural; Slots : Slot_Storage) is
+      begin
+         if Idx in Keys'Range then
+            Keys (Idx) := Key; Lens (Idx) := N;
+            Snaps (Idx) := Slots; Valid (Idx) := True;
+         end if;
+      end Commit;
+   end Prefix_Reg;
+
    function Decode_Tokens
      (M              : Qwen_Model;
       Prompt_Ids     : LLM_Tokenizer.Token_Array;
@@ -831,7 +926,11 @@ package body LLM_Qwen is
       Stop1, Stop2   : Integer;
       Sink           : access Token_Sink'Class;
       Params         : LLM_Sampler.Params := LLM_Sampler.Greedy;
-      Stats          : access Gen_Stats := null) return String
+      Stats          : access Gen_Stats := null;
+      --  Length (in tokens, from Prompt_Ids'First) of the constant leading
+      --  prefix (the agent's system prompt) that is eligible for the prefix
+      --  KV-cache. 0 disables caching for this call. See Prefix_Reg.
+      Prefix_Len     : Natural := 0) return String
    is
       Dim     : constant Integer := M.Model_Dim;
       Cap     : constant Integer :=
@@ -1036,12 +1135,66 @@ package body LLM_Qwen is
             PCHUNK : constant := 256;
             Total  : constant Natural := Prompt_Ids'Length;
             Done   : Natural := 0;
+
+            --  Prefix KV-cache (phase 3, single path only — the batcher path
+            --  is phase 4). Active only under ASPIDA_PREFIX_CACHE, with a real
+            --  system prefix that leaves a suffix to still prefill, when the
+            --  shim exports the snapshot API. On a hit we restore the per-layer
+            --  device state and jump Chain_Pos past the prefix; on a miss we
+            --  prefill the prefix, snapshot every layer, then continue.
+            Cache_Active : constant Boolean :=
+              Prefix_Cache_On and then Prefix_Len > 0
+              and then Prefix_Len < Total and then not Batch_Mode
+              and then LLM_Qwen_GPU.Prefix_Cache_Available;
+            Key   : constant Interfaces.Unsigned_64 :=
+              (if Cache_Active then Prefix_Hash (Prompt_Ids, Prefix_Len) else 0);
+            Hit   : Boolean := False;
+            Slots : Slot_Storage := Empty_Slots;
+            Res_Idx : Natural := 0;
          begin
             Last_Logits := New_Tensor ([1, M.Vocab_Sz]);
+
+            if Cache_Active then
+               Prefix_Reg.Lookup (Key, Prefix_Len, Hit, Slots);
+            end if;
+
+            if Hit then
+               --  Restore each layer's snapshotted state, then skip the prefix.
+               for I in 1 .. M.N_Blocks loop
+                  declare
+                     H : constant Integer := Integer (Handles (I));
+                     R : constant Integer :=
+                       (if Cache (I).Is_Full
+                        then LLM_Qwen_GPU.Fattn_Restore (H, Slots (I))
+                        else LLM_Qwen_GPU.Dnet_Restore (H, Slots (I)));
+                  begin
+                     if R < 0 then
+                        raise Constraint_Error
+                          with "prefix restore failed at layer"
+                               & Integer'Image (I);
+                     end if;
+                  end;
+               end loop;
+               Chain_Pos := Prefix_Len;
+               Done := Prefix_Len;
+               if Prefix_Cache_On then
+                  Ada.Text_IO.Put_Line
+                    (Ada.Text_IO.Standard_Error,
+                     "[PREFIXCACHE] HIT n=" & Prefix_Len'Image
+                     & " suffix=" & Natural'Image (Total - Prefix_Len));
+               end if;
+            elsif Cache_Active then
+               Prefix_Reg.Reserve (Key, Prefix_Len, Res_Idx, Slots);
+            end if;
+
             while Done < Total loop
                declare
-                  P    : constant Natural :=
-                    Integer'Min (PCHUNK, Total - Done);
+                  --  On a miss, stop the chunk exactly at the prefix boundary
+                  --  so we can snapshot the state at position Prefix_Len.
+                  Limit : constant Natural :=
+                    (if Cache_Active and then not Hit and then Done < Prefix_Len
+                     then Prefix_Len - Done else Total - Done);
+                  P    : constant Natural := Integer'Min (PCHUNK, Limit);
                   Rows : array (1 .. P) of Interfaces.C.int;
                begin
                   if Chain_Pos + P > Cap then
@@ -1062,6 +1215,38 @@ package body LLM_Qwen is
                      Sink.Tick;
                   end if;
                end;
+
+               --  Reached the prefix boundary on a miss: snapshot every layer
+               --  into the reserved slots and commit, so the NEXT request with
+               --  this system prompt hits and skips this work.
+               if Cache_Active and then not Hit and then Done = Prefix_Len then
+                  declare
+                     Actual : Slot_Storage := Empty_Slots;
+                     All_Ok : Boolean := True;
+                  begin
+                     for I in 1 .. M.N_Blocks loop
+                        declare
+                           H : constant Integer := Integer (Handles (I));
+                        begin
+                           Actual (I) :=
+                             (if Cache (I).Is_Full
+                              then LLM_Qwen_GPU.Fattn_Snapshot
+                                     (H, Prefix_Len, Slots (I))
+                              else LLM_Qwen_GPU.Dnet_Snapshot (H, Slots (I)));
+                           if Actual (I) < 0 then All_Ok := False; end if;
+                        end;
+                     end loop;
+                     if All_Ok then
+                        Prefix_Reg.Commit (Res_Idx, Key, Prefix_Len, Actual);
+                     end if;
+                     if Prefix_Cache_On then
+                        Ada.Text_IO.Put_Line
+                          (Ada.Text_IO.Standard_Error,
+                           "[PREFIXCACHE] MISS n=" & Prefix_Len'Image
+                           & " snapshot_ok=" & All_Ok'Image);
+                     end if;
+                  end;
+               end if;
             end loop;
          end;
       else
@@ -1432,6 +1617,28 @@ package body LLM_Qwen is
                         Conversation'First)
             else
               Conv_Ids (M, Conversation, Conversation'First));
+
+         --  Prefix KV-cache boundary: the leading run of Role_System messages
+         --  (the agent's constant system prompt + synthesized tools block).
+         --  Its token count is the first N tokens of Ids (Conv_Ids concatenates
+         --  per message, so Conv_Ids over the system run is a true prefix of the
+         --  full Ids). Only computed under ASPIDA_PREFIX_CACHE — the extra
+         --  tokenisation is paid only when the cache is enabled.
+         function Sys_End return Natural is
+            E : Natural := Conversation'First - 1;
+         begin
+            for I in Conversation'Range loop
+               exit when Conversation (I).Role /= Role_System;
+               E := I;
+            end loop;
+            return E;
+         end Sys_End;
+         Sys_Prefix_Len : constant Natural :=
+           (if Prefix_Cache_On and then Sys_End >= Conversation'First
+            then Conv_Ids
+                   (M, Conversation (Conversation'First .. Sys_End),
+                    Conversation'First)'Length
+            else 0);
          Ids : constant LLM_Tokenizer.Token_Array :=
            (if Think_Open then
               --  Empty-think prefill + thinking on: OPEN a <think> block so the
@@ -1469,7 +1676,8 @@ package body LLM_Qwen is
            (Token_Sink with Psr => P'Access, Tgt => SinkRef);
          Raw : constant String :=
            Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id,
-                          Bridge'Access, Params, Stats);
+                          Bridge'Access, Params, Stats,
+                          Prefix_Len => Sys_Prefix_Len);
          pragma Unreferenced (Raw);  -- already fed to the parser live above
       begin
          LLM_Chat_Parser.Finalize (P, SinkRef);
