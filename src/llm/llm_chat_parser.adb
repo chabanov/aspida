@@ -314,13 +314,23 @@ package body LLM_Chat_Parser is
          --  is matched once completed. Text now streams token-by-token.
          declare
             Tag_Tail : constant := 24;
+            Cut      : Integer := Len - Tag_Tail;
          begin
+            --  Never split a multi-byte UTF-8 sequence at the cut: back off
+            --  any continuation byte (10xxxxxx) so we emit whole characters
+            --  and the tail starts on a lead byte. Splitting mid-codepoint
+            --  produced replacement-char mojibake (e.g. emoji shown as ���).
+            while Cut > 0
+              and then Character'Pos (Str (Cut + 1)) in 16#80# .. 16#BF#
+            loop
+               Cut := Cut - 1;
+            end loop;
             if (P.State = S_In_Reasoning or else P.State = S_In_Text
                 or else P.State = S_Idle)
-              and then Len > Tag_Tail
+              and then Cut > 0
             then
-               Emit_Text (P, Str (1 .. Len - Tag_Tail), Sink);
-               P.Buf := To_Unbounded_String (Str (Len - Tag_Tail + 1 .. Len));
+               Emit_Text (P, Str (1 .. Cut), Sink);
+               P.Buf := To_Unbounded_String (Str (Cut + 1 .. Len));
             end if;
          end;
          return False;
