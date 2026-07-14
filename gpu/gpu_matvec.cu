@@ -2534,12 +2534,90 @@ __global__ void k_fattn_prep_chunk(
     else      Kc[(size_t) pos * kvd + head * hd + d] = out;
 }
 
+//  Tiled causal attention for chunked prefill (flash-attention style).
+//  Grid = (query tiles of TQW=16 warps) x (head h); each WARP owns one query
+//  row, K/V stream through shared memory in tiles of TK positions, and the
+//  softmax is online in registers. Same ascending-s update order as the naive
+//  k_fattn_attend_chunk below, so the only float-level difference is the dot
+//  product's butterfly-shfl reduce order (vs the shared-memory tree there).
+//
+//  Why: the naive kernel does a block-wide tree reduction with __syncthreads
+//  INSIDE the per-position loop — at 25k context that is 25k serialized
+//  block-wide reductions per query, and every query block re-reads the entire
+//  K/V cache (P x len reads per layer). Here the inner loop is warp-
+//  synchronous (shfl only, no block sync) and each K/V tile is read from HBM
+//  once per 16 queries. Profiled 2026-07-14 (RTX 6000 Ada, P=256, pos~4k):
+//  fattn was 180-226 ms/chunk (~40%, growing linearly with position) — the
+//  dominant prefill cost on long prompts.
+__global__ void k_fattn_attend_tile(
+    const float *__restrict__ q_all, const float *__restrict__ g_all,
+    const float *__restrict__ Kc, const float *__restrict__ Vc,
+    float *__restrict__ attn,
+    int nq, int nkv, int hd, int kvd, int pos_start, int P, int TK) {
+    int h = blockIdx.y;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int nwarp = blockDim.x >> 5;
+    int t = blockIdx.x * nwarp + warp;      //  query position in chunk
+    int rep = nq / nkv, kvh = h / rep;
+    int kv_off = kvh * hd, att = nq * hd;
+    int RQ = hd >> 5;                       //  q/acc registers per lane (<= 8)
+    extern __shared__ float shkv[];         //  K tile [TK][hd], then V tile
+    float *Ksh = shkv, *Vsh = shkv + (size_t) TK * hd;
+    float q[8], acc[8];
+    bool active = t < P;
+    int len = active ? (pos_start + t + 1) : 0;
+    int t_last = min(P - 1, (blockIdx.x + 1) * nwarp - 1);
+    int len_max = pos_start + t_last + 1;   //  block-wide causal bound
+    const float *qp = q_all + (size_t) t * att + h * hd;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) { q[j] = 0.f; acc[j] = 0.f; }
+    for (int j = 0; j < RQ; ++j) q[j] = active ? qp[lane + 32 * j] : 0.f;
+    float scale = rsqrtf((float) hd), m = -3.402823466e38f, l = 0.f;
+    for (int s0 = 0; s0 < len_max; s0 += TK) {
+        int tk = min(TK, len_max - s0);
+        //  Cooperative tile load: ALL warps participate (idle query warps
+        //  included — they must reach the __syncthreads below).
+        for (int i = threadIdx.x; i < tk * hd; i += blockDim.x) {
+            int srow = i / hd, sd = i - srow * hd;
+            Ksh[(size_t) srow * hd + sd] = Kc[(size_t)(s0 + srow) * kvd + kv_off + sd];
+            Vsh[(size_t) srow * hd + sd] = Vc[(size_t)(s0 + srow) * kvd + kv_off + sd];
+        }
+        __syncthreads();
+        int smax = min(tk, len - s0);       //  warp-local causal bound
+        for (int s = 0; s < smax; ++s) {
+            float part = 0.f;
+            for (int j = 0; j < RQ; ++j) part += q[j] * Ksh[(size_t) s * hd + lane + 32 * j];
+            //  Butterfly reduce: every lane ends with the full dot product.
+            for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffffu, part, o);
+            float dot = part * scale;
+            float m_new = fmaxf(m, dot);
+            float corr = expf(m - m_new);
+            float p = expf(dot - m_new);
+            l = l * corr + p;
+            for (int j = 0; j < RQ; ++j)
+                acc[j] = acc[j] * corr + p * Vsh[(size_t) s * hd + lane + 32 * j];
+            m = m_new;
+        }
+        __syncthreads();
+    }
+    if (active) {
+        const float *gp = g_all + (size_t) t * att + h * hd;
+        float *op = attn + (size_t) t * att + h * hd;
+        for (int j = 0; j < RQ; ++j) {
+            float g = gp[lane + 32 * j];
+            op[lane + 32 * j] = (acc[j] / l) * (1.f / (1.f + expf(-g)));
+        }
+    }
+}
+
 // Batched causal attention for a chunk: block = (h, t), threads = hd. Query
 // (head h, chunk-position t) attends over cache 0..pos_start+t with an ONLINE
 // (flash) softmax — no per-head scores scratch, one launch for all nq*P queries
 // instead of one per position. Numerically the running-max softmax differs from
 // the two-pass one only at the ~1e-6 float level; validated bit-exact end to
 // end. threads = hd (each owns output dim d and cooperates on each dot).
+// KEPT as the fallback path (env ASPIDA_FATTN_NAIVE=1, or hd not a multiple
+// of 32 / hd > 256) — k_fattn_attend_tile above is the serving default.
 __global__ void k_fattn_attend_chunk(
     const float *__restrict__ q_all, const float *__restrict__ g_all,
     const float *__restrict__ Kc, const float *__restrict__ Vc,
@@ -2844,8 +2922,28 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 pdqg, pdkt, pdvt, L.qn, L.kn, pdqa, pdga, fs.K, fs.V,
                 L.nq,L.nkv,L.hd,kvd, pos_start, L.rd,L.base,L.freq_scale,L.m_scale,
                 L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total, P);
-            k_fattn_attend_chunk<<<(size_t)L.nq*P, L.hd, 0, st>>>(
-                pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start);
+            //  Tiled attention is a ~5x-faster but numerically DIFFERENT
+            //  kernel (warp-shfl dot reduce + tiled online softmax) — not
+            //  bit-exact to the naive path at long context, so it is OPT-IN
+            //  (ASPIDA_FATTN_TILE=1) pending eval-harness sign-off that it does
+            //  not regress answer quality vs naive / Ollama. Default = naive
+            //  (bit-exact, the validated serving path).
+            static int fattn_tile = getenv("ASPIDA_FATTN_TILE") ? 1 : 0;
+            if (fattn_tile && L.hd <= 256 && (L.hd & 31) == 0) {
+                //  Tiled path (serving default): TK sized so the K+V tile
+                //  stays within the 48 KB default dynamic-shared limit.
+                int TK = (L.hd <= 128) ? 32 : 16;
+                //  32 query warps/block share each K/V tile → half the K/V HBM
+                //  passes vs 16 (fattn is bandwidth-bound at long context).
+                int TQW = 32;   //  query warps per block
+                size_t shmem = (size_t) 2 * TK * L.hd * 4;
+                dim3 grid((unsigned)((P + TQW - 1) / TQW), (unsigned) L.nq);
+                k_fattn_attend_tile<<<grid, TQW * 32, shmem, st>>>(
+                    pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P, TK);
+            } else {
+                k_fattn_attend_chunk<<<(size_t)L.nq*P, L.hd, 0, st>>>(
+                    pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start);
+            }
             launch_mv_b(L.fow, L.fow_k, att, dim, pdatt, paob, P, st);
         }
         k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
