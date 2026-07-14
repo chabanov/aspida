@@ -82,19 +82,21 @@ package body LLM_Sampler is
       end if;
 
       --  Fast sampled path (the production config: temperature + top-k and/or
-      --  top-p, no min-p). ONE ordered pass over the logits with an
+      --  top-p and/or min-p). ONE ordered pass over the logits with an
       --  incremental top-K insertion buffer, then softmax over just the K kept
-      --  candidates — the top-k -> softmax -> top-p order this package header
-      --  documents (llama.cpp/ollama do exactly this; the tail beyond top-k is
-      --  discarded there too). The general path below instead did ~25 full
-      --  passes over the vocab per token (copy, softmax with 248k Exp calls,
-      --  and an O(N*K) selection with K full scans) plus ~1.25 MB of heap
-      --  allocation — ~16.6 ms/token at vocab 248k, dwarfing the 7 ms GPU
-      --  forward (40 tok/s instead of ~117). Penalties are applied on the fly
-      --  via a cursor over a small index-sorted penalised set, replaying the
+      --  candidates — the top-k -> softmax -> top-p -> min-p order this package
+      --  header documents (llama.cpp/ollama do exactly this; the tail beyond
+      --  top-k is discarded there too). The general path below instead did ~25
+      --  full passes over the vocab per token (copy, softmax with 248k Exp
+      --  calls, and an O(N*K) selection with K full scans) plus ~1.25 MB of
+      --  heap allocation — ~16.6 ms/token at vocab 248k, dwarfing the 7 ms GPU
+      --  forward (40 tok/s instead of ~117). min-p is a cheap prefix cut on the
+      --  KV-sorted survivors (E is descending), so it stays on the fast path
+      --  rather than forcing the slow general path. Penalties are applied on the
+      --  fly via a cursor over a small index-sorted penalised set, replaying the
       --  exact same math as the general path.
-      if S.P.Temperature > 0.0 and then S.P.Min_P = 0.0
-        and then (S.P.Top_K > 0 or else S.P.Top_P < 1.0)
+      if S.P.Temperature > 0.0
+        and then (S.P.Top_K > 0 or else S.P.Top_P < 1.0 or else S.P.Min_P > 0.0)
       then
          declare
             type Flat_View is array (1 .. N) of Float;
@@ -215,6 +217,20 @@ package body LLM_Sampler is
                      end loop;
                   end;
                end if;
+               --  Min-p: drop survivors whose prob < Min_P * p_max. E is sorted
+               --  descending and KV (1) is the argmax, so E (1) is the peak; the
+               --  first R below the floor cuts the (already top-p-limited)
+               --  prefix. Applied AFTER top-p, matching llama.cpp/ollama. Always
+               --  keep at least the argmax.
+               if S.P.Min_P > 0.0 then
+                  declare
+                     Floor : constant Float := S.P.Min_P * E (1);
+                  begin
+                     for R in 2 .. Keep loop
+                        if E (R) < Floor then Keep := R - 1; exit; end if;
+                     end loop;
+                  end;
+               end if;
                declare
                   KDen : Float := 0.0;
                   U    : constant Float := Next_Float (S);
@@ -323,38 +339,9 @@ package body LLM_Sampler is
 
             if not OK then
                Result := Greedy - 1;
-            elsif S.P.Min_P > 0.0 then
-            --  Min-p: keep only tokens with prob >= Min_P * p_max (a peaked
-            --  distribution keeps few tokens, a flat one keeps many), then
-            --  renormalise the survivors and draw. Robust alternative to top-p.
-            declare
-               Pmax : Float := 0.0; Thresh, MDen : Float := 0.0;
-               U    : Float; Acc : Float := 0.0;
-            begin
-               for I in 1 .. N loop
-                  if L (I) > Pmax then Pmax := L (I); end if;
-               end loop;
-               Thresh := S.P.Min_P * Pmax;
-               for I in 1 .. N loop
-                  if L (I) < Thresh then L (I) := 0.0;
-                  else MDen := MDen + L (I); end if;
-               end loop;
-               U := Next_Float (S);
-               Result := N - 1;
-               --  All survivors zero (or NaN): the denominator would be 0 and
-               --  L(I)/MDen a NaN. Fall back to greedy instead of dividing.
-               if MDen <= 0.0 then
-                  Result := Greedy - 1;
-               else
-                  for I in 1 .. N loop
-                     if L (I) > 0.0 then
-                        Acc := Acc + L (I) / MDen;
-                        if U <= Acc then Result := I - 1; exit; end if;
-                     end if;
-                  end loop;
-               end if;
-            end;
-         elsif S.P.Top_K <= 0 and then S.P.Top_P >= 1.0 then
+            elsif S.P.Top_K <= 0 and then S.P.Top_P >= 1.0
+              and then S.P.Min_P <= 0.0
+            then
             --  Pure temperature: draw straight from the full distribution.
             declare
                U : constant Float := Next_Float (S); Acc : Float := 0.0;
@@ -366,7 +353,10 @@ package body LLM_Sampler is
                end loop;
             end;
          else
-            --  Top-EffK partial selection (O(N*EffK)), then top-p, then draw.
+            --  llama.cpp / Ollama filter chain on the tempered softmax:
+            --  top-k (partial selection) -> top-p (nucleus) -> min-p (relative
+            --  floor). All three COMPOSE and are applied in sequence — Ollama
+            --  runs top_k, top_p AND min_p together, they are not alternatives.
             declare
                EffK : constant Integer :=
                  (if S.P.Top_K > 0 then Integer'Min (S.P.Top_K, N)
@@ -399,22 +389,30 @@ package body LLM_Sampler is
                   end;
                end if;
 
-               --  Renormalise the kept set and draw.
+               --  Min-p floor + renormalise the kept set and draw. Idx (1) is
+               --  the argmax, so L (Idx (1)) is p_max; below-floor tokens drop
+               --  out of the draw (Ollama applies min_p after top_k/top_p).
                declare
                   KDen : Float := 0.0;
+                  Thr  : constant Float :=
+                    (if S.P.Min_P > 0.0 then S.P.Min_P * L (Idx (1)) else 0.0);
                   U    : constant Float := Next_Float (S);
                   Acc  : Float := 0.0;
                begin
-                  for R in 1 .. Keep loop KDen := KDen + L (Idx (R)); end loop;
-                  Result := Idx (Keep) - 1;   -- fallback (rounding)
+                  for R in 1 .. Keep loop
+                     if L (Idx (R)) >= Thr then KDen := KDen + L (Idx (R)); end if;
+                  end loop;
+                  Result := Idx (1) - 1;   -- fallback = argmax
                   --  All kept probabilities zero (or NaN): KDen would be 0 and
                   --  L/KDen a NaN. Fall back to greedy rather than dividing.
                   if KDen <= 0.0 then
                      Result := Greedy - 1;
                   else
                      for R in 1 .. Keep loop
-                        Acc := Acc + L (Idx (R)) / KDen;
-                        if U <= Acc then Result := Idx (R) - 1; exit; end if;
+                        if L (Idx (R)) >= Thr then
+                           Acc := Acc + L (Idx (R)) / KDen;
+                           if U <= Acc then Result := Idx (R) - 1; exit; end if;
+                        end if;
                      end loop;
                   end if;
                end;

@@ -42,16 +42,23 @@ package body OpenAI is
          --  that silently truncates normal answers.
          R.Max_Tokens := JSON.As_Int (JSON.Get (V, "max_tokens"), 1_000_000);
          R.Stream     := JSON.As_Bool (JSON.Get (V, "stream"), False);
-         --  Sampling defaults MATCH the hura Ollama Modelfile so a client that
-         --  omits a field gets byte-for-byte Ollama behaviour: temp 0.2,
-         --  top_p 0.9, top_k 40, repeat_penalty 1.1 (over the last 64 tokens),
-         --  presence_penalty 0.0. (The previous temp 1.0 / top_k 20 / presence
-         --  1.5 / no-repeat-penalty defaults diverged from Ollama and made the
-         --  model ramble/loop — see the settings-parity audit 2026-07-13.)
-         R.Params.Temperature      := JSON.As_Float (JSON.Get (V, "temperature"), 0.2);
-         R.Params.Top_P            := JSON.As_Float (JSON.Get (V, "top_p"), 0.9);
-         R.Params.Top_K            := JSON.As_Int   (JSON.Get (V, "top_k"), 40);
-         R.Params.Min_P            := JSON.As_Float (JSON.Get (V, "min_p"), 0.0);
+         --  Sampling defaults MATCH the LIVE hura Ollama config (verified via
+         --  `ollama show hura --parameters` 2026-07-14) so a client that omits
+         --  a field gets byte-for-byte Ollama behaviour: temp 0.15, top_p 0.8,
+         --  top_k 20, min_p 0.05, repeat_penalty 1.0 (i.e. NO repeat penalty),
+         --  presence_penalty 0.0. The platform sends ONLY temperature/max_tokens
+         --  to the model (openai-compat #buildRequestBody / #buildOllamaBody
+         --  forward neither top_p/top_k/min_p nor repeat_penalty), so these
+         --  server-side defaults ARE the effective sampler — they must equal the
+         --  Modelfile exactly. (The 2026-07-13 "settings-parity" audit used
+         --  guessed values temp 0.2 / top_p 0.9 / top_k 40 / min_p 0 / repeat
+         --  1.1 that never matched the real Modelfile; that looser candidate set
+         --  — esp. min_p 0 — let the model ramble/hallucinate where Ollama, with
+         --  min_p 0.05 + top_k 20 + top_p 0.8, stays focused.)
+         R.Params.Temperature      := JSON.As_Float (JSON.Get (V, "temperature"), 0.15);
+         R.Params.Top_P            := JSON.As_Float (JSON.Get (V, "top_p"), 0.8);
+         R.Params.Top_K            := JSON.As_Int   (JSON.Get (V, "top_k"), 20);
+         R.Params.Min_P            := JSON.As_Float (JSON.Get (V, "min_p"), 0.05);
          R.Params.Presence_Penalty := JSON.As_Float (JSON.Get (V, "presence_penalty"), 0.0);
          --  Ollama-native `think` maps to this on the /api/chat bridge; default
          --  thinking ON (the model reasons unless the caller disables it).
@@ -59,10 +66,11 @@ package body OpenAI is
          R.Params.Seed        :=
            Long_Long_Integer (JSON.As_Int (JSON.Get (V, "seed"), 0));
          --  Repetition penalty (Ollama `repeat_penalty`, multiplicative over the
-         --  last repeat_last_n=64 tokens). Default 1.1 = hura's Modelfile. An
-         --  OpenAI `frequency_penalty` (additive semantics) still maps in as an
-         --  override when the caller sends it explicitly.
-         R.Params.Repeat_Penalty := JSON.As_Float (JSON.Get (V, "repeat_penalty"), 1.1);
+         --  last repeat_last_n=64 tokens). Default 1.0 = hura's live Modelfile,
+         --  i.e. NO repeat penalty — Ollama relies on min_p 0.05 + top_k 20 for
+         --  anti-looping, not a penalty. An OpenAI `frequency_penalty` (additive
+         --  semantics) still maps in as an override when the caller sends it.
+         R.Params.Repeat_Penalty := JSON.As_Float (JSON.Get (V, "repeat_penalty"), 1.0);
          if JSON.Exists (JSON.Get (V, "frequency_penalty")) then
             R.Params.Repeat_Penalty :=
               1.0 + JSON.As_Float (JSON.Get (V, "frequency_penalty"), 0.0);
