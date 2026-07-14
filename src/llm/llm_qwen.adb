@@ -838,6 +838,13 @@ package body LLM_Qwen is
    --  in production (one journald line per LLM call is a lot under load).
    Prefix_Log_On : constant Boolean :=
      Ada.Environment_Variables.Exists ("ASPIDA_PREFIX_LOG");
+   --  Multi-turn history cache: also snapshot at the end of each session turn
+   --  (not just the system prompt) so a follow-up turn restores the whole
+   --  conversation state and prefills only the new user message. Opt-in until
+   --  validated (retokenisation of prior turns must reproduce the cached
+   --  tokens, which holds for our deterministic tokenizer + template).
+   Prefix_History_On : constant Boolean :=
+     Ada.Environment_Variables.Exists ("ASPIDA_PREFIX_HISTORY");
 
    Max_Prefix_Layers  : constant := 128;   -- >= any model's block count
    --  Distinct system prompts cached. Each ~5.9k-token prefix snapshot costs
@@ -928,6 +935,14 @@ package body LLM_Qwen is
       end Commit;
    end Prefix_Reg;
 
+   --  Ascending list of token offsets that are candidate prefix-cache
+   --  boundaries: the leading system prompt AND (with ASPIDA_PREFIX_HISTORY)
+   --  the end of every prior conversation turn. Decode_Tokens probes them
+   --  longest-first to RESTORE the deepest cached state, and snapshots at the
+   --  largest (the full history before the current user turn) so the next turn
+   --  in the session chains onto it. Empty => caching disabled for the call.
+   type Cache_Bounds_Array is array (Positive range <>) of Natural;
+
    function Decode_Tokens
      (M              : Qwen_Model;
       Prompt_Ids     : LLM_Tokenizer.Token_Array;
@@ -940,6 +955,11 @@ package body LLM_Qwen is
       --  prefix (the agent's system prompt) that is eligible for the prefix
       --  KV-cache. 0 disables caching for this call. See Prefix_Reg.
       Prefix_Len     : Natural := 0;
+      --  Multi-boundary cache offsets (ASPIDA_PREFIX_HISTORY). When non-empty,
+      --  overrides Prefix_Len: probe these ascending offsets longest-first to
+      --  restore the deepest cached turn, and snapshot at the largest. Empty =>
+      --  fall back to the single Prefix_Len boundary (legacy behaviour).
+      Cache_Bounds   : Cache_Bounds_Array := [1 .. 0 => 0];
       --  True when the prompt already opens a <think> block (forced thinking),
       --  so the reasoning-budget guard counts from token 0.
       Reason_Seeded  : Boolean := False) return String
@@ -1180,31 +1200,65 @@ package body LLM_Qwen is
             --  lane stream before returning, so the snapshot reads a complete
             --  state; the snapshot pools are mutex-guarded on the CUDA side and
             --  the registry is a protected object, so concurrent lanes are safe.
+            --  Snapshot boundary: the full history before the current user
+            --  turn (largest Cache_Bounds entry), else the single Prefix_Len.
+            Snap_Len : constant Natural :=
+              (if Cache_Bounds'Length > 0 then Cache_Bounds (Cache_Bounds'Last)
+               else Prefix_Len);
             Cache_Active : constant Boolean :=
-              Prefix_Cache_On and then Prefix_Len > 0
-              and then Prefix_Len < Total
+              Prefix_Cache_On and then Snap_Len > 0
+              and then Snap_Len < Total
               and then LLM_Qwen_GPU.Prefix_Cache_Available;
-            Key   : constant Interfaces.Unsigned_64 :=
-              (if Cache_Active then Prefix_Hash (Prompt_Ids, Prefix_Len) else 0);
-            Hit   : Boolean := False;
-            Slots : Slot_Storage := Empty_Slots;
-            Res_Idx : Natural := 0;
+            Hit         : Boolean := False;
+            Restore_Len : Natural := 0;
+            RSlots      : Slot_Storage := Empty_Slots;   -- restore FROM
+            SSlots      : Slot_Storage := Empty_Slots;   -- snapshot INTO
+            Res_Idx     : Natural := 0;
+            Snap_Key    : Interfaces.Unsigned_64 := 0;
+            Need_Snap   : Boolean := False;
          begin
             Last_Logits := New_Tensor ([1, M.Vocab_Sz]);
 
             if Cache_Active then
-               Prefix_Reg.Lookup (Key, Prefix_Len, Hit, Slots);
+               --  Probe restore boundaries longest-first: restore the deepest
+               --  already-cached turn. History mode probes every turn boundary;
+               --  legacy mode the single system prefix.
+               if Cache_Bounds'Length > 0 then
+                  for I in reverse Cache_Bounds'Range loop
+                     declare
+                        B : constant Natural := Cache_Bounds (I);
+                     begin
+                        if B > 0 and then B < Total then
+                           Prefix_Reg.Lookup
+                             (Prefix_Hash (Prompt_Ids, B), B, Hit, RSlots);
+                           if Hit then Restore_Len := B; exit; end if;
+                        end if;
+                     end;
+                  end loop;
+               else
+                  Prefix_Reg.Lookup
+                    (Prefix_Hash (Prompt_Ids, Snap_Len), Snap_Len, Hit, RSlots);
+                  if Hit then Restore_Len := Snap_Len; end if;
+               end if;
+
+               --  Snapshot the full-history boundary unless it is already cached
+               --  (a full hit at Snap_Len). Reserve a distinct slot set to write.
+               Need_Snap := Restore_Len < Snap_Len;
+               if Need_Snap then
+                  Snap_Key := Prefix_Hash (Prompt_Ids, Snap_Len);
+                  Prefix_Reg.Reserve (Snap_Key, Snap_Len, Res_Idx, SSlots);
+               end if;
             end if;
 
             if Hit then
-               --  Restore each layer's snapshotted state, then skip the prefix.
+               --  Restore each layer's snapshotted state, then skip to Restore_Len.
                for I in 1 .. M.N_Blocks loop
                   declare
                      H : constant Integer := Integer (Handles (I));
                      R : constant Integer :=
                        (if Cache (I).Is_Full
-                        then LLM_Qwen_GPU.Fattn_Restore (H, Slots (I))
-                        else LLM_Qwen_GPU.Dnet_Restore (H, Slots (I)));
+                        then LLM_Qwen_GPU.Fattn_Restore (H, RSlots (I))
+                        else LLM_Qwen_GPU.Dnet_Restore (H, RSlots (I)));
                   begin
                      if R < 0 then
                         raise Constraint_Error
@@ -1213,25 +1267,24 @@ package body LLM_Qwen is
                      end if;
                   end;
                end loop;
-               Chain_Pos := Prefix_Len;
-               Done := Prefix_Len;
+               Chain_Pos := Restore_Len;
+               Done := Restore_Len;
                if Prefix_Log_On then
                   Ada.Text_IO.Put_Line
                     (Ada.Text_IO.Standard_Error,
-                     "[PREFIXCACHE] HIT n=" & Prefix_Len'Image
-                     & " suffix=" & Natural'Image (Total - Prefix_Len));
+                     "[PREFIXCACHE] HIT restore=" & Restore_Len'Image
+                     & " snap=" & Snap_Len'Image
+                     & " suffix=" & Natural'Image (Total - Restore_Len));
                end if;
-            elsif Cache_Active then
-               Prefix_Reg.Reserve (Key, Prefix_Len, Res_Idx, Slots);
             end if;
 
             while Done < Total loop
                declare
-                  --  On a miss, stop the chunk exactly at the prefix boundary
-                  --  so we can snapshot the state at position Prefix_Len.
+                  --  Stop the chunk exactly at Snap_Len while a snapshot is still
+                  --  pending, so we can capture the state at that boundary.
                   Limit : constant Natural :=
-                    (if Cache_Active and then not Hit and then Done < Prefix_Len
-                     then Prefix_Len - Done else Total - Done);
+                    (if Cache_Active and then Need_Snap and then Done < Snap_Len
+                     then Snap_Len - Done else Total - Done);
                   P    : constant Natural := Integer'Min (PCHUNK, Limit);
                   Rows : array (1 .. P) of Interfaces.C.int;
                begin
@@ -1254,10 +1307,10 @@ package body LLM_Qwen is
                   end if;
                end;
 
-               --  Reached the prefix boundary on a miss: snapshot every layer
-               --  into the reserved slots and commit, so the NEXT request with
-               --  this system prompt hits and skips this work.
-               if Cache_Active and then not Hit and then Done = Prefix_Len then
+               --  Reached the snapshot boundary: snapshot every layer into the
+               --  reserved slots and commit, so the NEXT turn in this session
+               --  restores it and prefills only the new user message.
+               if Cache_Active and then Need_Snap and then Done = Snap_Len then
                   declare
                      Actual : Slot_Storage := Empty_Slots;
                      All_Ok : Boolean := True;
@@ -1269,19 +1322,21 @@ package body LLM_Qwen is
                            Actual (I) :=
                              (if Cache (I).Is_Full
                               then LLM_Qwen_GPU.Fattn_Snapshot
-                                     (H, Prefix_Len, Slots (I))
-                              else LLM_Qwen_GPU.Dnet_Snapshot (H, Slots (I)));
+                                     (H, Snap_Len, SSlots (I))
+                              else LLM_Qwen_GPU.Dnet_Snapshot (H, SSlots (I)));
                            if Actual (I) < 0 then All_Ok := False; end if;
                         end;
                      end loop;
                      if All_Ok then
-                        Prefix_Reg.Commit (Res_Idx, Key, Prefix_Len, Actual);
+                        Prefix_Reg.Commit (Res_Idx, Snap_Key, Snap_Len, Actual);
                      end if;
+                     Need_Snap := False;
                      if Prefix_Log_On then
                         Ada.Text_IO.Put_Line
                           (Ada.Text_IO.Standard_Error,
-                           "[PREFIXCACHE] MISS n=" & Prefix_Len'Image
-                           & " snapshot_ok=" & All_Ok'Image);
+                           "[PREFIXCACHE] SNAP n=" & Snap_Len'Image
+                           & " restored=" & Restore_Len'Image
+                           & " ok=" & All_Ok'Image);
                      end if;
                   end;
                end if;
@@ -1704,6 +1759,37 @@ package body LLM_Qwen is
                    (M, Conversation (Conversation'First .. Sys_End),
                     Conversation'First)'Length
             else 0);
+
+         --  History-cache boundaries: the cumulative token offset at the end of
+         --  each message up to (but excluding) any trailing assistant prefill —
+         --  i.e. every session-turn boundary. Decode_Tokens restores the deepest
+         --  cached one and snapshots the largest (the whole conversation before
+         --  the current user turn). Only built when ASPIDA_PREFIX_HISTORY is on.
+         function Hist_Bounds return Cache_Bounds_Array is
+            Last_Msg : constant Integer :=
+              Conversation'Last - (if Last_Is_Asst then 1 else 0);
+            Tmp : Cache_Bounds_Array (1 .. 64) := [others => 0];
+            NB  : Natural := 0;
+         begin
+            if not (Prefix_Cache_On and then Prefix_History_On)
+              or else Last_Msg < Conversation'First
+            then
+               return [1 .. 0 => 0];
+            end if;
+            for I in Conversation'First .. Last_Msg loop
+               declare
+                  L : constant Natural :=
+                    Conv_Ids (M, Conversation (Conversation'First .. I),
+                              Conversation'First)'Length;
+               begin
+                  if L > 0 and then NB < Tmp'Last then
+                     NB := NB + 1; Tmp (NB) := L;
+                  end if;
+               end;
+            end loop;
+            return Tmp (1 .. NB);
+         end Hist_Bounds;
+         Hist_B : constant Cache_Bounds_Array := Hist_Bounds;
          Ids : constant LLM_Tokenizer.Token_Array :=
            (if Think_Open then
               --  Empty-think prefill + thinking on: OPEN a <think> block so the
@@ -1743,6 +1829,7 @@ package body LLM_Qwen is
            Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id,
                           Bridge'Access, Params, Stats,
                           Prefix_Len => Sys_Prefix_Len,
+                          Cache_Bounds => Hist_B,
                           Reason_Seeded => Think_Open);
          pragma Unreferenced (Raw);  -- already fed to the parser live above
       begin
