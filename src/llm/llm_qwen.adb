@@ -840,11 +840,11 @@ package body LLM_Qwen is
      Ada.Environment_Variables.Exists ("ASPIDA_PREFIX_LOG");
    --  Multi-turn history cache: also snapshot at the end of each session turn
    --  (not just the system prompt) so a follow-up turn restores the whole
-   --  conversation state and prefills only the new user message. Opt-in until
-   --  validated (retokenisation of prior turns must reproduce the cached
-   --  tokens, which holds for our deterministic tokenizer + template).
+   --  conversation state and prefills only the new user message. DEFAULT (when
+   --  the prefix cache is on); validated by the eval gate + multi-turn recall.
+   --  ASPIDA_NO_PREFIX_HISTORY=1 falls back to system-prefix-only caching.
    Prefix_History_On : constant Boolean :=
-     Ada.Environment_Variables.Exists ("ASPIDA_PREFIX_HISTORY");
+     not Ada.Environment_Variables.Exists ("ASPIDA_NO_PREFIX_HISTORY");
 
    Max_Prefix_Layers  : constant := 128;   -- >= any model's block count
    --  Distinct system prompts cached. Each ~5.9k-token prefix snapshot costs

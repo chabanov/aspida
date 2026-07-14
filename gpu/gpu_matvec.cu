@@ -3020,8 +3020,11 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             k_dnet_conv_chunk<<<(L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.conv, pdcq, L.qo, L.kernel, P);
             k_dnet_gates_b<<<((size_t)P*L.nv+255)/256,256,0,st>>>(pdar, pdbr, L.aw, L.dtw, pdg, pdb, L.nv, P);
             if (pprof) { cudaEventRecord(pe1, st); cudaEventSynchronize(pe1); float p=0; cudaEventElapsedTime(&p, pe0, pe1); acc_dproj += p; }
-            static int dnet_warp = getenv("ASPIDA_DNET_WARP") ? 1 : 0;
-            if (dnet_warp && (L.khd & 31) == 0 && L.khd <= 256 && L.vhd <= 256) {
+            //  Warp-parallel register-resident recurrence (~14x): DEFAULT after
+            //  the eval gate (no quality regression). ASPIDA_DNET_SEQ=1 forces
+            //  the bit-exact sequential kernel (A/B, debugging).
+            static int dnet_seq = getenv("ASPIDA_DNET_SEQ") ? 1 : 0;
+            if (!dnet_seq && (L.khd & 31) == 0 && L.khd <= 256 && L.vhd <= 256) {
                 //  Register-resident warp recurrence: normalise Q/K, run the
                 //  column-parallel scan (S in registers), then RMS+z-gate.
                 k_dnet_qk_norm<<<P * L.nkh, L.khd, 0, st>>>(
@@ -3056,12 +3059,12 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total, P);
             //  Tiled attention is a ~5x-faster but numerically DIFFERENT
             //  kernel (warp-shfl dot reduce + tiled online softmax) — not
-            //  bit-exact to the naive path at long context, so it is OPT-IN
-            //  (ASPIDA_FATTN_TILE=1) pending eval-harness sign-off that it does
-            //  not regress answer quality vs naive / Ollama. Default = naive
-            //  (bit-exact, the validated serving path).
-            static int fattn_tile = getenv("ASPIDA_FATTN_TILE") ? 1 : 0;
-            if (fattn_tile && L.hd <= 256 && (L.hd & 31) == 0) {
+            //  bit-exact to the naive path at long context. Now the DEFAULT
+            //  after the eval-harness cutover gate showed no quality regression
+            //  (aspida 95% == Ollama, faster). ASPIDA_FATTN_NAIVE=1 forces the
+            //  bit-exact naive kernel (A/B, debugging).
+            static int fattn_naive = getenv("ASPIDA_FATTN_NAIVE") ? 1 : 0;
+            if (!fattn_naive && L.hd <= 256 && (L.hd & 31) == 0) {
                 //  Tiled path (serving default): TK sized so the K+V tile
                 //  stays within the 48 KB default dynamic-shared limit.
                 int TK = (L.hd <= 128) ? 32 : 16;
