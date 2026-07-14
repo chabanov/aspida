@@ -1506,7 +1506,15 @@ package body LLM_Qwen is
       Empty_Think  : constant Boolean :=
         Last_Is_Asst
         and then Is_Empty_Think (To_String (Conversation (Conversation'Last).Text));
-      Think_Open   : constant Boolean := Empty_Think and then Params.Enable_Thinking;
+      --  Forcing an OPEN <think> makes the model reason visibly (matches
+      --  Ollama), but for some prompts it runs AWAY in reasoning to the token
+      --  cap and never emits the answer — an empty 40 s+ reply. Until a decode
+      --  thinking-budget guard lands, default to honouring the platform's empty
+      --  <think></think> as "answer directly" (stable, fast). Opt back into
+      --  forced visible thinking with ASPIDA_FORCE_THINK once guarded.
+      Think_Open   : constant Boolean :=
+        Empty_Think and then Params.Enable_Thinking
+        and then Ada.Environment_Variables.Exists ("ASPIDA_FORCE_THINK");
       P      : aliased LLM_Chat_Parser.Parser :=
         LLM_Chat_Parser.New_Parser (Start_In_Reasoning => Think_Open);
       Nullish : constant Null_Sink_Access := New_Null_Sink;
