@@ -939,7 +939,10 @@ package body LLM_Qwen is
       --  Length (in tokens, from Prompt_Ids'First) of the constant leading
       --  prefix (the agent's system prompt) that is eligible for the prefix
       --  KV-cache. 0 disables caching for this call. See Prefix_Reg.
-      Prefix_Len     : Natural := 0) return String
+      Prefix_Len     : Natural := 0;
+      --  True when the prompt already opens a <think> block (forced thinking),
+      --  so the reasoning-budget guard counts from token 0.
+      Reason_Seeded  : Boolean := False) return String
    is
       Dim     : constant Integer := M.Model_Dim;
       Cap     : constant Integer :=
@@ -951,6 +954,21 @@ package body LLM_Qwen is
       N_Hist  : Natural := 0;
       Produced : Natural := 0;       -- generated tokens (completion_tokens)
       Hit_Stop : Boolean := False;   -- stopped on a stop token, not the cap
+
+      --  Reasoning-budget guard. This fine-tune sometimes runs AWAY inside a
+      --  <think> block — reasoning to the token cap and never emitting an
+      --  answer (a 40 s+ empty reply; also floods the SSE buffer). Cap the
+      --  chain-of-thought: once it has run this many tokens without closing,
+      --  force-emit </think> so the model concludes and answers. 0 disables.
+      Think_Open_Id  : constant Integer := LLM_Tokenizer.Token_To_Id (M.Tok, "<think>");
+      Think_Close_Id : constant Integer := LLM_Tokenizer.Token_To_Id (M.Tok, "</think>");
+      Think_Budget   : constant Natural :=
+        (if Ada.Environment_Variables.Exists ("ASPIDA_THINK_BUDGET")
+         then Natural'Value (Ada.Environment_Variables.Value ("ASPIDA_THINK_BUDGET"))
+         else 512);
+      In_Reason    : Boolean := Reason_Seeded;   -- prompt opened <think>?
+      Reason_Start : Natural := 0;               -- Produced when reasoning began
+      Think_Forced : Boolean := False;           -- already forced the close
 
       --  Per-token host-tail profiler (env ASPIDA_TAIL_PROF): sampling vs stream.
       Tail_Prof : constant Boolean :=
@@ -1292,10 +1310,29 @@ package body LLM_Qwen is
               Integer'Min (N_Hist, Integer'Max (0, Params.Repeat_Last_N));
             T_Smp : constant Ada.Real_Time.Time :=
               (if Tail_Prof then Ada.Real_Time.Clock else Ada.Real_Time.Time_First);
-            Tid : constant Integer := LLM_Sampler.Next
+            Tid : Integer := LLM_Sampler.Next
               (Smp, Last_Logits, Hist (N_Hist - Win + 1 .. N_Hist));
-            Best_Row : constant Integer := Tid + 1;   -- 1-based embedding row
+            Best_Row : Integer;
          begin
+            --  Reasoning-budget guard: if a <think> block has run past the
+            --  budget without closing, force this token to </think> so the
+            --  model concludes and produces the answer (prevents the runaway
+            --  empty reply). Then track reasoning state from the token in play.
+            if Think_Budget > 0 and then Think_Close_Id >= 0 then
+               if In_Reason and then not Think_Forced
+                 and then Produced - Reason_Start >= Think_Budget
+                 and then Tid /= Think_Close_Id
+               then
+                  Tid := Think_Close_Id;
+                  Think_Forced := True;
+               end if;
+               if Tid = Think_Open_Id then
+                  In_Reason := True; Reason_Start := Produced; Think_Forced := False;
+               elsif Tid = Think_Close_Id then
+                  In_Reason := False;
+               end if;
+            end if;
+            Best_Row := Tid + 1;   -- 1-based embedding row
             if Tail_Prof then
                Acc_Smp := Acc_Smp + (Ada.Real_Time.Clock - T_Smp);
                Tail_N := Tail_N + 1;
@@ -1699,7 +1736,8 @@ package body LLM_Qwen is
          Raw : constant String :=
            Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id,
                           Bridge'Access, Params, Stats,
-                          Prefix_Len => Sys_Prefix_Len);
+                          Prefix_Len => Sys_Prefix_Len,
+                          Reason_Seeded => Think_Open);
          pragma Unreferenced (Raw);  -- already fed to the parser live above
       begin
          LLM_Chat_Parser.Finalize (P, SinkRef);
