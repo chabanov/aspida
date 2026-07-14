@@ -781,7 +781,7 @@ extern "C" void aspida_gpu_dense_matvec(const void *w, long wbytes, int in_dim,
 // =====================================================================
 // Per-layer resident delta-net state: the recurrent S_All AND the causal-conv
 // history window both live on the device across tokens.
-struct DnetState { float *S; float *hist; int qo; int kernel; };
+struct DnetState { float *S; float *hist; int qo; int kernel; size_t sn; size_t hn; };
 static std::vector<DnetState> g_dnet;
 static std::vector<int> g_dnet_free;      // freed slots for reuse
 
@@ -814,7 +814,7 @@ extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel)
     if (cudaMallocAsync(&st.hist, hn * 4, g_astream) != cudaSuccess) { cudaFreeAsync(st.S, g_astream); cudaStreamSynchronize(g_astream); return -1; }
     cudaMemsetAsync(st.hist, 0, hn * 4, g_astream);
     cudaStreamSynchronize(g_astream);   // block + memset ready for use on any stream
-    st.qo = qo; st.kernel = kernel;
+    st.qo = qo; st.kernel = kernel; st.sn = n; st.hn = hn;
     if (!g_dnet_free.empty()) {
         int h = g_dnet_free.back(); g_dnet_free.pop_back();
         g_dnet[h] = st; return h;
@@ -831,6 +831,65 @@ extern "C" void aspida_gpu_dnet_free(int handle) {
     if (st.S)    { cudaFreeAsync(st.S, g_astream); st.S = nullptr; }
     if (st.hist) { cudaFreeAsync(st.hist, g_astream); st.hist = nullptr; }
     g_dnet_free.push_back(handle);
+}
+
+//  ---- Prefix-state snapshots (RETAINED across requests) --------------------
+//  A prefix KV-cache lets a repeated request (identical system prompt) skip
+//  re-prefilling the shared prefix: after prefilling it once we snapshot each
+//  layer's device state into a retained slot, and on a later cache hit we
+//  restore it into that request's fresh state and prefill only the suffix.
+//  DeltaNet is a RECURRENT accumulator (unlike positional attention KV), so the
+//  snapshot must be the full S matrix + conv history captured EXACTLY at the
+//  end-of-prefix position. Snapshots live in their own pools and are NOT touched
+//  by Free_States (per-request teardown) — only aspida_gpu_prefix_reset frees
+//  them (on model change). Copies are device→device on the alloc stream and
+//  synced, so the snapshot is a stable, byte-identical image of the state.
+struct DnetSnap { float *S; float *hist; size_t sn; size_t hn; };
+static std::vector<DnetSnap> g_dnet_snap;
+static std::vector<int> g_dnet_snap_free;
+
+//  Snapshot delta-net state `handle` into slot `slot` (-1 = allocate a new
+//  slot). Returns the slot id, or -1 on error. Reusing a slot overwrites it.
+extern "C" int aspida_gpu_dnet_snapshot(int handle, int slot) {
+    if (handle < 0 || handle >= (int) g_dnet.size()) return -1;
+    DnetState &st = g_dnet[handle];
+    if (!st.S || !st.hist) return -1;
+    ensure_astream();
+    DnetSnap sn;
+    if (slot >= 0 && slot < (int) g_dnet_snap.size()
+        && g_dnet_snap[slot].S != nullptr) {
+        sn = g_dnet_snap[slot];
+        if (sn.sn != st.sn || sn.hn != st.hn) return -1;  // size mismatch
+    } else {
+        if (cudaMallocAsync(&sn.S, st.sn * 4, g_astream) != cudaSuccess) return -1;
+        if (cudaMallocAsync(&sn.hist, st.hn * 4, g_astream) != cudaSuccess) {
+            cudaFreeAsync(sn.S, g_astream); cudaStreamSynchronize(g_astream); return -1; }
+        sn.sn = st.sn; sn.hn = st.hn;
+    }
+    cudaMemcpyAsync(sn.S, st.S, st.sn * 4, cudaMemcpyDeviceToDevice, g_astream);
+    cudaMemcpyAsync(sn.hist, st.hist, st.hn * 4, cudaMemcpyDeviceToDevice, g_astream);
+    cudaStreamSynchronize(g_astream);
+    if (slot >= 0 && slot < (int) g_dnet_snap.size()) { g_dnet_snap[slot] = sn; return slot; }
+    if (!g_dnet_snap_free.empty()) {
+        int h = g_dnet_snap_free.back(); g_dnet_snap_free.pop_back();
+        g_dnet_snap[h] = sn; return h;
+    }
+    g_dnet_snap.push_back(sn);
+    return (int) g_dnet_snap.size() - 1;
+}
+
+//  Restore snapshot `slot` into a fresh delta-net state `handle`.
+extern "C" int aspida_gpu_dnet_restore(int handle, int slot) {
+    if (handle < 0 || handle >= (int) g_dnet.size()) return -1;
+    if (slot < 0 || slot >= (int) g_dnet_snap.size()) return -1;
+    DnetState &st = g_dnet[handle];
+    DnetSnap &sn = g_dnet_snap[slot];
+    if (!st.S || !sn.S || st.sn != sn.sn || st.hn != sn.hn) return -1;
+    ensure_astream();
+    cudaMemcpyAsync(st.S, sn.S, st.sn * 4, cudaMemcpyDeviceToDevice, g_astream);
+    cudaMemcpyAsync(st.hist, sn.hist, st.hn * 4, cudaMemcpyDeviceToDevice, g_astream);
+    cudaStreamSynchronize(g_astream);
+    return 0;
 }
 
 // Matvec with kind >= 0 -> K-quant warp kernel; kind == -1 -> the weight's raw
@@ -1096,6 +1155,80 @@ extern "C" void aspida_gpu_fattn_free(int handle) {
     if (st.V)      { cudaFreeAsync(st.V, g_astream); st.V = nullptr; }
     if (st.scores) { cudaFreeAsync(st.scores, g_astream); st.scores = nullptr; }
     g_fattn_free.push_back(handle);
+}
+
+//  ---- Full-attention prefix snapshots (RETAINED) --------------------------
+//  Unlike DeltaNet, attention state is positional: the first N K/V rows ARE the
+//  prefix's cache. We snapshot exactly those N rows (N = prefix length); the
+//  scores buffer is scratch and is not saved. On restore the rows are copied
+//  back into a fresh state and the Ada layer sets its Len := N so decode
+//  appends at row N. See the DeltaNet snapshot header for lifetime rules.
+struct FattnSnap { float *K; float *V; int rows; int kvd; };
+static std::vector<FattnSnap> g_fattn_snap;
+static std::vector<int> g_fattn_snap_free;
+
+//  Snapshot the first `rows` K/V rows of state `handle` into `slot` (-1 = new).
+extern "C" int aspida_gpu_fattn_snapshot(int handle, int rows, int slot) {
+    if (handle < 0 || handle >= (int) g_fattn.size()) return -1;
+    FattnState &st = g_fattn[handle];
+    if (!st.K || !st.V || rows <= 0 || rows > st.max_len) return -1;
+    ensure_astream();
+    size_t bytes = (size_t) rows * st.kvd * 4;
+    FattnSnap sn;
+    if (slot >= 0 && slot < (int) g_fattn_snap.size()
+        && g_fattn_snap[slot].K != nullptr
+        && g_fattn_snap[slot].rows == rows && g_fattn_snap[slot].kvd == st.kvd) {
+        sn = g_fattn_snap[slot];
+    } else {
+        if (cudaMallocAsync(&sn.K, bytes, g_astream) != cudaSuccess) return -1;
+        if (cudaMallocAsync(&sn.V, bytes, g_astream) != cudaSuccess) {
+            cudaFreeAsync(sn.K, g_astream); cudaStreamSynchronize(g_astream); return -1; }
+        sn.rows = rows; sn.kvd = st.kvd;
+    }
+    cudaMemcpyAsync(sn.K, st.K, bytes, cudaMemcpyDeviceToDevice, g_astream);
+    cudaMemcpyAsync(sn.V, st.V, bytes, cudaMemcpyDeviceToDevice, g_astream);
+    cudaStreamSynchronize(g_astream);
+    if (slot >= 0 && slot < (int) g_fattn_snap.size()) { g_fattn_snap[slot] = sn; return slot; }
+    if (!g_fattn_snap_free.empty()) {
+        int h = g_fattn_snap_free.back(); g_fattn_snap_free.pop_back();
+        g_fattn_snap[h] = sn; return h;
+    }
+    g_fattn_snap.push_back(sn);
+    return (int) g_fattn_snap.size() - 1;
+}
+
+//  Restore snapshot `slot` (its `rows` K/V rows) into fresh state `handle`.
+extern "C" int aspida_gpu_fattn_restore(int handle, int slot) {
+    if (handle < 0 || handle >= (int) g_fattn.size()) return -1;
+    if (slot < 0 || slot >= (int) g_fattn_snap.size()) return -1;
+    FattnState &st = g_fattn[handle];
+    FattnSnap &sn = g_fattn_snap[slot];
+    if (!st.K || !sn.K || sn.kvd != st.kvd || sn.rows > st.max_len) return -1;
+    ensure_astream();
+    size_t bytes = (size_t) sn.rows * st.kvd * 4;
+    cudaMemcpyAsync(st.K, sn.K, bytes, cudaMemcpyDeviceToDevice, g_astream);
+    cudaMemcpyAsync(st.V, sn.V, bytes, cudaMemcpyDeviceToDevice, g_astream);
+    cudaStreamSynchronize(g_astream);
+    return 0;
+}
+
+//  Free ALL retained prefix snapshots (delta-net + full-attn). Called on model
+//  change / chain reset, when cached prefixes are no longer valid.
+extern "C" void aspida_gpu_prefix_reset(void) {
+    ensure_astream();
+    for (auto &sn : g_dnet_snap) {
+        if (sn.S)    cudaFreeAsync(sn.S, g_astream);
+        if (sn.hist) cudaFreeAsync(sn.hist, g_astream);
+        sn.S = nullptr; sn.hist = nullptr;
+    }
+    for (auto &sn : g_fattn_snap) {
+        if (sn.K) cudaFreeAsync(sn.K, g_astream);
+        if (sn.V) cudaFreeAsync(sn.V, g_astream);
+        sn.K = nullptr; sn.V = nullptr;
+    }
+    cudaStreamSynchronize(g_astream);
+    g_dnet_snap.clear();  g_dnet_snap_free.clear();
+    g_fattn_snap.clear(); g_fattn_snap_free.clear();
 }
 
 // theta for RoPE pair i (matches LLM_RoPE.Apply_Sections text path exactly).
