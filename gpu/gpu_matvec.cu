@@ -2411,6 +2411,118 @@ __global__ void k_dnet_conv_chunk(const float *__restrict__ qkv, float *__restri
     }
 }
 
+//===========================================================================
+//  Warp-parallel delta-net recurrence (ASPIDA_DNET_WARP) — same math as
+//  k_dnet_recur_chunk, restructured for occupancy + register-resident state.
+//
+//  The sequential kernel launches <<<nv, khd>>> = 32*128 = 4096 threads on a
+//  142-SM card (~2% occupancy: 110 SMs idle) and reads/writes the recurrent
+//  state S to GLOBAL memory 3*khd times PER position PER column (strided by
+//  vhd) — so it is both occupancy- and bandwidth-starved. Profiled ~150 ms /
+//  256-chunk at 25k, the #2 prefill cost after full-attn.
+//
+//  Here each WARP owns one (head, column) and holds that column's khd-slice of
+//  S in REGISTERS (khd/32 = 4 floats/lane) for the whole chunk — S touches
+//  HBM only twice per chunk (load at start, store at end) instead of per step.
+//  Columns are independent (the state update S[k][v] and outputs only read
+//  column v), so this is exact; the RMS output-norm that DOES couple columns
+//  is split into k_dnet_out_norm below. The per-position khd reductions use
+//  warp shfl (butterfly), differing from the sequential k-loop only at the
+//  float level — so like the tiled attention this path is OPT-IN pending
+//  eval-harness sign-off; the sequential kernel stays the bit-exact default.
+//===========================================================================
+
+//  L2-normalise Q and K per (position, k-head). block = (t, k_head), threads =
+//  khd. Matches the in-kernel norm of k_dnet_recur_chunk exactly (1/(√ss+1e-6)).
+__global__ void k_dnet_qk_norm(const float *__restrict__ cq,
+    float *__restrict__ kn, float *__restrict__ qn,
+    int khd, int q_dim, int n_k_heads, int qo, int P) {
+    int t = blockIdx.x / n_k_heads, kh = blockIdx.x % n_k_heads, v = threadIdx.x;
+    const float *cq_t = cq + (size_t) t * qo;
+    float qv = cq_t[kh * khd + v], kv = cq_t[q_dim + kh * khd + v];
+    __shared__ float sq[256], sk[256];
+    sq[v] = qv * qv; sk[v] = kv * kv;
+    __syncthreads();
+    for (int o = khd >> 1; o > 0; o >>= 1) {
+        if (v < o) { sq[v] += sq[v + o]; sk[v] += sk[v + o]; }
+        __syncthreads();
+    }
+    float rq = 1.f / (sqrtf(sq[0]) + 1e-6f), rk = 1.f / (sqrtf(sk[0]) + 1e-6f);
+    qn[(size_t) t * q_dim + kh * khd + v] = qv * rq;
+    kn[(size_t) t * q_dim + kh * khd + v] = kv * rk;
+}
+
+//  Recurrence: grid = (nv heads, col-tiles of WARPS_PER_BLOCK), one warp per
+//  column. S[:,v] lives in `RQ` registers per lane across the chunk. Writes the
+//  scaled output o*(1/√khd) to `osh` [P, v_dim]; the RMS + z-gate is applied by
+//  k_dnet_out_norm. Inactive warps (v >= vhd) still drive the cooperative KN/QN
+//  tile load + __syncthreads.
+__global__ void k_dnet_recur_warp(float *__restrict__ S,
+    const float *__restrict__ kn, const float *__restrict__ qn,
+    const float *__restrict__ cq, const float *__restrict__ gate,
+    const float *__restrict__ beta, float *__restrict__ osh,
+    int khd, int vhd, int q_dim, int n_k_heads, int nv, int qo, int v_dim, int P) {
+    int h = blockIdx.x;
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int v = blockIdx.y * (blockDim.x >> 5) + warp;   // column
+    int k_head = h % n_k_heads;
+    int RQ = khd >> 5;                                // regs per lane (khd/32)
+    extern __shared__ float sh[];                     // KN[khd], QN[khd]
+    float *KN = sh, *QN = sh + khd;
+    bool active = v < vhd;
+    float Sreg[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) Sreg[j] = 0.f;
+    if (active)
+        for (int j = 0; j < RQ; ++j)
+            Sreg[j] = S[(size_t)(h * khd + lane + 32 * j) * vhd + v];
+    float scale = 1.f / sqrtf((float) khd);
+    for (int t = 0; t < P; ++t) {
+        for (int i = threadIdx.x; i < khd; i += blockDim.x) {
+            KN[i] = kn[(size_t) t * q_dim + k_head * khd + i];
+            QN[i] = qn[(size_t) t * q_dim + k_head * khd + i];
+        }
+        __syncthreads();
+        if (active) {
+            float g = gate[(size_t) t * nv + h], b = beta[(size_t) t * nv + h];
+            float Vv = cq[(size_t) t * qo + 2 * q_dim + h * vhd + v];
+            float pr = 0.f;
+            for (int j = 0; j < RQ; ++j) pr += Sreg[j] * KN[lane + 32 * j];
+            for (int o = 16; o > 0; o >>= 1) pr += __shfl_xor_sync(0xffffffffu, pr, o);
+            float retr = g * pr;
+            float corr = b * (Vv - retr);
+            for (int j = 0; j < RQ; ++j) Sreg[j] = g * Sreg[j] + KN[lane + 32 * j] * corr;
+            float po = 0.f;
+            for (int j = 0; j < RQ; ++j) po += Sreg[j] * QN[lane + 32 * j];
+            for (int o = 16; o > 0; o >>= 1) po += __shfl_xor_sync(0xffffffffu, po, o);
+            if (lane == 0) osh[(size_t) t * v_dim + h * vhd + v] = po * scale;
+        }
+        __syncthreads();
+    }
+    if (active)
+        for (int j = 0; j < RQ; ++j)
+            S[(size_t)(h * khd + lane + 32 * j) * vhd + v] = Sreg[j];
+}
+
+//  Output RMS-norm + z-gate per (position, head), matching the tail of
+//  k_dnet_recur_chunk. block = (t, head), threads = vhd.
+__global__ void k_dnet_out_norm(const float *__restrict__ osh,
+    const float *__restrict__ z, const float *__restrict__ norm_w,
+    float *__restrict__ o_row, int vhd, int nv, int v_dim, int P) {
+    int t = blockIdx.x / nv, h = blockIdx.x % nv, v = threadIdx.x;
+    float o = osh[(size_t) t * v_dim + h * vhd + v];
+    __shared__ float sr[256];
+    sr[v] = o * o;
+    __syncthreads();
+    for (int k = vhd >> 1; k > 0; k >>= 1) {
+        if (v < k) sr[v] += sr[v + k];
+        __syncthreads();
+    }
+    float rms = sqrtf(sr[0] / (float) vhd + 1e-6f);
+    float zz = z[(size_t) t * v_dim + h * vhd + v];
+    o_row[(size_t) t * v_dim + h * vhd + v] = (o / rms) * norm_w[v] * (zz / (1.f + expf(-zz)));
+}
+
 // Delta-net recurrence over a chunk: block = head, thread = column v, walks
 // t = 0..P-1 keeping the state matrix S resident (identical math + ascending
 // sum order to k_dnet_recur). Chunk buffers are [P, ...] row-major.
@@ -2665,6 +2777,9 @@ __global__ void k_fattn_attend_chunk(
 struct PScr {
     float *Hb,*nxb,*aob,*dqkv,*dcq,*dar,*dbr,*dz,*dg,*db,*dor,*dqg,*dkt,*dvt,
           *dqa,*dga,*datt,*drl,*dhb,*dlog;
+    //  Warp-recurrence scratch (ASPIDA_DNET_WARP): normalised Q/K per chunk
+    //  and the pre-output-norm delta-net output (o*scale). Sized like q/v dims.
+    float *dkn,*dqn,*dosh;
     MoeRoute *droute;
     int *rows;
     int *mg_pos, *mg_k, *mg_cnt;   // expert-grouped MoE: positions/slots per expert + counts
@@ -2684,7 +2799,9 @@ static void chain_alloc_p(void) {
         if (g_mx_qo){ cudaMalloc(&S.dqkv, Pd*g_mx_qo*4); cudaMalloc(&S.dcq, Pd*g_mx_qo*4); }
         if (g_mx_nv){ cudaMalloc(&S.dar, Pd*g_mx_nv*4); cudaMalloc(&S.dbr, Pd*g_mx_nv*4);
                       cudaMalloc(&S.dg, Pd*g_mx_nv*4); cudaMalloc(&S.db, Pd*g_mx_nv*4); }
-        if (g_mx_vd){ cudaMalloc(&S.dz, Pd*g_mx_vd*4); cudaMalloc(&S.dor, Pd*g_mx_vd*4); }
+        if (g_mx_vd){ cudaMalloc(&S.dz, Pd*g_mx_vd*4); cudaMalloc(&S.dor, Pd*g_mx_vd*4);
+                      cudaMalloc(&S.dosh, Pd*g_mx_vd*4); }
+        if (g_mx_qo){ cudaMalloc(&S.dkn, Pd*g_mx_qo*4); cudaMalloc(&S.dqn, Pd*g_mx_qo*4); }
         if (g_mx_qgd) cudaMalloc(&S.dqg, Pd*g_mx_qgd*4);
         if (g_mx_kvd){ cudaMalloc(&S.dkt, Pd*g_mx_kvd*4); cudaMalloc(&S.dvt, Pd*g_mx_kvd*4); }
         if (g_mx_att){ cudaMalloc(&S.dqa, Pd*g_mx_att*4); cudaMalloc(&S.dga, Pd*g_mx_att*4);
@@ -2874,7 +2991,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     float *pHb=S.Hb,*pnxb=S.nxb,*paob=S.aob,*pdqkv=S.dqkv,*pdcq=S.dcq,*pdar=S.dar,
           *pdbr=S.dbr,*pdz=S.dz,*pdg=S.dg,*pdb=S.db,*pdor=S.dor,*pdqg=S.dqg,
           *pdkt=S.dkt,*pdvt=S.dvt,*pdqa=S.dqa,*pdga=S.dga,*pdatt=S.datt,*pdrl=S.drl,
-          *pdhb=S.dhb,*pdlog=S.dlog;
+          *pdhb=S.dhb,*pdlog=S.dlog,*pdkn=S.dkn,*pdqn=S.dqn,*pdosh=S.dosh;
     MoeRoute *pdroute=S.droute;
     int *p_rows=S.rows;
     int *pmg_pos=S.mg_pos,*pmg_k=S.mg_k,*pmg_cnt=S.mg_cnt;
@@ -2903,9 +3020,24 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             k_dnet_conv_chunk<<<(L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.conv, pdcq, L.qo, L.kernel, P);
             k_dnet_gates_b<<<((size_t)P*L.nv+255)/256,256,0,st>>>(pdar, pdbr, L.aw, L.dtw, pdg, pdb, L.nv, P);
             if (pprof) { cudaEventRecord(pe1, st); cudaEventSynchronize(pe1); float p=0; cudaEventElapsedTime(&p, pe0, pe1); acc_dproj += p; }
-            k_dnet_recur_chunk<<<L.nv, L.khd, shmem, st>>>(
-                ds.S, pdcq, pdg, pdb, pdz, L.nw, pdor,
-                L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim, P);
+            static int dnet_warp = getenv("ASPIDA_DNET_WARP") ? 1 : 0;
+            if (dnet_warp && (L.khd & 31) == 0 && L.khd <= 256 && L.vhd <= 256) {
+                //  Register-resident warp recurrence: normalise Q/K, run the
+                //  column-parallel scan (S in registers), then RMS+z-gate.
+                k_dnet_qk_norm<<<P * L.nkh, L.khd, 0, st>>>(
+                    pdcq, pdkn, pdqn, L.khd, L.q_dim, L.nkh, L.qo, P);
+                int RW = 8;   //  warps (=columns) per block
+                dim3 rg((unsigned) L.nv, (unsigned) ((L.vhd + RW - 1) / RW));
+                k_dnet_recur_warp<<<rg, RW * 32, (size_t) 2 * L.khd * 4, st>>>(
+                    ds.S, pdkn, pdqn, pdcq, pdg, pdb, pdosh,
+                    L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim, P);
+                k_dnet_out_norm<<<P * L.nv, L.vhd, 0, st>>>(
+                    pdosh, pdz, L.nw, pdor, L.vhd, L.nv, L.v_dim, P);
+            } else {
+                k_dnet_recur_chunk<<<L.nv, L.khd, shmem, st>>>(
+                    ds.S, pdcq, pdg, pdb, pdz, L.nw, pdor,
+                    L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim, P);
+            }
             if (pprof) { cudaEventRecord(pe2, st); cudaEventSynchronize(pe2); float r=0; cudaEventElapsedTime(&r, pe1, pe2); acc_recur += r; }
             launch_mv_b(L.ow, L.ow_k, L.v_dim, dim, pdor, paob, P, st);
         } else {
