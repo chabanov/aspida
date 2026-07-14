@@ -177,6 +177,16 @@ package body LLM_Qwen_GPU is
       Handles, Last_Logits : System.Address) with Convention => C;
    function To_CPre is new Ada.Unchecked_Conversion (System.Address, Chain_Prefill_Fn);
 
+   --  Prefix-cache snapshot/restore (phase 2). int f(handle, slot) for the
+   --  two-arg forms (dnet snapshot/restore, fattn restore); int f(handle,
+   --  rows, slot) for fattn snapshot. All return the slot id / 0 / -1.
+   type Snap2_Fn is access function (H, Slot : int) return int
+     with Convention => C;
+   function To_Snap2 is new Ada.Unchecked_Conversion (System.Address, Snap2_Fn);
+   type Snap3_Fn is access function (H, Rows, Slot : int) return int
+     with Convention => C;
+   function To_Snap3 is new Ada.Unchecked_Conversion (System.Address, Snap3_Fn);
+
    Fn       : MoE_Fn := null;
    DNew_Fn  : Dnet_New_Fn := null;
    DStep_Fn : Dnet_Step_Fn := null;
@@ -196,6 +206,11 @@ package body LLM_Qwen_GPU is
    CBatch_Fn : Chain_Batch_Fn := null;
    CErr_Fn   : Int_Fn := null;   --  aspida_gpu_last_error
    CPre_Fn   : Chain_Prefill_Fn := null;
+   DSnap_Fn  : Snap2_Fn := null;   --  aspida_gpu_dnet_snapshot
+   DRest_Fn  : Snap2_Fn := null;   --  aspida_gpu_dnet_restore
+   FSnap_Fn  : Snap3_Fn := null;   --  aspida_gpu_fattn_snapshot
+   FRest_Fn  : Snap2_Fn := null;   --  aspida_gpu_fattn_restore
+   PReset_Fn : Void_Fn := null;    --  aspida_gpu_prefix_reset
 
    protected Init_Guard is
       procedure Run;
@@ -314,6 +329,16 @@ package body LLM_Qwen_GPU is
                if A /= System.Null_Address then CErr_Fn := To_Int (A); end if;
                Look ("aspida_gpu_chain_prefill", A);
                if A /= System.Null_Address then CPre_Fn := To_CPre (A); end if;
+               Look ("aspida_gpu_dnet_snapshot", A);
+               if A /= System.Null_Address then DSnap_Fn := To_Snap2 (A); end if;
+               Look ("aspida_gpu_dnet_restore", A);
+               if A /= System.Null_Address then DRest_Fn := To_Snap2 (A); end if;
+               Look ("aspida_gpu_fattn_snapshot", A);
+               if A /= System.Null_Address then FSnap_Fn := To_Snap3 (A); end if;
+               Look ("aspida_gpu_fattn_restore", A);
+               if A /= System.Null_Address then FRest_Fn := To_Snap2 (A); end if;
+               Look ("aspida_gpu_prefix_reset", A);
+               if A /= System.Null_Address then PReset_Fn := To_Void (A); end if;
             end;
          end;
       end Run;
@@ -473,6 +498,40 @@ package body LLM_Qwen_GPU is
          FFree_Fn (int (Handle));
       end if;
    end Fattn_Free;
+
+   --  ---- Prefix-cache snapshot/restore (phase 2) --------------------------
+   function Dnet_Snapshot (Handle, Slot : Integer) return Integer is
+   begin
+      if DSnap_Fn = null or else Handle < 0 then return -1; end if;
+      return Integer (DSnap_Fn (int (Handle), int (Slot)));
+   end Dnet_Snapshot;
+
+   function Dnet_Restore (Handle, Slot : Integer) return Integer is
+   begin
+      if DRest_Fn = null or else Handle < 0 or else Slot < 0 then return -1; end if;
+      return Integer (DRest_Fn (int (Handle), int (Slot)));
+   end Dnet_Restore;
+
+   function Fattn_Snapshot (Handle, Rows, Slot : Integer) return Integer is
+   begin
+      if FSnap_Fn = null or else Handle < 0 or else Rows <= 0 then return -1; end if;
+      return Integer (FSnap_Fn (int (Handle), int (Rows), int (Slot)));
+   end Fattn_Snapshot;
+
+   function Fattn_Restore (Handle, Slot : Integer) return Integer is
+   begin
+      if FRest_Fn = null or else Handle < 0 or else Slot < 0 then return -1; end if;
+      return Integer (FRest_Fn (int (Handle), int (Slot)));
+   end Fattn_Restore;
+
+   procedure Prefix_Reset is
+   begin
+      if PReset_Fn /= null then PReset_Fn.all; end if;
+   end Prefix_Reset;
+
+   function Prefix_Cache_Available return Boolean is
+     (DSnap_Fn /= null and then DRest_Fn /= null
+      and then FSnap_Fn /= null and then FRest_Fn /= null);
 
    function Chain_Available return Boolean is
    begin

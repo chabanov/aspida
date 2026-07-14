@@ -152,6 +152,22 @@ package LLM_Qwen_GPU is
    procedure Dnet_Free  (Handle : Integer);
    procedure Fattn_Free (Handle : Integer);
 
+   --  Prefix KV-cache (phase 2): snapshot a layer's device state after the
+   --  shared prefix has been prefilled, and restore it into a fresh state on a
+   --  later cache hit so only the suffix is prefilled. Snapshots are RETAINED
+   --  across requests (not freed by Dnet_Free/Fattn_Free); Prefix_Reset frees
+   --  them on model change. Snapshot returns the slot id (pass -1 to allocate a
+   --  new slot, or an existing slot to overwrite it), Restore returns 0 on
+   --  success, both -1 on error. Rows = the prefix length (K/V rows) for
+   --  full-attention. Prefix_Cache_Available reports whether the loaded shim
+   --  exports the whole set.
+   function Dnet_Snapshot  (Handle, Slot : Integer) return Integer;
+   function Dnet_Restore   (Handle, Slot : Integer) return Integer;
+   function Fattn_Snapshot (Handle, Rows, Slot : Integer) return Integer;
+   function Fattn_Restore  (Handle, Slot : Integer) return Integer;
+   procedure Prefix_Reset;
+   function Prefix_Cache_Available return Boolean;
+
    --  Phase C — full resident forward chain. Layers are registered once per
    --  loaded model (device weight pointers resolved through the resident
    --  cache); Chain_Forward then runs a whole decode step on the device:
