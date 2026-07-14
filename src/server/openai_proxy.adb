@@ -283,6 +283,13 @@ procedure OpenAI_Proxy is
       Create_Socket (Sock);
       Connect_Socket (Sock, (Family_Inet, Inet_Addr (Argument (1)),
                              Port_Type'Value (Argument (2))));
+      --  TCP_NODELAY on the Noise hop too: the server sends one tiny AEAD
+      --  frame per generated token; Nagle on this localhost socket coalesces
+      --  them so the whole reply arrives at once instead of streaming.
+      begin
+         Set_Socket_Option (Sock, IP_Protocol_For_TCP_Level, (No_Delay, True));
+      exception when others => null;
+      end;
       CT.Sock := Sock;
       Secure_Channel.Client_Handshake (Ch, CT'Access, From_Hex (Argument (3)));
       --  Optional client authentication (ASPIDA_CLIENT_TOKEN), sent first; a
@@ -674,6 +681,13 @@ begin
          begin
             Set_Socket_Option (C, Socket_Level, (Send_Timeout, 30.0));
             Set_Socket_Option (C, Socket_Level, (Receive_Timeout, 30.0));
+            --  TCP_NODELAY: SSE streams write one tiny "data: {token}" line per
+            --  generated token. Without disabling Nagle the OS coalesces these
+            --  small writes and flushes them in bursts, so the client sees the
+            --  whole reply arrive at once instead of token-by-token. Disable
+            --  Nagle so each streamed chunk goes out immediately.
+            Set_Socket_Option
+              (C, IP_Protocol_For_TCP_Level, (No_Delay, True));
          exception
             when others => null;
          end;

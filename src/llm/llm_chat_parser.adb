@@ -302,6 +302,27 @@ package body LLM_Chat_Parser is
       end case;
 
       if Best = 0 then
+         --  No tag in the buffer. Previously we held ALL text until a tag
+         --  (or Finalize) appeared, so a whole reasoning block (until
+         --  </think>) and the whole answer (until end) each arrived at once
+         --  — the client saw the reply "as one message" instead of streaming.
+         --  In the text-streaming states, flush everything except a short
+         --  tail that could still be the start of a tag spanning the next
+         --  Feed. Tag_Tail (24) safely exceeds the longest tag plus a leading
+         --  newline (e.g. "\n</tool_call>"), so a partial tag — and the
+         --  newline a bare line-start tag needs — always stays buffered and
+         --  is matched once completed. Text now streams token-by-token.
+         declare
+            Tag_Tail : constant := 24;
+         begin
+            if (P.State = S_In_Reasoning or else P.State = S_In_Text
+                or else P.State = S_Idle)
+              and then Len > Tag_Tail
+            then
+               Emit_Text (P, Str (1 .. Len - Tag_Tail), Sink);
+               P.Buf := To_Unbounded_String (Str (Len - Tag_Tail + 1 .. Len));
+            end if;
+         end;
          return False;
       end if;
 

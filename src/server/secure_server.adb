@@ -531,6 +531,13 @@ procedure Secure_Server is
          --  back to the normal idle timeout for the rest of the session.
          Set_Socket_Option (Conn, Socket_Level, (Receive_Timeout, Idle_Timeout));
          Set_Socket_Option (Conn, Socket_Level, (Send_Timeout, Send_Deadline));
+         --  TCP_NODELAY: stream per-token AEAD frames immediately (no Nagle
+         --  coalescing) so the client sees tokens as generated, not in bursts.
+         begin
+            Set_Socket_Option
+              (Conn, IP_Protocol_For_TCP_Level, (No_Delay, True));
+         exception when others => null;
+         end;
 
          if Hello'Length >= 1 and then Hello (Hello'First) = Protocol.Tag_Session then
             for I in Hello'First + 1 .. Hello'Last loop
