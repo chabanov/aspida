@@ -7,6 +7,7 @@
 #include <mma.h>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -848,9 +849,17 @@ struct DnetSnap { float *S; float *hist; size_t sn; size_t hn; };
 static std::vector<DnetSnap> g_dnet_snap;
 static std::vector<int> g_dnet_snap_free;
 
+//  Serialises all snapshot-pool access. Under BATCH_SERVE several handler tasks
+//  prefill concurrently; without this a concurrent snapshot (vector push_back /
+//  slot reuse) would race a restore reading the same vectors. Snapshots are
+//  rare (once per distinct prefix) and restores are a few small device copies,
+//  so the critical section is short relative to the seconds of decode it saves.
+static std::mutex g_snap_mtx;
+
 //  Snapshot delta-net state `handle` into slot `slot` (-1 = allocate a new
 //  slot). Returns the slot id, or -1 on error. Reusing a slot overwrites it.
 extern "C" int aspida_gpu_dnet_snapshot(int handle, int slot) {
+    std::lock_guard<std::mutex> lk(g_snap_mtx);
     if (handle < 0 || handle >= (int) g_dnet.size()) return -1;
     DnetState &st = g_dnet[handle];
     if (!st.S || !st.hist) return -1;
@@ -880,6 +889,7 @@ extern "C" int aspida_gpu_dnet_snapshot(int handle, int slot) {
 
 //  Restore snapshot `slot` into a fresh delta-net state `handle`.
 extern "C" int aspida_gpu_dnet_restore(int handle, int slot) {
+    std::lock_guard<std::mutex> lk(g_snap_mtx);
     if (handle < 0 || handle >= (int) g_dnet.size()) return -1;
     if (slot < 0 || slot >= (int) g_dnet_snap.size()) return -1;
     DnetState &st = g_dnet[handle];
@@ -1169,6 +1179,7 @@ static std::vector<int> g_fattn_snap_free;
 
 //  Snapshot the first `rows` K/V rows of state `handle` into `slot` (-1 = new).
 extern "C" int aspida_gpu_fattn_snapshot(int handle, int rows, int slot) {
+    std::lock_guard<std::mutex> lk(g_snap_mtx);
     if (handle < 0 || handle >= (int) g_fattn.size()) return -1;
     FattnState &st = g_fattn[handle];
     if (!st.K || !st.V || rows <= 0 || rows > st.max_len) return -1;
@@ -1199,6 +1210,7 @@ extern "C" int aspida_gpu_fattn_snapshot(int handle, int rows, int slot) {
 
 //  Restore snapshot `slot` (its `rows` K/V rows) into fresh state `handle`.
 extern "C" int aspida_gpu_fattn_restore(int handle, int slot) {
+    std::lock_guard<std::mutex> lk(g_snap_mtx);
     if (handle < 0 || handle >= (int) g_fattn.size()) return -1;
     if (slot < 0 || slot >= (int) g_fattn_snap.size()) return -1;
     FattnState &st = g_fattn[handle];
@@ -1215,6 +1227,7 @@ extern "C" int aspida_gpu_fattn_restore(int handle, int slot) {
 //  Free ALL retained prefix snapshots (delta-net + full-attn). Called on model
 //  change / chain reset, when cached prefixes are no longer valid.
 extern "C" void aspida_gpu_prefix_reset(void) {
+    std::lock_guard<std::mutex> lk(g_snap_mtx);
     ensure_astream();
     for (auto &sn : g_dnet_snap) {
         if (sn.S)    cudaFreeAsync(sn.S, g_astream);

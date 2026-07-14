@@ -836,7 +836,12 @@ package body LLM_Qwen is
      Ada.Environment_Variables.Exists ("ASPIDA_PREFIX_CACHE");
 
    Max_Prefix_Layers  : constant := 128;   -- >= any model's block count
-   Max_Prefix_Entries : constant := 16;    -- distinct system prompts cached
+   --  Distinct system prompts cached. Each ~5.9k-token prefix snapshot costs
+   --  ~290 MiB VRAM, so 8 caps the cache near ~2.3 GB — comfortable headroom
+   --  under the resident 35B-Q8 model + per-lane K/V on a 48 GB card. Round-
+   --  robin eviction recycles slots beyond this, so more agents still work
+   --  (they just re-prefill on eviction) with no leak.
+   Max_Prefix_Entries : constant := 8;
 
    type Slot_Storage is array (1 .. Max_Prefix_Layers) of Integer;
    Empty_Slots : constant Slot_Storage := [others => -1];
@@ -1142,9 +1147,14 @@ package body LLM_Qwen is
             --  shim exports the snapshot API. On a hit we restore the per-layer
             --  device state and jump Chain_Pos past the prefix; on a miss we
             --  prefill the prefix, snapshot every layer, then continue.
+            --  Phase 4: also active under the batcher. Prefill (and thus the
+            --  snapshot/restore) is per-lane via Chain_Prefill, which syncs the
+            --  lane stream before returning, so the snapshot reads a complete
+            --  state; the snapshot pools are mutex-guarded on the CUDA side and
+            --  the registry is a protected object, so concurrent lanes are safe.
             Cache_Active : constant Boolean :=
               Prefix_Cache_On and then Prefix_Len > 0
-              and then Prefix_Len < Total and then not Batch_Mode
+              and then Prefix_Len < Total
               and then LLM_Qwen_GPU.Prefix_Cache_Available;
             Key   : constant Interfaces.Unsigned_64 :=
               (if Cache_Active then Prefix_Hash (Prompt_Ids, Prefix_Len) else 0);
