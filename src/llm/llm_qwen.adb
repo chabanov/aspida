@@ -834,6 +834,10 @@ package body LLM_Qwen is
    --  full-prefill logits) before it is trusted in serving.
    Prefix_Cache_On : constant Boolean :=
      Ada.Environment_Variables.Exists ("ASPIDA_PREFIX_CACHE");
+   --  Per-request HIT/MISS logging — separate opt-in so the cache runs quietly
+   --  in production (one journald line per LLM call is a lot under load).
+   Prefix_Log_On : constant Boolean :=
+     Ada.Environment_Variables.Exists ("ASPIDA_PREFIX_LOG");
 
    Max_Prefix_Layers  : constant := 128;   -- >= any model's block count
    --  Distinct system prompts cached. Each ~5.9k-token prefix snapshot costs
@@ -1187,7 +1191,7 @@ package body LLM_Qwen is
                end loop;
                Chain_Pos := Prefix_Len;
                Done := Prefix_Len;
-               if Prefix_Cache_On then
+               if Prefix_Log_On then
                   Ada.Text_IO.Put_Line
                     (Ada.Text_IO.Standard_Error,
                      "[PREFIXCACHE] HIT n=" & Prefix_Len'Image
@@ -1249,7 +1253,7 @@ package body LLM_Qwen is
                      if All_Ok then
                         Prefix_Reg.Commit (Res_Idx, Key, Prefix_Len, Actual);
                      end if;
-                     if Prefix_Cache_On then
+                     if Prefix_Log_On then
                         Ada.Text_IO.Put_Line
                           (Ada.Text_IO.Standard_Error,
                            "[PREFIXCACHE] MISS n=" & Prefix_Len'Image
