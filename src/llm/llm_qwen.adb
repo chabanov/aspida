@@ -1168,6 +1168,68 @@ package body LLM_Qwen is
    function One (Id : Integer) return LLM_Tokenizer.Token_Array is
      [1 => Id];
 
+   --  Special-token-aware tokenisation for chat message bodies. The Hura /
+   --  Qwen3.5 GGUF carries <think>, </think>, <tool_call>, </tool_call> as
+   --  single "added" vocab ids (e.g. <think>=248068), but byte-level Encode
+   --  splits each into 3-4 ordinary BPE tokens. Feeding those splits, the model
+   --  never saw the real control tokens: it ignored the platform's empty
+   --  <think></think> "thinking-done" prefill, reasoned anyway, and — with no
+   --  in-window repeat guard on block-level text — looped in reasoning until the
+   --  token cap, emitting ZERO answer tokens ("empty response"). We resolve each
+   --  known special to its id and byte-encode only the gaps, matching
+   --  llama.cpp / Ollama's parse_special path. <|im_start|>/<|im_end|> are
+   --  intentionally NOT in the set: turn frames are added structurally via
+   --  One (Im_Start_Id), so leaving them literal in a body blocks turn-boundary
+   --  injection from message text.
+   function Encode_Chat (M : Qwen_Model; S : String)
+      return LLM_Tokenizer.Token_Array
+   is
+      use type LLM_Tokenizer.Token_Array;
+
+      --  Longest special starting exactly at S (P); 0 if none, with its id.
+      function Special_At (P : Positive; Id : out Integer) return Natural is
+         function Try (Lit : String) return Natural is
+         begin
+            if P + Lit'Length - 1 <= S'Last
+              and then S (P .. P + Lit'Length - 1) = Lit
+            then
+               declare
+                  T : constant Integer := LLM_Tokenizer.Token_To_Id (M.Tok, Lit);
+               begin
+                  if T >= 0 then
+                     Id := T;
+                     return Lit'Length;
+                  end if;
+               end;
+            end if;
+            return 0;
+         end Try;
+         L : Natural;
+      begin
+         Id := -1;
+         --  longest first so "</tool_call>" beats "<tool_call>" etc.
+         L := Try ("</tool_call>"); if L > 0 then return L; end if;
+         L := Try ("<tool_call>");  if L > 0 then return L; end if;
+         L := Try ("</think>");     if L > 0 then return L; end if;
+         L := Try ("<think>");      if L > 0 then return L; end if;
+         return 0;
+      end Special_At;
+   begin
+      for P in S'Range loop
+         declare
+            Id : Integer;
+            L  : constant Natural := Special_At (P, Id);
+         begin
+            if L > 0 then
+               return LLM_Tokenizer.Encode (M.Tok, S (S'First .. P - 1))
+                      & One (Id)
+                      & Encode_Chat (M, S (P + L .. S'Last));
+            end if;
+         end;
+      end loop;
+      return LLM_Tokenizer.Encode (M.Tok, S);
+   end Encode_Chat;
+
    function Role_Str (R : Role_Kind) return String is
      (case R is when Role_System => "system", when Role_User => "user",
          when Role_Assistant => "assistant");
@@ -1181,7 +1243,7 @@ package body LLM_Qwen is
    begin
       return One (M.Im_Start_Id)
         & LLM_Tokenizer.Encode (M.Tok, Role_Str (Msg.Role) & LF)
-        & LLM_Tokenizer.Encode (M.Tok, To_String (Msg.Text))
+        & Encode_Chat (M, To_String (Msg.Text))
         & One (M.Im_End_Id)
         & LLM_Tokenizer.Encode (M.Tok, LF);
    end Msg_Ids;
@@ -1318,13 +1380,36 @@ package body LLM_Qwen is
          --  does for no-think — the model then answers directly. (This is the
          --  angle-bracketed form; the earlier degenerate loop came from bare
          --  "think\n\nthink\n\n" without brackets, which primed the literal word.)
+         --  If the caller ends the conversation with an ASSISTANT message it is
+         --  a PREFILL (the platform api sends a leading <think></think> assistant
+         --  turn to steer reasoning): open that assistant turn and let the model
+         --  continue it — do NOT close it with <|im_end|> and then open a SECOND
+         --  assistant turn. The old code rendered every message closed and always
+         --  appended a fresh opener, so a trailing assistant produced a DOUBLE
+         --  assistant turn (…assistant\n<think></think><|im_end|>\n<|im_start|>
+         --  assistant\n) — a malformed prompt that made the model hallucinate and
+         --  loop. Ollama treats a trailing assistant message as a prefill; match it.
+         Last_Asst : constant Boolean :=
+           Conversation'Length > 1
+           and then Conversation (Conversation'Last).Role = Role_Assistant;
          Ids : constant LLM_Tokenizer.Token_Array :=
-           Conv_Ids (M, Conversation, Conversation'First)
-           & One (M.Im_Start_Id)
-           & LLM_Tokenizer.Encode
-               (M.Tok,
-                (if Params.Enable_Thinking then "assistant" & LF
-                 else "assistant" & LF & "<think>" & LF & LF & "</think>" & LF & LF));
+           (if Last_Asst then
+              Conv_Ids (M, Conversation
+                          (Conversation'First .. Conversation'Last - 1),
+                        Conversation'First)
+              & One (M.Im_Start_Id)
+              & LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
+              & Encode_Chat
+                  (M, To_String (Conversation (Conversation'Last).Text))
+            else
+              Conv_Ids (M, Conversation, Conversation'First)
+              & One (M.Im_Start_Id)
+              & (if Params.Enable_Thinking then
+                    LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
+                 else
+                    LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
+                    & Encode_Chat
+                        (M, "<think>" & LF & LF & "</think>" & LF & LF)));
          --  Feed each token into the parser AS it is generated (Bridge.Emit ->
          --  Feed), so On_Text/On_Reasoning/On_Tool_Call fire live on SinkRef.
          --  A dead downstream client makes SinkRef raise, Decode_Tokens frees

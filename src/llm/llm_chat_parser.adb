@@ -190,6 +190,60 @@ package body LLM_Chat_Parser is
       return To_String ("{" & Result & "}");
    end Args_Of;
 
+   --  Extract a <function=NAME>...</function> block from Blk and emit it as a
+   --  tool call on Sink. Returns True iff a well-formed call was emitted.
+   --  Shared by Step (on the canonical </tool_call> closer) and Finalize —
+   --  the Hura fine-tune frequently ends the turn right after </function>,
+   --  omitting the outer </tool_call>, so without a Finalize fallback the whole
+   --  tool call was buffered and silently dropped (streaming emitted nothing →
+   --  the platform reported "empty response / no tool support").
+   function Emit_Tool_Block (P    : in out Parser;
+                             Blk  : String;
+                             Sink : access LLM_Qwen.Chat_Sink'Class)
+                             return Boolean
+   is
+      Fn : constant Natural := Idx ("<function=", Blk, Blk'First);
+      Nm : Unbounded_String := Null_Unbounded_String;
+      Ar : Unbounded_String := Null_Unbounded_String;
+   begin
+      if Fn > 0 then
+         declare
+            NS : constant Natural := Fn + 10;
+            NE : Natural := NS;
+         begin
+            while NE <= Blk'Last and then Blk (NE) /= '>'
+                    and then (NE - NS) <= 64 loop
+               NE := NE + 1;
+            end loop;
+            if NE <= Blk'Last and then Blk (NE) = '>' then
+               Nm := To_Unbounded_String (Blk (NS .. NE - 1));
+               Ar := To_Unbounded_String (Args_Of (Blk));
+            end if;
+         end;
+      end if;
+
+      if not P.Tool_Cap_Reached and then Nm /= Null_Unbounded_String then
+         P.N_Calls := P.N_Calls + 1;
+         if P.N_Calls <= P.Calls'Last then
+            declare
+               Idx_C : constant String := Id_For (P.N_Calls);
+            begin
+               P.Calls (P.N_Calls) :=
+                 (Id           => To_Unbounded_String (Idx_C),
+                  Name         => Nm,
+                  Arguments_JS => Ar);
+               LLM_Qwen.On_Tool_Call
+                 (Sink.all, Idx_C, To_String (Nm), To_String (Ar));
+               P.Text_After_Last_Tool := False;
+            end;
+            return True;
+         else
+            P.Tool_Cap_Reached := True;
+         end if;
+      end if;
+      return False;
+   end Emit_Tool_Block;
+
    procedure Emit_Text (P : in out Parser;
                         Text : String;
                         Sink : access LLM_Qwen.Chat_Sink'Class) is
@@ -398,51 +452,10 @@ package body LLM_Chat_Parser is
                --  Assemble and emit one tool call from the block preceding
                --  this closer.
                declare
-                  Blk : constant String := Str (Str'First .. Best - 1);
-                  Fn  : constant Natural :=
-                    Idx ("<function=", Blk, Blk'First);
-                  Nm  : Unbounded_String := Null_Unbounded_String;
-                  Ar  : Unbounded_String := Null_Unbounded_String;
+                  Emitted : constant Boolean :=
+                    Emit_Tool_Block (P, Str (Str'First .. Best - 1), Sink);
                begin
-                  if Fn > 0 then
-                     declare
-                        NS : constant Natural := Fn + 10;
-                        NE : Natural := NS;
-                     begin
-                        while NE <= Blk'Last
-                          and then Blk (NE) /= '>'
-                          and then (NE - NS) <= 64
-                        loop
-                           NE := NE + 1;
-                        end loop;
-                        if NE <= Blk'Last and then Blk (NE) = '>' then
-                           Nm := To_Unbounded_String (Blk (NS .. NE - 1));
-                           Ar := To_Unbounded_String (Args_Of (Blk));
-                        end if;
-                     end;
-                  end if;
-
-                  if not P.Tool_Cap_Reached
-                    and then Nm /= Null_Unbounded_String
-                  then
-                     P.N_Calls := P.N_Calls + 1;
-                     if P.N_Calls <= P.Calls'Last then
-                        declare
-                           Idx_C : constant String := Id_For (P.N_Calls);
-                        begin
-                           P.Calls (P.N_Calls) :=
-                             (Id           => To_Unbounded_String (Idx_C),
-                              Name         => Nm,
-                              Arguments_JS => Ar);
-                           LLM_Qwen.On_Tool_Call
-                             (Sink.all, Idx_C,
-                              To_String (Nm), To_String (Ar));
-                           P.Text_After_Last_Tool := False;
-                        end;
-                     else
-                        P.Tool_Cap_Reached := True;
-                     end if;
-                  end if;
+                  pragma Unreferenced (Emitted);
                end;
                P.Tool_Depth := P.Tool_Depth - 1;
                if P.Tool_Depth > 0 then
@@ -488,12 +501,17 @@ package body LLM_Chat_Parser is
          Str   : constant String := To_String (P.Buf);
       begin
          if Saved = S_In_Tool then
-            --  Tool block was still open at end-of-stream. Move the
-            --  unclosed bytes to the Answer as best-effort fallback
-            --  (the model forgot the tool_call closer). DO NOT mark
-            --  Text_After_Last_Tool, since this text wasn't a real
-            --  post-tool message.
-            P.Answer := P.Answer & Str;
+            --  Tool block still open at end-of-stream. The Hura fine-tune
+            --  routinely ends the turn right after </function> WITHOUT the
+            --  outer </tool_call>, so Step never fired the call. Recover it:
+            --  if the buffer holds a <function=NAME>...</function>, emit it as
+            --  a tool call (streaming clients then see the tool_call event and
+            --  the run proceeds instead of failing with "empty response"). Only
+            --  when there is no function block do we fall back to treating the
+            --  bytes as answer text. DO NOT mark Text_After_Last_Tool.
+            if not Emit_Tool_Block (P, Str, Sink) then
+               P.Answer := P.Answer & Str;
+            end if;
             P.Buf := Null_Unbounded_String;
          elsif Str'Length > 0 then
             Emit_Text (P, Str, Sink);
