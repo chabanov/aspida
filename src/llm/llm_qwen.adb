@@ -1230,6 +1230,27 @@ package body LLM_Qwen is
       return LLM_Tokenizer.Encode (M.Tok, S);
    end Encode_Chat;
 
+   --  True when S is an EMPTY reasoning prefill: "<think></think>" with only
+   --  whitespace around/inside it. The platform api appends exactly this as a
+   --  trailing assistant message (THINKING_PREFILL_CONTENT = "<think></think>
+   --  \n\n"). On Ollama that prefill is a NO-OP — the hura Modelfile template
+   --  re-opens thinking on every turn — so the model always shows its
+   --  reasoning. We match that: an empty-think prefill is rendered as an OPEN
+   --  <think> at the assistant turn (see Chat_Raw) so the model reasons, and
+   --  the parser is seeded in reasoning to stream those thoughts.
+   function Is_Empty_Think (S : String) return Boolean is
+      Compact : String (1 .. S'Length);
+      N       : Natural := 0;
+   begin
+      for I in S'Range loop
+         if S (I) not in ' ' | ASCII.LF | ASCII.CR | ASCII.HT then
+            N := N + 1;
+            Compact (N) := S (I);
+         end if;
+      end loop;
+      return Compact (1 .. N) = "<think></think>";
+   end Is_Empty_Think;
+
    function Role_Str (R : Role_Kind) return String is
      (case R is when Role_System => "system", when Role_User => "user",
          when Role_Assistant => "assistant");
@@ -1274,7 +1295,21 @@ package body LLM_Qwen is
       Stats : access Gen_Stats) return Chat_Result
    is
       LF     : constant String := [1 => ASCII.LF];
-      P      : aliased LLM_Chat_Parser.Parser := LLM_Chat_Parser.New_Parser;
+      --  The platform api ends the conversation with an assistant `<think></think>`
+      --  prefill. On Ollama that is a no-op and the hura template re-opens
+      --  thinking every turn, so the model always reasons visibly. We match it:
+      --  render that prefill as an OPEN `<think>` (see the Ids build) and seed
+      --  the parser in reasoning so the chain-of-thought streams as
+      --  reasoning_content instead of being mis-read as the answer.
+      Last_Is_Asst : constant Boolean :=
+        Conversation'Length > 1
+        and then Conversation (Conversation'Last).Role = Role_Assistant;
+      Empty_Think  : constant Boolean :=
+        Last_Is_Asst
+        and then Is_Empty_Think (To_String (Conversation (Conversation'Last).Text));
+      Think_Open   : constant Boolean := Empty_Think and then Params.Enable_Thinking;
+      P      : aliased LLM_Chat_Parser.Parser :=
+        LLM_Chat_Parser.New_Parser (Start_In_Reasoning => Think_Open);
       Nullish : constant Null_Sink_Access := New_Null_Sink;
       function Resolve_Sink return access Chat_Sink'Class is
       begin
@@ -1389,20 +1424,36 @@ package body LLM_Qwen is
          --  assistant turn (…assistant\n<think></think><|im_end|>\n<|im_start|>
          --  assistant\n) — a malformed prompt that made the model hallucinate and
          --  loop. Ollama treats a trailing assistant message as a prefill; match it.
-         Last_Asst : constant Boolean :=
-           Conversation'Length > 1
-           and then Conversation (Conversation'Last).Role = Role_Assistant;
-         Ids : constant LLM_Tokenizer.Token_Array :=
-           (if Last_Asst then
+         --  Prefix over messages before any trailing assistant prefill.
+         Prefix : constant LLM_Tokenizer.Token_Array :=
+           (if Last_Is_Asst then
               Conv_Ids (M, Conversation
                           (Conversation'First .. Conversation'Last - 1),
                         Conversation'First)
+            else
+              Conv_Ids (M, Conversation, Conversation'First));
+         Ids : constant LLM_Tokenizer.Token_Array :=
+           (if Think_Open then
+              --  Empty-think prefill + thinking on: OPEN a <think> block so the
+              --  model reasons visibly, exactly like Ollama's always-think
+              --  template. The parser is seeded in reasoning (Think_Open) so the
+              --  chain-of-thought streams as reasoning_content and the model's
+              --  own </think> switches it to the answer.
+              Prefix
+              & One (M.Im_Start_Id)
+              & LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
+              & Encode_Chat (M, "<think>" & LF)
+            elsif Last_Is_Asst then
+              --  Real assistant prefill (non-empty, or empty-think with thinking
+              --  off): open that turn and let the model continue it — NOT a
+              --  closed turn + a second opener (that double turn was malformed).
+              Prefix
               & One (M.Im_Start_Id)
               & LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
               & Encode_Chat
                   (M, To_String (Conversation (Conversation'Last).Text))
             else
-              Conv_Ids (M, Conversation, Conversation'First)
+              Prefix
               & One (M.Im_Start_Id)
               & (if Params.Enable_Thinking then
                     LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)

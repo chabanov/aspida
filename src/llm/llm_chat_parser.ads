@@ -63,7 +63,15 @@ package LLM_Chat_Parser is
 
    --  Initial state (Finish not yet determined; parser doesn't emit
    --  On_Finish_Reason until you call Finalize).
-   function New_Parser return Parser;
+   --
+   --  Start_In_Reasoning seeds the FSM as if a `<think>` opener was already
+   --  consumed. Use it when the PROMPT opens a thinking block (the assistant
+   --  generation prompt ends with `<think>`, as this fine-tune's always-think
+   --  template does): the model then emits its chain-of-thought and a closing
+   --  `</think>` in the stream, so the opener is NOT in the generated text and
+   --  the parser must already be in S_In_Reasoning to route it to
+   --  reasoning_content rather than mis-classifying it as the answer.
+   function New_Parser (Start_In_Reasoning : Boolean := False) return Parser;
 
    --  Append a piece of model output. Drives the FSM:
    --   * emits On_Reasoning(...) for any text inside a <think> block,

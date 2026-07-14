@@ -101,10 +101,14 @@ package body LLM_Chat_Parser is
    function Id_For (N : Natural) return String is
      ("tc_" & Ada.Strings.Fixed.Trim (Natural'Image (N), Ada.Strings.Both));
 
-   function New_Parser return Parser is
+   function New_Parser (Start_In_Reasoning : Boolean := False) return Parser is
       P : Parser;
    begin
       P.Max_Buf := Safety;
+      if Start_In_Reasoning then
+         P.State       := S_In_Reasoning;
+         P.Think_Depth := 1;
+      end if;
       return P;
    end New_Parser;
 
