@@ -1776,6 +1776,19 @@ package body LLM_Qwen is
          function Hist_Bounds return Cache_Bounds_Array is
             Last_Msg : constant Integer :=
               Conversation'Last - (if Last_Is_Asst then 1 else 0);
+            --  Snapshot only up to the last ASSISTANT message (end of the
+            --  STABLE persisted history), never the current turn. The platform
+            --  now emits per-turn dynamic context (retrieved memory, tenant
+            --  status) as a system message immediately BEFORE the user turn, so
+            --  the tail [dynamic-system, current-user] is ephemeral — it is not
+            --  in next turn's history. Snapshotting the full prefix would bake
+            --  that ephemeral tail into the key and break the turn-to-turn
+            --  chain (next turn's history has [user, assistant] where the
+            --  snapshot had [dynamic, user]). Stopping at the last assistant
+            --  keeps the snapshot byte-stable; the current turn re-prefills as
+            --  the suffix. No assistant yet (turn 1) => snapshot the leading
+            --  message (the stable system prompt).
+            Last_Stable : Integer := Conversation'First;
             Tmp : Cache_Bounds_Array (1 .. 64) := [others => 0];
             NB  : Natural := 0;
          begin
@@ -1785,6 +1798,9 @@ package body LLM_Qwen is
                return [1 .. 0 => 0];
             end if;
             for I in Conversation'First .. Last_Msg loop
+               if Conversation (I).Role = Role_Assistant then Last_Stable := I; end if;
+            end loop;
+            for I in Conversation'First .. Last_Stable loop
                declare
                   L : constant Natural :=
                     Conv_Ids (M, Conversation (Conversation'First .. I),
