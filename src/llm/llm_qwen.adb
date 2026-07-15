@@ -1185,12 +1185,15 @@ package body LLM_Qwen is
             --  Prefill chunk. The Q8 matmuls use the tensor-core kernel
             --  (weight-stationary), so a large chunk amortises the weight read
             --  ~4x better than 32. Must stay <= the CUDA-side PCH buffer cap.
-            --  256 -> 512 -> 1024 (2026-07-15): with 255/256 MoE experts
-            --  firing per chunk the expert-weight stream is a fixed per-chunk
-            --  cost; 1024 cuts MoE to 57.7ms per 256-tok equivalent (was
-            --  155.8). VRAM-safe via the bounded lazy scratch pool on the
-            --  CUDA side (ASPIDA_PREFILL_SETS). MUST match #define PCH in
-            --  gpu/gpu_matvec.cu.
+            --  256 -> 512 -> 1024 (2026-07-15): larger chunks amortise the
+            --  fixed per-chunk MoE expert-weight stream (1024 cuts MoE to
+            --  57.7ms per 256-tok equivalent, was 155.8; measured ~10% faster
+            --  prefill end-to-end). Runs with ASPIDA_PREFILL_SETS=1 (one scratch
+            --  set) on the 46GB prod box, which co-hosts a 3.2GB voice_server.
+            --  Measured prompt ceiling is >=20k tokens (no OOM), covering the
+            --  platform's 25-100KB prompts, so a single 1024 scratch set
+            --  (~440MB) is comfortably affordable. MUST match #define PCH in
+            --  gpu/gpu_matvec.cu — see that comment for the full VRAM budget.
             PCHUNK : constant := 1024;
             Total  : constant Natural := Prompt_Ids'Length;
             Done   : Natural := 0;

@@ -2478,14 +2478,25 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
                  // the chunk), so a big chunk amortises the weight read. Non-Q8
                  // kinds are sub-batched by MAXB inside launch_mv_b.
                  //
-                 // 256 -> 512 -> 1024 (moe-lever + VRAM audit, 2026-07-15): at
-                 // P=256 essentially ALL 256 experts fire every chunk, so the
+                 // 256 -> 512 -> 1024 (moe-lever, 2026-07-15): at P=256
+                 // essentially ALL 256 experts fire every chunk, so the
                  // ~570MB/layer gate+up weight stream is a FIXED cost the chunk
                  // amortises: MoE per-256-tok-equivalent 155.8ms (P=256) ->
-                 // 86ms (512) -> 57.7ms (1024). 1024 is VRAM-safe ONLY because
-                 // prefill scratch is a bounded lazy pool (ASPIDA_PREFILL_SETS,
-                 // default 4): 4 sets @1024 = 1.7GB = same footprint as the old
-                 // eager 8 x 512. MUST match PCHUNK in src/llm/llm_qwen.adb
+                 // 86ms (512) -> 57.7ms (1024).
+                 //
+                 // PROD VRAM budget (2026-07-15): the deployed the GPU host is a
+                 // 46GB (not 48GB) an NVIDIA GPU that ALSO co-hosts a 3.2GB voice_server,
+                 // so free VRAM over the resident 35B-Q8 (~38.4GB) is ~4.4GB.
+                 // We run PCH=1024 with ASPIDA_PREFILL_SETS=1 (ONE scratch set,
+                 // ~440MB): vs 512 (~220MB) the extra 220MB buys ~10% faster
+                 // prefill (5619 tok 3.9s->3.5s) via MoE weight-stream
+                 // amortisation, at negligible headroom cost. Measured prompt
+                 // ceiling on prod is >=20k tokens (20017 tok = 15.4s, no OOM),
+                 // comfortably covering the platform's 25-100KB prompts — so KV
+                 // headroom is NOT the binding constraint at SETS=1 (an earlier
+                 // ~9k estimate was a wrong analytical KV model; the real per-gen
+                 // KV is far smaller). Use SETS>1 only with the full 48GB free
+                 // (voice relocated). MUST match PCHUNK in src/llm/llm_qwen.adb
                  // (the Ada side sends the chunks).
 
 // Delta-net causal depthwise conv over a chunk: thread owns channel c and walks
