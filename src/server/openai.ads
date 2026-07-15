@@ -58,9 +58,13 @@ package OpenAI is
 
    --  Tool-call delta chunk: emits a single
    --  choices[0].delta.tool_calls=[{index, id, type, function:{name, arguments}}]
-   --  object. The proxy forwards it as-is.
+   --  object. The proxy forwards it as-is. Index is the 0-based ordinal of
+   --  the call within the response: spec-compliant clients MERGE deltas that
+   --  share an index, so emitting parallel calls all at index 0 makes the
+   --  client concatenate their argument strings into invalid JSON
+   --  ("{...}{...}" — eval-hura tools-web-search failure, 2026-07-15).
    function Tool_Call_Chunk
-     (Model, Id, Name, Arguments : String) return String;
+     (Model, Id, Name, Arguments : String; Index : Natural := 0) return String;
 
    function Chat_Done_Chunk
      (Model : String;

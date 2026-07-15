@@ -219,7 +219,7 @@ package body OpenAI is
    end Chat_Chunk;
 
    function Tool_Call_Chunk
-     (Model, Id, Name, Arguments : String) return String
+     (Model, Id, Name, Arguments : String; Index : Natural := 0) return String
    is
       Root    : constant JSON.Value_Ref := JSON.New_Object;
       Choices : constant JSON.Value_Ref := JSON.New_Array;
@@ -231,7 +231,7 @@ package body OpenAI is
    begin
       JSON.Set (Fn, "name", JSON.Str (Name));
       JSON.Set (Fn, "arguments", JSON.Str (Arguments));
-      JSON.Set (TC, "index", JSON.Int (0));
+      JSON.Set (TC, "index", JSON.Int (Index));
       JSON.Set (TC, "id", JSON.Str (Id));
       JSON.Set (TC, "type", JSON.Str ("function"));
       JSON.Set (TC, "function", Fn);

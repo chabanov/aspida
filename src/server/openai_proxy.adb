@@ -462,13 +462,35 @@ procedure OpenAI_Proxy is
                                          JSON.As_String (JSON.Get (Idx, "name")),
                                          JSON.As_String (JSON.Get (Idx, "arguments"))) & NL);
                                  else
-                                    Sock_Write (Client, "data: "
-                                      & OpenAI.Tool_Call_Chunk
-                                          (Model_Name,
-                                           JSON.As_String (JSON.Get (Idx, "id")),
-                                           JSON.As_String (JSON.Get (Idx, "name")),
-                                           JSON.As_String (JSON.Get (Idx, "arguments")))
-                                      & CRLF & CRLF);
+                                    declare
+                                       --  0-based stream index from the parser's
+                                       --  "tc_N" id (Id_For, N >= 1). Parallel
+                                       --  calls MUST carry distinct indexes or
+                                       --  spec-compliant clients merge their
+                                       --  argument deltas into invalid JSON.
+                                       Id_S : constant String :=
+                                         JSON.As_String (JSON.Get (Idx, "id"));
+                                       Ord  : Natural := 0;
+                                    begin
+                                       if Id_S'Length > 3
+                                         and then Id_S (Id_S'First .. Id_S'First + 2) = "tc_"
+                                       then
+                                          begin
+                                             Ord := Natural'Value
+                                               (Id_S (Id_S'First + 3 .. Id_S'Last)) - 1;
+                                          exception
+                                             when others => Ord := 0;
+                                          end;
+                                       end if;
+                                       Sock_Write (Client, "data: "
+                                         & OpenAI.Tool_Call_Chunk
+                                             (Model_Name,
+                                              Id_S,
+                                              JSON.As_String (JSON.Get (Idx, "name")),
+                                              JSON.As_String (JSON.Get (Idx, "arguments")),
+                                              Ord)
+                                         & CRLF & CRLF);
+                                    end;
                                  end if;
                               end if;
                            end;
