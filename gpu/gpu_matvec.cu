@@ -2190,6 +2190,73 @@ __global__ void k_q8_wmma(const uint8_t *__restrict__ w, const float *__restrict
     }
 }
 
+//  Register-tiled Q8 tensor-core matmul (moe-lever, 2026-07-15): each warp
+//  computes an MT x NT grid of 16x16 output fragments (e.g. 4x4 = a 64x64
+//  tile), issuing MT*NT mma per A/B fragment-load instead of 2. The 16x16
+//  k_q8_wmma was TC-UNDERUTILIZED (22.9 TFLOP/s; NOT memory- or dequant-
+//  bound — measured via share-weight and fp16-weight diagnostics); reg4x4
+//  reaches 62.3 TFLOP/s = 2.72x, BIT-EXACT (same dequant values, same
+//  per-tile K order). Caveats: needs out % (16*NT) == 0 (a tail guard in
+//  the hot dequant loop collapses perf ~3x — gate + fall back instead) and
+//  enough blocks to fill the GPU (starves below ~512 blocks: qkv at B=256
+//  was 0.48x) — hence the block-count dispatch gates in launch_mv_b.
+template<int MT, int NT>
+__global__ void k_q8_reg(const uint8_t *__restrict__ w, const float *__restrict__ x,
+                         float *__restrict__ y, int in, int out, int B) {
+    int n0 = blockIdx.x * (WMM_TN * NT), m0 = blockIdx.y * (WMM_TM * MT);
+    int lane = threadIdx.x & 31;
+    int nb = in / 32; size_t bpr = (size_t) nb * 34;
+    __shared__ half As[MT][WMM_TM * WMM_TK];
+    __shared__ half Bs[NT][WMM_TK * WMM_TN];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cf[MT][NT];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) nvcuda::wmma::fill_fragment(cf[i][j], 0.0f);
+    for (int kb = 0; kb < nb; ++kb) {
+        //  No tail guard here (branching in this hot loop collapses perf ~3x);
+        //  the caller guarantees out % (16*NT) == 0.
+        #pragma unroll
+        for (int j = 0; j < NT; ++j) for (int n = 0; n < WMM_TN; ++n) {
+            const uint8_t *bl = w + (size_t) (n0 + j * WMM_TN + n) * bpr + (size_t) kb * 34;
+            Bs[j][(size_t) lane * WMM_TN + n] = __float2half(f16(bl) * (float) ((const int8_t *) (bl + 2))[lane]);
+        }
+        #pragma unroll
+        for (int i = 0; i < MT; ++i) for (int m = 0; m < WMM_TM; ++m) {
+            int gm = m0 + i * WMM_TM + m;
+            float xv = (gm < B) ? x[(size_t) gm * in + kb * 32 + lane] : 0.0f;
+            As[i][(size_t) m * WMM_TK + lane] = __float2half(xv);
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int k16 = 0; k16 < 2; ++k16) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> af[MT];
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major> bf[NT];
+            #pragma unroll
+            for (int i = 0; i < MT; ++i) nvcuda::wmma::load_matrix_sync(af[i], As[i] + k16 * 16, WMM_TK);
+            #pragma unroll
+            for (int j = 0; j < NT; ++j) nvcuda::wmma::load_matrix_sync(bf[j], Bs[j] + (size_t) k16 * 16 * WMM_TN, WMM_TN);
+            #pragma unroll
+            for (int i = 0; i < MT; ++i)
+                #pragma unroll
+                for (int j = 0; j < NT; ++j) nvcuda::wmma::mma_sync(cf[i][j], af[i], bf[j], cf[i][j]);
+        }
+        __syncwarp();
+    }
+    __shared__ float Cs[WMM_TM * WMM_TN];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i) for (int j = 0; j < NT; ++j) {
+        __syncwarp();
+        nvcuda::wmma::store_matrix_sync(Cs, cf[i][j], WMM_TN, nvcuda::wmma::mem_row_major);
+        __syncwarp();
+        for (int idx = lane; idx < WMM_TM * WMM_TN; idx += 32) {
+            int m = idx / WMM_TN, n = idx % WMM_TN;
+            int gm = m0 + i * WMM_TM + m, gn = n0 + j * WMM_TN + n;
+            if (gm < B && gn < out) y[(size_t) gm * out + gn] = Cs[idx];
+        }
+    }
+}
+
 static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
                                const float *dx, float *dy, int B, cudaStream_t st) {
     const int TPB = 256, WPB = TPB / 32; int blocks = (out + WPB - 1) / WPB;
@@ -2206,6 +2273,20 @@ static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
             //  measured). The single-vector kernel has no acc array and hits
             //  ~80-100% of peak bandwidth — 3.6x faster, bit-identical.
             k_q8_0_w<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out);
+        } else if (out % 64 == 0 && B >= 64
+                   && (size_t)((out + 63) / 64) * ((B + 63) / 64) >= 512) {
+            //  Large prefill projections (B=PCH): register-tiled 64x64 warp
+            //  tiles, 2.72x over the 16x16 wmma, bit-exact. Block-count gate:
+            //  below ~512 blocks the wide tile starves the GPU (measured
+            //  0.48x at qkv B=256) — those shapes stay on the paths below.
+            dim3 grid(out / 64, (B + 63) / 64);
+            k_q8_reg<4, 4><<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
+        } else if (out % 32 == 0 && B >= 32
+                   && (size_t)((out + 31) / 32) * ((B + 31) / 32) >= 512) {
+            //  Medium tier: 32x32 warp tiles (1.71x at the big shapes, needs
+            //  a quarter the blocks of reg4x4 to fill the GPU).
+            dim3 grid(out / 32, (B + 31) / 32);
+            k_q8_reg<2, 2><<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
         } else if (B >= 16) {
             dim3 grid((out + WMM_TN - 1) / WMM_TN, (B + WMM_TM - 1) / WMM_TM);
             k_q8_wmma<<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
