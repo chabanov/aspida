@@ -1205,8 +1205,16 @@ package body LLM_Qwen is
             Snap_Len : constant Natural :=
               (if Cache_Bounds'Length > 0 then Cache_Bounds (Cache_Bounds'Last)
                else Prefix_Len);
+            --  Don't spend a cache slot (there are only Max_Prefix_Entries) on a
+            --  tiny prefix: an adaptive-effort classifier call carries only a
+            --  ~100-400-token prompt that re-prefills in <0.5 s anyway, but if it
+            --  snapshots it evicts the valuable ~6k agent-system-prompt snapshots
+            --  in round-robin — so a session's greeting hits the cache for two
+            --  turns then the classifier churns it out and turn 3+ cold-prefills
+            --  the whole prompt again. Only cache prefixes worth the slot.
+            Min_Snap : constant Natural := 1024;
             Cache_Active : constant Boolean :=
-              Prefix_Cache_On and then Snap_Len > 0
+              Prefix_Cache_On and then Snap_Len >= Min_Snap
               and then Snap_Len < Total
               and then LLM_Qwen_GPU.Prefix_Cache_Available;
             Hit         : Boolean := False;
