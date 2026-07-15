@@ -1185,7 +1185,11 @@ package body LLM_Qwen is
             --  Prefill chunk. The Q8 matmuls use the tensor-core kernel
             --  (weight-stationary), so a large chunk amortises the weight read
             --  ~4x better than 32. Must stay <= the CUDA-side PCH buffer cap.
-            PCHUNK : constant := 256;
+            --  256 -> 512 (2026-07-15): with 255/256 MoE experts firing per
+            --  chunk the expert-weight stream is a fixed per-chunk cost; 512
+            --  halves the MoE ms/token (155.8 -> 86 per 256-tok equivalent).
+            --  MUST match #define PCH in gpu/gpu_matvec.cu.
+            PCHUNK : constant := 512;
             Total  : constant Natural := Prompt_Ids'Length;
             Done   : Natural := 0;
 

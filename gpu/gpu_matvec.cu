@@ -2387,10 +2387,20 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
 //  resident state, so it overlaps the batch Driver's concurrent decode forwards
 //  (read-only shared weights) without a lock.
 //===========================================================================
-#define PCH 256  // chunk size. The Q8 matmuls use the tensor-core k_q8_wmma
+#define PCH 512  // chunk size. The Q8 matmuls use the tensor-core k_q8_wmma
                  // (no MAXB cap; weight-stationary, per-token cost falls with
                  // the chunk), so a big chunk amortises the weight read. Non-Q8
                  // kinds are sub-batched by MAXB inside launch_mv_b.
+                 //
+                 // 256 -> 512 (moe-lever, 2026-07-15): at P=256 essentially ALL
+                 // 256 experts fire every chunk (bucket max 17, 255/256 active),
+                 // so the ~570MB/layer gate+up weight stream is a FIXED cost the
+                 // chunk amortises: measured MoE per-256-tok-equivalent 155.8ms
+                 // (P=256) -> 86ms (P=512) -> 57.7ms (P=1024). 512 chosen: the
+                 // per-lane prefill scratch scales with PCH x PMAXLANE(8) lanes
+                 // (+~0.9GB at 512, fits the ~2GB post-model headroom; 1024 =
+                 // +~2.6GB, likely OOM at serve time). MUST match PCHUNK in
+                 // src/llm/llm_qwen.adb (the Ada side sends the chunks).
 
 // Delta-net causal depthwise conv over a chunk: thread owns channel c and walks
 // t = 0..P-1, maintaining the sliding hist window exactly as k_dnet_conv does.
