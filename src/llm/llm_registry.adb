@@ -13,6 +13,7 @@
 
 with Ada.Environment_Variables;
 with Ada.Directories;
+with Ada.Strings.Fixed;
 with Ada.Strings.Unbounded;  use Ada.Strings.Unbounded;
 with LLM_Catalog;
 
@@ -208,18 +209,32 @@ package body LLM_Registry is
    is
       use type LLM_Catalog.Model_Status;
       Cat : constant LLM_Catalog.Entry_Vectors.Vector := LLM_Catalog.Discover;
+      --  Ollama tag convention: a bare model name (no ':') means the ':latest'
+      --  tag. Ollama accepts both "hura" and "hura:latest"; aspida catalog
+      --  entries are keyed by the file's simple name ("hura:latest"), so
+      --  without this the platform's native /api/chat requests (which send the
+      --  bare "hura") were rejected as "unknown model" and the Ollama-format
+      --  converter turned that error into an empty message — an outage that
+      --  ONLY hit the native transport (the /v1 path sends the full tag).
+      function Norm (S : String) return String is
+        (if Ada.Strings.Fixed.Index (S, ":") = 0 then S & ":latest" else S);
+      NRef : constant String := Norm (Ref);
    begin
       Found := False;
       Path  := Null_Unbounded_String;
       for E of Cat loop
-         if (To_String (E.Path) = Ref
-             or else Ada.Directories.Simple_Name (To_String (E.Path)) = Ref)
-           and then E.Status = LLM_Catalog.Supported
-         then
-            Found := True;
-            Path  := E.Path;
-            return;
-         end if;
+         declare
+            SN : constant String :=
+              Ada.Directories.Simple_Name (To_String (E.Path));
+         begin
+            if (To_String (E.Path) = Ref or else SN = Ref or else Norm (SN) = NRef)
+              and then E.Status = LLM_Catalog.Supported
+            then
+               Found := True;
+               Path  := E.Path;
+               return;
+            end if;
+         end;
       end loop;
    end Resolve;
 
@@ -239,8 +254,23 @@ package body LLM_Registry is
       Ok  : out Boolean;
       Err : out Ada.Strings.Unbounded.Unbounded_String)
    is
+      --  Ollama tag convention: a bare model name (no ':') means ':latest'.
+      --  The model is registered/resident under its full tag (e.g. the
+      --  QWEN_MODEL_PATH file "hura:latest"), while the catalog Resolve is
+      --  keyed by the real gguf filename — so a request for the BARE "hura"
+      --  matched neither the resident key nor Resolve and failed as
+      --  "unknown model". The platform's native /api/chat transport sends the
+      --  bare name (Ollama accepts it), so without this every native request
+      --  was rejected and the Ollama-format converter turned the error into an
+      --  empty message — a cutover outage that hit ONLY the native path
+      --  (2026-07-15). Normalise a bare Ref to <Ref>:latest when that matches
+      --  the resident default, before the lookups below.
       Key  : constant String :=
-        (if Ref = "" then To_String (Default_Key) else Ref);
+        (if Ref = "" then To_String (Default_Key)
+         elsif Ada.Strings.Fixed.Index (Ref, ":") = 0
+               and then Ref & ":latest" = To_String (Default_Key)
+         then To_String (Default_Key)
+         else Ref);
       Slot : Natural;
    begin
       Err := Null_Unbounded_String;
