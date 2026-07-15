@@ -2845,12 +2845,36 @@ __global__ void k_fattn_attend_chunk(
 // prefilled concurrently — garbage output (2026-07-13). Only the LM head runs
 // once per prefill (last position), so no [PCH,vocab] per position.
 #define PMAXLANE 8
+// Split fused input-projection output comb[P, proj] (row layout per position:
+//   [ qkv(qo) | alpha(nv) | beta(nv) | z(v_dim) ] )
+// into the separate contiguous buffers the delta-net kernels read. Bit-exact
+// vs the 4 separate launches (same k_q8_wmma, byte-concatenated weights).
+__global__ void k_proj_scatter(
+        const float* __restrict__ comb, int P, int proj,
+        float* __restrict__ qkv, int qo,
+        float* __restrict__ ar,  float* __restrict__ br, int nv,
+        float* __restrict__ z,   int vdim) {
+    size_t gid = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (size_t) P * proj) return;
+    int t = (int)(gid / proj), c = (int)(gid % proj);
+    float v = comb[(size_t) t * proj + c];
+    if      (c < qo)        qkv[(size_t) t * qo   + c]              = v;
+    else if (c < qo + nv)   ar [(size_t) t * nv   + (c - qo)]       = v;
+    else if (c < qo + 2*nv) br [(size_t) t * nv   + (c - qo - nv)]  = v;
+    else                    z  [(size_t) t * vdim + (c - qo - 2*nv)]= v;
+}
+
 struct PScr {
     float *Hb,*nxb,*aob,*dqkv,*dcq,*dar,*dbr,*dz,*dg,*db,*dor,*dqg,*dkt,*dvt,
           *dqa,*dga,*datt,*drl,*dhb,*dlog;
     //  Warp-recurrence scratch (ASPIDA_DNET_WARP): normalised Q/K per chunk
     //  and the pre-output-norm delta-net output (o*scale). Sized like q/v dims.
     float *dkn,*dqn,*dosh;
+    //  Fused input-projection output [P, qo+2*nv+v_dim] (dnet lever): one
+    //  k_q8_wmma over the loader's concatenated L.proj, scattered back into
+    //  dqkv/dar/dbr/dz. Saves ~5.3 ms/chunk vs 4 separate launches (the tiny
+    //  alpha/beta matmuls are occupancy-starved on their own).
+    float *dcomb;
     MoeRoute *droute;
     int *rows;
     int *mg_pos, *mg_k, *mg_cnt;   // expert-grouped MoE: positions/slots per expert + counts
@@ -2873,6 +2897,7 @@ static void chain_alloc_p(void) {
         if (g_mx_vd){ cudaMalloc(&S.dz, Pd*g_mx_vd*4); cudaMalloc(&S.dor, Pd*g_mx_vd*4);
                       cudaMalloc(&S.dosh, Pd*g_mx_vd*4); }
         if (g_mx_qo){ cudaMalloc(&S.dkn, Pd*g_mx_qo*4); cudaMalloc(&S.dqn, Pd*g_mx_qo*4); }
+        if (g_mx_qo) cudaMalloc(&S.dcomb, Pd*(size_t)(g_mx_qo + 2*g_mx_nv + g_mx_vd)*4);
         if (g_mx_qgd) cudaMalloc(&S.dqg, Pd*g_mx_qgd*4);
         if (g_mx_kvd){ cudaMalloc(&S.dkt, Pd*g_mx_kvd*4); cudaMalloc(&S.dvt, Pd*g_mx_kvd*4); }
         if (g_mx_att){ cudaMalloc(&S.dqa, Pd*g_mx_att*4); cudaMalloc(&S.dga, Pd*g_mx_att*4);
@@ -3083,10 +3108,20 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
         k_norm1_b<<<P,256,0,st>>>(pHb, L.attn_norm, pnxb, dim, P);
         if (!L.is_fattn) {
             DnetState ds = g_dnet[handles[li]];
-            launch_mv_b(L.qkv, L.qkv_k, dim, L.qo, pnxb, pdqkv, P, st);
-            launch_mv_b(L.al, L.al_k, dim, L.nv, pnxb, pdar, P, st);
-            launch_mv_b(L.be, L.be_k, dim, L.nv, pnxb, pdbr, P, st);
-            launch_mv_b(L.ga, L.ga_k, dim, L.v_dim, pnxb, pdz, P, st);
+            //  Fused input projection (dnet lever): one k_q8_wmma over the
+            //  loader's concatenated qkv|alpha|beta|gate weight + a cheap
+            //  scatter. Bit-exact; ~1.3x over 4 separate launches (the 2048x32
+            //  alpha/beta matmuls alone are occupancy-starved: 32 warps/GPU).
+            if (L.proj_fused && S.dcomb) {
+                launch_mv_b(L.proj, L.qkv_k, dim, L.proj_out, pnxb, S.dcomb, P, st);
+                k_proj_scatter<<<((size_t)P*L.proj_out+255)/256,256,0,st>>>(
+                    S.dcomb, P, L.proj_out, pdqkv, L.qo, pdar, pdbr, L.nv, pdz, L.v_dim);
+            } else {
+                launch_mv_b(L.qkv, L.qkv_k, dim, L.qo, pnxb, pdqkv, P, st);
+                launch_mv_b(L.al, L.al_k, dim, L.nv, pnxb, pdar, P, st);
+                launch_mv_b(L.be, L.be_k, dim, L.nv, pnxb, pdbr, P, st);
+                launch_mv_b(L.ga, L.ga_k, dim, L.v_dim, pnxb, pdz, P, st);
+            }
             size_t shmem=(size_t)(4*L.khd+2*L.vhd)*4;
             k_dnet_conv_chunk<<<(L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.conv, pdcq, L.qo, L.kernel, P);
             k_dnet_gates_b<<<((size_t)P*L.nv+255)/256,256,0,st>>>(pdar, pdbr, L.aw, L.dtw, pdg, pdb, L.nv, P);
