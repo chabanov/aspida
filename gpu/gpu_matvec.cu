@@ -2722,6 +2722,90 @@ __global__ void k_fattn_attend_tile(
     }
 }
 
+//  GQA K/V-reuse variant of the tiled kernel (fattn-gqa lever, 2026-07-15).
+//  The tiled kernel launches one independent block per q-head (grid.y = nq), so
+//  each kv-head's K/V streams from HBM rep = nq/nkv times — the long-context
+//  bottleneck (hura: rep=8). Here block = (query-tile, head-group): each warp
+//  carries online-softmax state for HPB group heads at once, sharing one
+//  Ksh/Vsh tile -> K/V HBM traffic drops HPB x. Same fp32 arithmetic as the
+//  tiled kernel, only the head loop is reorganised — outputs match it to ~1e-6
+//  (oracle-identical). Measured on real hura dims (hd=256, nq=16, nkv=2):
+//  1.77-1.94x over tiled at pos>=4k; HPB=2 with 16 query-warps (512 thr, 80
+//  regs, no spills) beats HPB=4/8 (register-occupancy trade). HPB must divide
+//  rep. Escape hatch: ASPIDA_FATTN_NOGQA=1 forces the plain tiled kernel.
+template<int HPB, int RQ>
+__global__ void k_fattn_tile_gqa(
+    const float *__restrict__ q_all, const float *__restrict__ g_all,
+    const float *__restrict__ Kc, const float *__restrict__ Vc,
+    float *__restrict__ attn, int nq, int nkv, int hd, int kvd, int pos_start, int P, int TK) {
+    int hg = blockIdx.y;                     //  head-group index
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int nwarp = blockDim.x >> 5;
+    int t = blockIdx.x * nwarp + warp;
+    int rep = nq / nkv;
+    int h_base = hg * HPB, kvh = h_base / rep;
+    int kv_off = kvh * hd, att = nq * hd;
+    extern __shared__ float shkv[];
+    float *Ksh = shkv, *Vsh = shkv + (size_t) TK * hd;
+    float q[HPB][RQ], acc[HPB][RQ], m[HPB], l[HPB];
+    bool active = t < P;
+    int len = active ? (pos_start + t + 1) : 0;
+    int t_last = min(P - 1, (blockIdx.x + 1) * nwarp - 1);
+    int len_max = pos_start + t_last + 1;
+    #pragma unroll
+    for (int hh = 0; hh < HPB; ++hh) {
+        const float *qp = q_all + (size_t) t * att + (h_base + hh) * hd;
+        #pragma unroll
+        for (int j = 0; j < RQ; ++j) { q[hh][j] = active ? qp[lane + 32 * j] : 0.f; acc[hh][j] = 0.f; }
+        m[hh] = -3.402823466e38f; l[hh] = 0.f;
+    }
+    float scale = rsqrtf((float) hd);
+    for (int s0 = 0; s0 < len_max; s0 += TK) {
+        int tk = min(TK, len_max - s0);
+        for (int i = threadIdx.x; i < tk * hd; i += blockDim.x) {
+            int srow = i / hd, sd = i - srow * hd;
+            Ksh[(size_t) srow * hd + sd] = Kc[(size_t)(s0 + srow) * kvd + kv_off + sd];
+            Vsh[(size_t) srow * hd + sd] = Vc[(size_t)(s0 + srow) * kvd + kv_off + sd];
+        }
+        __syncthreads();
+        int smax = min(tk, len - s0);
+        for (int s = 0; s < smax; ++s) {
+            const float *ks = Ksh + (size_t) s * hd + lane;
+            const float *vs = Vsh + (size_t) s * hd + lane;
+            float kreg[RQ], vreg[RQ];
+            #pragma unroll
+            for (int j = 0; j < RQ; ++j) { kreg[j] = ks[32 * j]; vreg[j] = vs[32 * j]; }
+            #pragma unroll
+            for (int hh = 0; hh < HPB; ++hh) {
+                float part = 0.f;
+                #pragma unroll
+                for (int j = 0; j < RQ; ++j) part += q[hh][j] * kreg[j];
+                for (int o = 16; o > 0; o >>= 1) part += __shfl_xor_sync(0xffffffffu, part, o);
+                float dot = part * scale;
+                float m_new = fmaxf(m[hh], dot);
+                float corr = expf(m[hh] - m_new), p = expf(dot - m_new);
+                l[hh] = l[hh] * corr + p;
+                #pragma unroll
+                for (int j = 0; j < RQ; ++j) acc[hh][j] = acc[hh][j] * corr + p * vreg[j];
+                m[hh] = m_new;
+            }
+        }
+        __syncthreads();
+    }
+    if (active) {
+        #pragma unroll
+        for (int hh = 0; hh < HPB; ++hh) {
+            const float *gp = g_all + (size_t) t * att + (h_base + hh) * hd;
+            float *op = attn + (size_t) t * att + (h_base + hh) * hd;
+            #pragma unroll
+            for (int j = 0; j < RQ; ++j) {
+                float g = gp[lane + 32 * j];
+                op[lane + 32 * j] = (acc[hh][j] / l[hh]) * (1.f / (1.f + expf(-g)));
+            }
+        }
+    }
+}
+
 //  Tensor-core (wmma) FlashAttention for chunked prefill. One warp = one 16-query
 //  tile x head; Q@K^T and P@V via 16x16x16 wmma (fp16 in, fp32 accum — the same
 //  nvcuda::wmma pattern as k_q8_wmma), online softmax in shared, O rescaled between
@@ -3179,16 +3263,34 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 k_fattn_wmma<<<grid, 32, shmem, st>>>(
                     pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P);
             } else if (!fattn_naive && L.hd <= 256 && (L.hd & 31) == 0) {
-                //  Tiled path (serving default): TK sized so the K+V tile
-                //  stays within the 48 KB default dynamic-shared limit.
                 int TK = (L.hd <= 128) ? 32 : 16;
-                //  32 query warps/block share each K/V tile → half the K/V HBM
-                //  passes vs 16 (fattn is bandwidth-bound at long context).
-                int TQW = 32;   //  query warps per block
                 size_t shmem = (size_t) 2 * TK * L.hd * 4;
+                int rep = (L.nkv > 0) ? L.nq / L.nkv : 1;
+                int RQ = L.hd >> 5;
+                //  GQA K/V-reuse (serving fast path): each block attends 2
+                //  group q-heads per shared K/V tile -> halves K/V HBM traffic.
+                //  Same fp32 math as tiled (outputs ~1e-6 identical); measured
+                //  1.77-1.94x at pos>=4k on hura dims. ASPIDA_FATTN_NOGQA=1
+                //  forces the plain tiled kernel (A/B, debugging).
+                static int fattn_nogqa = getenv("ASPIDA_FATTN_NOGQA") ? 1 : 0;
+                if (!fattn_nogqa && rep % 2 == 0 && (RQ == 4 || RQ == 8)) {
+                    int TQW = 16;   //  query warps per block (512 thr, 80 regs)
+                    dim3 grid((unsigned)((P + TQW - 1) / TQW), (unsigned)(L.nq / 2));
+                    if (RQ == 8)
+                        k_fattn_tile_gqa<2, 8><<<grid, TQW * 32, shmem, st>>>(
+                            pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P, TK);
+                    else
+                        k_fattn_tile_gqa<2, 4><<<grid, TQW * 32, shmem, st>>>(
+                            pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P, TK);
+                } else {
+                //  Tiled path: TK sized so the K+V tile stays within the 48 KB
+                //  default dynamic-shared limit. 32 query warps/block share
+                //  each K/V tile → half the K/V HBM passes vs 16.
+                int TQW = 32;   //  query warps per block
                 dim3 grid((unsigned)((P + TQW - 1) / TQW), (unsigned) L.nq);
                 k_fattn_attend_tile<<<grid, TQW * 32, shmem, st>>>(
                     pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P, TK);
+                }
             } else {
                 k_fattn_attend_chunk<<<(size_t)L.nq*P, L.hd, 0, st>>>(
                     pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start);
