@@ -134,6 +134,22 @@ package body LLM_Chat_Parser is
       return To_String (Acc);
    end Quote;
 
+   --  Strip leading/trailing whitespace from a parameter key or value. The
+   --  model routinely writes `<parameter=limit>\n100\n</parameter>` (value on
+   --  its own line), and without this the value came through as "\n100" — a
+   --  string the downstream JSON/int coercion rejects, so the tool call errored
+   --  ("limit":"\n100"). Interior whitespace is preserved.
+   function Trim_WS (S : String) return String is
+      function Is_WS (C : Character) return Boolean is
+        (C = ' ' or else C = ASCII.LF or else C = ASCII.CR or else C = ASCII.HT);
+      F : Integer := S'First;
+      L : Integer := S'Last;
+   begin
+      while F <= L and then Is_WS (S (F)) loop F := F + 1; end loop;
+      while L >= F and then Is_WS (S (L)) loop L := L - 1; end loop;
+      return S (F .. L);
+   end Trim_WS;
+
    --  Reconstruct a compact JSON object {"key":...,"key2":...} from the
    --  raw <parameter=KEY>VALUE</parameter><parameter=KEY2>VALUE2</parameter>
    --  pairs the model writes inside a tool block. Pairs are emitted in the
@@ -181,8 +197,8 @@ package body LLM_Chat_Parser is
                --  hangs wedges the whole server (2026-07-14).
                exit when VES = 0;
                declare
-                  Key : constant String := Blk (KS .. KE - 1);
-                  Val : constant String := Blk (Tail .. VES - 1);
+                  Key : constant String := Trim_WS (Blk (KS .. KE - 1));
+                  Val : constant String := Trim_WS (Blk (Tail .. VES - 1));
                begin
                   if not First then
                      Result := Result & ",";
