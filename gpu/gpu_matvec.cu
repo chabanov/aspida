@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -2387,20 +2388,20 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
 //  resident state, so it overlaps the batch Driver's concurrent decode forwards
 //  (read-only shared weights) without a lock.
 //===========================================================================
-#define PCH 512  // chunk size. The Q8 matmuls use the tensor-core k_q8_wmma
+#define PCH 1024 // chunk size. The Q8 matmuls use the tensor-core k_q8_wmma
                  // (no MAXB cap; weight-stationary, per-token cost falls with
                  // the chunk), so a big chunk amortises the weight read. Non-Q8
                  // kinds are sub-batched by MAXB inside launch_mv_b.
                  //
-                 // 256 -> 512 (moe-lever, 2026-07-15): at P=256 essentially ALL
-                 // 256 experts fire every chunk (bucket max 17, 255/256 active),
-                 // so the ~570MB/layer gate+up weight stream is a FIXED cost the
-                 // chunk amortises: measured MoE per-256-tok-equivalent 155.8ms
-                 // (P=256) -> 86ms (P=512) -> 57.7ms (P=1024). 512 chosen: the
-                 // per-lane prefill scratch scales with PCH x PMAXLANE(8) lanes
-                 // (+~0.9GB at 512, fits the ~2GB post-model headroom; 1024 =
-                 // +~2.6GB, likely OOM at serve time). MUST match PCHUNK in
-                 // src/llm/llm_qwen.adb (the Ada side sends the chunks).
+                 // 256 -> 512 -> 1024 (moe-lever + VRAM audit, 2026-07-15): at
+                 // P=256 essentially ALL 256 experts fire every chunk, so the
+                 // ~570MB/layer gate+up weight stream is a FIXED cost the chunk
+                 // amortises: MoE per-256-tok-equivalent 155.8ms (P=256) ->
+                 // 86ms (512) -> 57.7ms (1024). 1024 is VRAM-safe ONLY because
+                 // prefill scratch is a bounded lazy pool (ASPIDA_PREFILL_SETS,
+                 // default 4): 4 sets @1024 = 1.7GB = same footprint as the old
+                 // eager 8 x 512. MUST match PCHUNK in src/llm/llm_qwen.adb
+                 // (the Ada side sends the chunks).
 
 // Delta-net causal depthwise conv over a chunk: thread owns channel c and walks
 // t = 0..P-1, maintaining the sliding hist window exactly as k_dnet_conv does.
@@ -2976,38 +2977,65 @@ struct PScr {
     cudaStream_t stream;
 };
 static PScr g_ps[PMAXLANE];
-static int pch_inited=0;
-
-static void chain_alloc_p(void) {
-    if (pch_inited) return;
-    int dim=g_ch_dim; size_t Pd=(size_t)PCH;
-    for (int L=0; L<PMAXLANE; ++L) {
-        PScr &S = g_ps[L];
-        cudaMalloc(&S.Hb, Pd*dim*4); cudaMalloc(&S.nxb, Pd*dim*4); cudaMalloc(&S.aob, Pd*dim*4);
-        cudaMalloc(&S.dlog, (size_t)g_ch_vocab*4);
-        if (g_mx_qo){ cudaMalloc(&S.dqkv, Pd*g_mx_qo*4); cudaMalloc(&S.dcq, Pd*g_mx_qo*4); }
-        if (g_mx_nv){ cudaMalloc(&S.dar, Pd*g_mx_nv*4); cudaMalloc(&S.dbr, Pd*g_mx_nv*4);
-                      cudaMalloc(&S.dg, Pd*g_mx_nv*4); cudaMalloc(&S.db, Pd*g_mx_nv*4); }
-        if (g_mx_vd){ cudaMalloc(&S.dz, Pd*g_mx_vd*4); cudaMalloc(&S.dor, Pd*g_mx_vd*4);
-                      cudaMalloc(&S.dosh, Pd*g_mx_vd*4); }
-        if (g_mx_qo){ cudaMalloc(&S.dkn, Pd*g_mx_qo*4); cudaMalloc(&S.dqn, Pd*g_mx_qo*4); }
-        if (g_mx_qo) cudaMalloc(&S.dcomb, Pd*(size_t)(g_mx_qo + 2*g_mx_nv + g_mx_vd)*4);
-        if (g_mx_qgd) cudaMalloc(&S.dqg, Pd*g_mx_qgd*4);
-        if (g_mx_kvd){ cudaMalloc(&S.dkt, Pd*g_mx_kvd*4); cudaMalloc(&S.dvt, Pd*g_mx_kvd*4); }
-        if (g_mx_att){ cudaMalloc(&S.dqa, Pd*g_mx_att*4); cudaMalloc(&S.dga, Pd*g_mx_att*4);
-                       cudaMalloc(&S.datt, Pd*g_mx_att*4); }
-        if (g_mx_nexp) cudaMalloc(&S.drl, Pd*g_mx_nexp*4);
-        if (g_mx_hbuf) cudaMalloc(&S.dhb, Pd*g_mx_hbuf*4);
-        cudaMalloc(&S.droute, Pd*sizeof(MoeRoute));
-        cudaMalloc(&S.rows, Pd*4);
-        if (g_mx_nexp){ cudaMalloc(&S.mg_pos, (size_t)g_mx_nexp*Pd*4);
-                        cudaMalloc(&S.mg_k, (size_t)g_mx_nexp*Pd*4);
-                        cudaMalloc(&S.mg_cnt, (size_t)g_mx_nexp*4); }
-        cudaMalloc(&S.dmoe, Pd*(size_t)(MOE_MAXK+1)*dim*4);
-        cudaStreamCreateWithPriority(&S.stream, cudaStreamDefault, aspida_stream_prio(0));
-    }
-    pch_inited=1;
+//  Prefill scratch is a bounded LAZY POOL, not eager per-lane arrays (VRAM
+//  audit 2026-07-15): per-set scratch is 436,040 B x PCH + ~1 MB fixed, so
+//  eager 8 x PCH=1024 would need 3.4 GB — OOM in the ~2.5 GB post-model
+//  budget. A pool of ASPIDA_PREFILL_SETS sets (default 4, clamp 1..8),
+//  lazily allocated and blocking-acquired, caps the peak: 4 sets @1024 =
+//  1.7 GB = the SAME footprint as the old 8 x 512. Prefill is already
+//  GPU-saturating, so capping concurrent prefills costs ~no wall-clock;
+//  the (N+1)th prefill waits a few ms instead of OOMing. Decode buffers
+//  (chain_alloc_b) are untouched.
+static bool g_prefill_oom = false;
+static inline void ckmalloc(void **p, size_t n, const char *what) {
+    cudaError_t e = cudaMalloc(p, n);
+    if (e != cudaSuccess) { *p = nullptr; g_prefill_oom = true;
+        fprintf(stderr, "[PREFILL] cudaMalloc(%s,%zuB) FAILED: %s\n", what, n, cudaGetErrorString(e)); }
 }
+
+//  Allocate ONE prefill scratch set (buffers + stream). ckmalloc flags OOM
+//  instead of leaving kernels to dereference null pointers.
+static void alloc_one(PScr &S) {
+    int dim=g_ch_dim; size_t Pd=(size_t)PCH;
+    ckmalloc((void**)&S.Hb,Pd*dim*4,"Hb"); ckmalloc((void**)&S.nxb,Pd*dim*4,"nxb"); ckmalloc((void**)&S.aob,Pd*dim*4,"aob");
+    ckmalloc((void**)&S.dlog,(size_t)g_ch_vocab*4,"dlog");
+    if (g_mx_qo){ ckmalloc((void**)&S.dqkv,Pd*g_mx_qo*4,"dqkv"); ckmalloc((void**)&S.dcq,Pd*g_mx_qo*4,"dcq"); }
+    if (g_mx_nv){ ckmalloc((void**)&S.dar,Pd*g_mx_nv*4,"dar"); ckmalloc((void**)&S.dbr,Pd*g_mx_nv*4,"dbr");
+                  ckmalloc((void**)&S.dg,Pd*g_mx_nv*4,"dg"); ckmalloc((void**)&S.db,Pd*g_mx_nv*4,"db"); }
+    if (g_mx_vd){ ckmalloc((void**)&S.dz,Pd*g_mx_vd*4,"dz"); ckmalloc((void**)&S.dor,Pd*g_mx_vd*4,"dor");
+                  ckmalloc((void**)&S.dosh,Pd*g_mx_vd*4,"dosh"); }
+    if (g_mx_qo){ ckmalloc((void**)&S.dkn,Pd*g_mx_qo*4,"dkn"); ckmalloc((void**)&S.dqn,Pd*g_mx_qo*4,"dqn"); }
+    if (g_mx_qo) ckmalloc((void**)&S.dcomb,Pd*(size_t)(g_mx_qo + 2*g_mx_nv + g_mx_vd)*4,"dcomb");
+    if (g_mx_qgd) ckmalloc((void**)&S.dqg,Pd*g_mx_qgd*4,"dqg");
+    if (g_mx_kvd){ ckmalloc((void**)&S.dkt,Pd*g_mx_kvd*4,"dkt"); ckmalloc((void**)&S.dvt,Pd*g_mx_kvd*4,"dvt"); }
+    if (g_mx_att){ ckmalloc((void**)&S.dqa,Pd*g_mx_att*4,"dqa"); ckmalloc((void**)&S.dga,Pd*g_mx_att*4,"dga");
+                   ckmalloc((void**)&S.datt,Pd*g_mx_att*4,"datt"); }
+    if (g_mx_nexp) ckmalloc((void**)&S.drl,Pd*g_mx_nexp*4,"drl");
+    if (g_mx_hbuf) ckmalloc((void**)&S.dhb,Pd*g_mx_hbuf*4,"dhb");
+    ckmalloc((void**)&S.droute,Pd*sizeof(MoeRoute),"droute");
+    ckmalloc((void**)&S.rows,Pd*4,"rows");
+    if (g_mx_nexp){ ckmalloc((void**)&S.mg_pos,(size_t)g_mx_nexp*Pd*4,"mg_pos");
+                    ckmalloc((void**)&S.mg_k,(size_t)g_mx_nexp*Pd*4,"mg_k");
+                    ckmalloc((void**)&S.mg_cnt,(size_t)g_mx_nexp*4,"mg_cnt"); }
+    ckmalloc((void**)&S.dmoe,Pd*(size_t)(MOE_MAXK+1)*dim*4,"dmoe");
+    cudaStreamCreateWithPriority(&S.stream, cudaStreamDefault, aspida_stream_prio(0));
+}
+static bool g_ps_inited[PMAXLANE]={false}, g_ps_busy[PMAXLANE]={false};
+static std::mutex g_ps_mtx; static std::condition_variable g_ps_cv;
+static int g_prefill_sets=-1;
+static int prefill_sets(){ if(g_prefill_sets<0){ const char*e=getenv("ASPIDA_PREFILL_SETS");
+    int n=e?atoi(e):4; if(n<1)n=1; if(n>PMAXLANE)n=PMAXLANE; g_prefill_sets=n; } return g_prefill_sets; }
+//  Blocks until one of prefill_sets() sets is free; lazily allocs on first
+//  use. Returns slot idx, or -1 on OOM (slot released).
+static int pscr_acquire(){
+    int n=prefill_sets(); std::unique_lock<std::mutex> lk(g_ps_mtx); int idx=-1;
+    g_ps_cv.wait(lk,[&]{ for(int i=0;i<n;++i) if(!g_ps_busy[i]){ idx=i; return true; } return false; });
+    g_ps_busy[idx]=true; bool need=!g_ps_inited[idx]; g_ps_inited[idx]=true; lk.unlock();
+    if(need) alloc_one(g_ps[idx]);
+    if(g_prefill_oom){ std::lock_guard<std::mutex> l2(g_ps_mtx); g_ps_busy[idx]=false; g_ps_cv.notify_one(); return -1; }
+    return idx;
+}
+static void pscr_release(int idx){ { std::lock_guard<std::mutex> lk(g_ps_mtx); g_ps_busy[idx]=false; } g_ps_cv.notify_one(); }
 
 // Expert-grouped MoE for chunked prefill. The per-position kernel k_moe_gu_p_b
 // re-reads each expert's weight once PER position that routed to it; at a large
@@ -3175,9 +3203,10 @@ __global__ void k_moe_combine(const float *__restrict__ d_buf, const MoeRoute *_
 extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int pos_start,
                                          const int *handles, float *last_logits) {
     if (P < 1) return; if (P > PCH) P = PCH;
-    if (lane < 0) lane = 0; if (lane >= PMAXLANE) lane = PMAXLANE - 1;
-    chain_alloc_p();
-    PScr &S = g_ps[lane];
+    (void) lane;   //  kept for ABI; the pool assigns the scratch set now
+    int slot = pscr_acquire();
+    if (slot < 0) { fprintf(stderr, "[PREFILL] scratch OOM — chunk aborted\n"); return; }
+    PScr &S = g_ps[slot];
     float *pHb=S.Hb,*pnxb=S.nxb,*paob=S.aob,*pdqkv=S.dqkv,*pdcq=S.dcq,*pdar=S.dar,
           *pdbr=S.dbr,*pdz=S.dz,*pdg=S.dg,*pdb=S.db,*pdor=S.dor,*pdqg=S.dqg,
           *pdkt=S.dkt,*pdvt=S.dvt,*pdqa=S.dqa,*pdga=S.dga,*pdatt=S.datt,*pdrl=S.drl,
@@ -3366,4 +3395,5 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     launch_mv_st(g_ch_lm, g_ch_lm_k, dim, g_ch_vocab, pnxb, pdlog, st);
     cudaMemcpyAsync(last_logits, pdlog, (size_t)g_ch_vocab*4, cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
+    pscr_release(slot);
 }
