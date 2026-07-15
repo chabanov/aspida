@@ -311,10 +311,10 @@ struct Shape{const char*name;int in;int out;int B;};
 
 int main(){
     std::mt19937 rng(7);
-    Shape shapes[]={ {"dproj in2048->out8192 B512",2048,8192,512},
-                     {"qkv   in2048->out2048 B256",2048,2048,256},
-                     {"lmodd in2048->out8000 B512(tail)",2048,8000,512},
-                     {"moe   in2048->out512  B512",2048,512,512} };
+    Shape shapes[]={ {"qkv    out8192 B1024 -> reg4x4 2048blk",2048,8192,1024},
+                     {"o_proj out2048 B1024 -> reg4x4 512blk (SUSPECT)",2048,2048,1024},
+                     {"dkt    out512  B1024 -> reg2x2 512blk (SUSPECT)",2048,512,1024},
+                     {"dcomb  out12352 B1024-> reg4x4 3088blk",2048,12352,1024} };
     size_t fb,tb; cudaMemGetInfo(&fb,&tb); printf("VRAM free=%zuMB\n",fb/1048576);
     cudaStream_t st; CK(cudaStreamCreate(&st));
     cudaEvent_t e0,e1; cudaEventCreate(&e0); cudaEventCreate(&e1);

@@ -2282,9 +2282,13 @@ static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
             dim3 grid(out / 64, (B + 63) / 64);
             k_q8_reg<4, 4><<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
         } else if (out % 32 == 0 && B >= 32
-                   && (size_t)((out + 31) / 32) * ((B + 31) / 32) >= 512) {
-            //  Medium tier: 32x32 warp tiles (1.71x at the big shapes, needs
-            //  a quarter the blocks of reg4x4 to fill the GPU).
+                   && (size_t)((out + 31) / 32) * ((B + 31) / 32) >= 2048) {
+            //  Medium tier: 32x32 warp tiles (1.71x at the big shapes). Block
+            //  threshold 2048, NOT 512: the 32x32 tile does a quarter the
+            //  work/block of reg4x4, so at ~512 blocks it LOSES (measured
+            //  0.58x at dkt/dvt out=512 B=1024) — those shapes fall through
+            //  to k_q8_wmma instead. reg4x4's 512 floor is fine (verified
+            //  1.69x at o_proj's exactly-512 blocks).
             dim3 grid(out / 32, (B + 31) / 32);
             k_q8_reg<2, 2><<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
         } else if (B >= 16) {
