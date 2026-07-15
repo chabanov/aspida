@@ -188,8 +188,8 @@ int main(int argc, char** argv){
     if(argc>=5){hd=atoi(argv[1]);nq=atoi(argv[2]);nkv=atoi(argv[3]);P=atoi(argv[4]);}
     int kvd=nkv*hd,att=nq*hd,rep=nq/nkv,RQ=hd/32;
     printf("== dims hd=%d nq=%d nkv=%d P=%d (rep=%d RQ=%d) ==\n",hd,nq,nkv,P,rep,RQ);
-    if(RQ!=8){printf("this bench specialized for hd=256 (RQ=8)\n");return 1;}
-    int TK=16, TQW=32;
+    if(RQ!=8&&RQ!=4){printf("this bench supports RQ=4 (hd=128) or RQ=8 (hd=256)\n");return 1;}
+    int TK=(hd<=128)?32:16, TQW=32;
     size_t shm=(size_t)2*TK*hd*4;
     std::mt19937 rng(3);std::normal_distribution<float> nd(0,1);
     int positions[]={0,4096,12288,25344};
@@ -214,9 +214,15 @@ int main(int argc, char** argv){
             dim3 grid((P+nw-1)/nw, r.hpb? nq/r.hpb : nq);
             auto launch=[&](float*o){
                 if(r.hpb==0) k_fattn_attend_tile<<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
-                else if(r.hpb==2) k_fattn_tile_gqa<2,8><<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
-                else if(r.hpb==4) k_fattn_tile_gqa<4,8><<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
-                else k_fattn_tile_gqa<8,8><<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
+                else if(RQ==8){
+                    if(r.hpb==2) k_fattn_tile_gqa<2,8><<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
+                    else if(r.hpb==4) k_fattn_tile_gqa<4,8><<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
+                    else k_fattn_tile_gqa<8,8><<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
+                } else { // RQ==4 (hd=128) — mirrors the prod <2,4> instantiation
+                    if(r.hpb==2) k_fattn_tile_gqa<2,4><<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
+                    else if(r.hpb==4) k_fattn_tile_gqa<4,4><<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
+                    else k_fattn_tile_gqa<8,4><<<grid,nw*32,shm>>>(dqa,dga,dK,dV,o,nq,nkv,hd,kvd,ps,P,TK);
+                }
             };
             CK(cudaMemset(dw,0,(size_t)P*att*4));
             launch(dw);CK(cudaDeviceSynchronize());

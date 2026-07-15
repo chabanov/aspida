@@ -3283,7 +3283,11 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 //  1.77-1.94x at pos>=4k on hura dims. ASPIDA_FATTN_NOGQA=1
                 //  forces the plain tiled kernel (A/B, debugging).
                 static int fattn_nogqa = getenv("ASPIDA_FATTN_NOGQA") ? 1 : 0;
-                if (!fattn_nogqa && rep % 2 == 0 && (RQ == 4 || RQ == 8)) {
+                //  nq%2 guard: for any nq that IS a multiple of nkv, even rep
+                //  already implies even nq; this only catches malformed GGUFs
+                //  (nq not a multiple of nkv) which would otherwise drop the
+                //  last head — they fall back to tiled instead.
+                if (!fattn_nogqa && rep % 2 == 0 && L.nq % 2 == 0 && (RQ == 4 || RQ == 8)) {
                     int TQW = 16;   //  query warps per block (512 thr, 80 regs)
                     dim3 grid((unsigned)((P + TQW - 1) / TQW), (unsigned)(L.nq / 2));
                     if (RQ == 8)
