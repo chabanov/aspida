@@ -2898,6 +2898,119 @@ __global__ void k_fattn_tile_gqa(
     }
 }
 
+//  Row of accumulator element e for this lane (sm_70+ m16n16k16 f32 layout):
+//    row = (lane>>2) + ((e & 2) ? 8 : 0)   (probe-verified on the an NVIDIA GPU)
+__device__ __forceinline__ int accrow(int lane, int e) { return (lane >> 2) + ((e & 2) ? 8 : 0); }
+
+//  Occupancy-aware WMMA attend (fattn-lever wmma3, 2026-07-15). W query-warps
+//  per block share ONE fp16 K/V tile; each warp owns a 16-query tile for head
+//  blockIdx.y; O lives in 16 accumulator FRAGMENTS rescaled in-place per
+//  key-tile (no shared roundtrip — the epilogue that killed wmma v1). Reads
+//  the EXISTING fp32 fs.K/fs.V (fp16 convert in the tile load): no cache-
+//  format, prep or snapshot changes. 95232 B shared (needs the >48KB opt-in),
+//  186 regs, 1 block/SM = 8 warps/SM — the occupancy v1 lacked (2 warps/SM).
+//  Measured vs GQA-2 at hd=256: pos12k 1.66x, pos25k 1.47x, pos37k 1.53x;
+//  rel err 3.8e-4 (fp16 QK/PV + __expf) — NOT bit-exact, so this path is
+//  length-gated to long chunks and must pass the eval-hura gate like the
+//  tiled path did. Requires hd==256. ASPIDA_FATTN_NOW3=1 disables.
+//  Two traps fixed during bring-up (recorded): lanes>=16 writing Psh out of
+//  bounds, and a divergent __syncthreads caused by a PER-WARP key bound —
+//  the loop bound below must be block-uniform.
+template<int W>
+__global__ void k_fattn_wmma3(
+    const float *__restrict__ q_all, const float *__restrict__ g_all,
+    const float *__restrict__ Kc, const float *__restrict__ Vc,
+    float *__restrict__ attn, int nq, int nkv, int hd, int kvd, int pos_start, int P) {
+    const int HT = 16;                    //  hd/16 (hd=256)
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int h = blockIdx.y, qtile = blockIdx.x * W + warp, q0 = qtile * 16;
+    int rep = nq / nkv, kvh = h / rep, kv_off = kvh * hd, att = nq * hd;
+    extern __shared__ char w3smem[];
+    half *Ksh = (half *) w3smem;                     //  [16*hd] block-shared
+    half *Vsh = Ksh + 16 * hd;                       //  [16*hd] block-shared
+    half *Qb  = Vsh + 16 * hd;                       //  [W][16*hd]
+    float *Sb = (float *) (Qb + (size_t) W * 16 * hd);   //  [W][16*16]
+    half  *Pb = (half *) (Sb + (size_t) W * 16 * 16);    //  [W][16*16]
+    float *Cb = (float *) (Pb + (size_t) W * 16 * 16);   //  [W][16] corr
+    float *Lb = Cb + (size_t) W * 16;                    //  [W][16] l
+    half *Qsh = Qb + (size_t) warp * 16 * hd;
+    float *Ssh = Sb + (size_t) warp * 16 * 16;
+    half *Psh = Pb + (size_t) warp * 16 * 16;
+    float *Csh = Cb + (size_t) warp * 16;
+    float *Lsh = Lb + (size_t) warp * 16;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> O[HT];
+    #pragma unroll
+    for (int n = 0; n < HT; ++n) nvcuda::wmma::fill_fragment(O[n], 0.f);
+    for (int i = lane; i < 16 * hd; i += 32) { int r = i / hd, d = i % hd;
+        Qsh[i] = (q0 + r < P) ? __float2half(q_all[(size_t)(q0 + r) * att + h * hd + d]) : __float2half(0.f); }
+    float m = -3.402823466e38f, l = 0.f;         //  per-row (lane<16 owns row=lane)
+    float scale = rsqrtf((float) hd);
+    //  Block-UNIFORM key bound: every warp must run the SAME number of key-
+    //  tiles or the __syncthreads below diverges (warps have different q0).
+    //  Exhausted warps see all-masked keys (corr=1, p=0 -> O unchanged).
+    int qlast_blk = min(P - 1, (int)((blockIdx.x + 1) * W * 16 - 1));
+    int len_max = pos_start + qlast_blk + 1;
+    __syncthreads();
+    for (int k0 = 0; k0 < len_max; k0 += 16) {
+        int kn = min(16, len_max - k0);
+        for (int i = threadIdx.x; i < 16 * hd; i += blockDim.x) { int r = i / hd, d = i % hd;
+            Ksh[i] = (r < kn) ? __float2half(Kc[(size_t)(k0 + r) * kvd + kv_off + d]) : __float2half(0.f);
+            Vsh[i] = (r < kn) ? __float2half(Vc[(size_t)(k0 + r) * kvd + kv_off + d]) : __float2half(0.f); }
+        __syncthreads();
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> Sf;
+        nvcuda::wmma::fill_fragment(Sf, 0.f);
+        #pragma unroll
+        for (int kt = 0; kt < HT; ++kt) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> af;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::col_major> bf;
+            nvcuda::wmma::load_matrix_sync(af, Qsh + kt * 16, hd);
+            nvcuda::wmma::load_matrix_sync(bf, Ksh + kt * 16, hd);   //  col_major => K^T
+            nvcuda::wmma::mma_sync(Sf, af, bf, Sf);
+        }
+        nvcuda::wmma::store_matrix_sync(Ssh, Sf, 16, nvcuda::wmma::mem_row_major);
+        __syncwarp();
+        if (lane < 16) {
+            int qpos = pos_start + q0 + lane; float rmax = m;
+            float s[16];
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) { float sv = (k < kn && (k0 + k) <= qpos) ? Ssh[lane * 16 + k] * scale : -3.402823466e38f; s[k] = sv; rmax = fmaxf(rmax, sv); }
+            float m_new = rmax; float corr = (m > -3.0e38f) ? __expf(m - m_new) : 0.f;
+            float lnew = l * corr;
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) { float p = (s[k] > -3.0e38f) ? __expf(s[k] - m_new) : 0.f; Psh[lane * 16 + k] = __float2half(p); lnew += p; }
+            m = (m_new > -3.0e38f) ? m_new : m; l = lnew; Csh[lane] = corr;
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int n = 0; n < HT; ++n) {
+            #pragma unroll
+            for (int e = 0; e < O[n].num_elements; ++e) O[n].x[e] *= Csh[accrow(lane, e)];
+        }
+        #pragma unroll
+        for (int n = 0; n < HT; ++n) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> af;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major> bf;
+            nvcuda::wmma::load_matrix_sync(af, Psh, 16);
+            nvcuda::wmma::load_matrix_sync(bf, Vsh + n * 16, hd);
+            nvcuda::wmma::mma_sync(O[n], af, bf, O[n]);
+        }
+        __syncthreads();      //  before the next K/V tile overwrites Ksh/Vsh
+    }
+    if (lane < 16) Lsh[lane] = l;
+    __syncwarp();
+    #pragma unroll
+    for (int n = 0; n < HT; ++n) {
+        #pragma unroll
+        for (int e = 0; e < O[n].num_elements; ++e) O[n].x[e] /= Lsh[accrow(lane, e)];
+        nvcuda::wmma::store_matrix_sync(Ssh, O[n], 16, nvcuda::wmma::mem_row_major);   //  reuse as scratch
+        __syncwarp();
+        for (int i = lane; i < 16 * 16; i += 32) { int r = i / 16, c = i % 16; int d = n * 16 + c;
+            if (q0 + r < P) { float g = g_all[(size_t)(q0 + r) * att + h * hd + d];
+                attn[(size_t)(q0 + r) * att + h * hd + d] = Ssh[i] * (1.f / (1.f + expf(-g))); } }
+        __syncwarp();
+    }
+}
+
 //  Tensor-core (wmma) FlashAttention for chunked prefill. One warp = one 16-query
 //  tile x head; Q@K^T and P@V via 16x16x16 wmma (fp16 in, fp32 accum — the same
 //  nvcuda::wmma pattern as k_q8_wmma), online softmax in shared, O rescaled between
@@ -3393,11 +3506,32 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 //  1.77-1.94x at pos>=4k on hura dims. ASPIDA_FATTN_NOGQA=1
                 //  forces the plain tiled kernel (A/B, debugging).
                 static int fattn_nogqa = getenv("ASPIDA_FATTN_NOGQA") ? 1 : 0;
+                //  Long-context tensor-core attend (wmma3): a second ~1.5x on
+                //  top of GQA-2 at pos>=12k (measured: 12k 1.66x, 25k 1.47x,
+                //  37k 1.53x; crossover below 12k unmeasured — short chunks
+                //  stay on GQA-2). fp16 QK/PV + __expf, rel err ~3.8e-4 ->
+                //  NOT bit-exact; must pass the eval-hura gate before prod.
+                //  ASPIDA_FATTN_NOW3=1 disables (A/B, debugging).
+                static int fattn_now3 = getenv("ASPIDA_FATTN_NOW3") ? 1 : 0;
                 //  nq%2 guard: for any nq that IS a multiple of nkv, even rep
                 //  already implies even nq; this only catches malformed GGUFs
                 //  (nq not a multiple of nkv) which would otherwise drop the
                 //  last head — they fall back to tiled instead.
-                if (!fattn_nogqa && rep % 2 == 0 && L.nq % 2 == 0 && (RQ == 4 || RQ == 8)) {
+                if (!fattn_now3 && L.hd == 256 && pos_start >= 12288) {
+                    const int W3 = 8;
+                    size_t shm3 = (size_t)(2 * 16 * L.hd + (size_t) W3 * 16 * L.hd) * 2
+                                + (size_t)(W3 * 16 * 16) * 4 + (size_t)(W3 * 16 * 16) * 2
+                                + (size_t)(2 * W3 * 16) * 4;
+                    static int w3_attr_set = 0;
+                    if (!w3_attr_set) {
+                        cudaFuncSetAttribute(k_fattn_wmma3<W3>,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm3);
+                        w3_attr_set = 1;
+                    }
+                    dim3 grid((unsigned)((P + 16 * W3 - 1) / (16 * W3)), (unsigned) L.nq);
+                    k_fattn_wmma3<W3><<<grid, W3 * 32, shm3, st>>>(
+                        pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P);
+                } else if (!fattn_nogqa && rep % 2 == 0 && L.nq % 2 == 0 && (RQ == 4 || RQ == 8)) {
                     int TQW = 16;   //  query warps per block (512 thr, 80 regs)
                     dim3 grid((unsigned)((P + TQW - 1) / TQW), (unsigned)(L.nq / 2));
                     if (RQ == 8)
