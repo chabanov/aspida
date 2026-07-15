@@ -2722,6 +2722,77 @@ __global__ void k_fattn_attend_tile(
     }
 }
 
+//  Tensor-core (wmma) FlashAttention for chunked prefill. One warp = one 16-query
+//  tile x head; Q@K^T and P@V via 16x16x16 wmma (fp16 in, fp32 accum — the same
+//  nvcuda::wmma pattern as k_q8_wmma), online softmax in shared, O rescaled between
+//  key tiles. ~1.6x the tiled kernel at long context (25k: 22 vs 36 ms/chunk),
+//  fp16-precision (rel ~3e-4 vs the naive oracle) — so OPT-IN via ASPIDA_FATTN_WMMA
+//  pending the eval-harness gate, like the tiled path was. Requires (hd % 16)==0.
+//  1 warp/block (~22 KB shared): WQT>1 sharing K/V measured WORSE (occupancy-bound).
+__global__ void k_fattn_wmma(const float *__restrict__ q_all, const float *__restrict__ g_all,
+    const float *__restrict__ Kc, const float *__restrict__ Vc, float *__restrict__ attn,
+    int nq, int nkv, int hd, int kvd, int pos_start, int P) {
+    int qt = blockIdx.x, h = blockIdx.y, lane = threadIdx.x;
+    int rep = nq / nkv, kvh = h / rep, kv_off = kvh * hd, att = nq * hd, HT = hd / 16, q0 = qt * 16;
+    extern __shared__ char smem[];
+    half *Qsh = (half *) smem;                       // [16*hd]
+    half *Ksh = Qsh + 16 * hd, *Vsh = Ksh + 16 * hd, *Psh = Vsh + 16 * hd;   // [16*hd],[16*hd],[16*16]
+    float *Osh = (float *) (Psh + 16 * 16);          // [16*hd]
+    float *Ssh = Osh + 16 * hd;                      // [16*16]
+    __shared__ float m[16], l[16];
+    int qmax = min(16, P - q0);
+    for (int i = lane; i < 16 * hd; i += 32) { int r = i / hd, d = i % hd;
+        Qsh[i] = (q0 + r < P) ? __float2half(q_all[(size_t)(q0 + r) * att + h * hd + d]) : __float2half(0.f);
+        Osh[i] = 0.f; }
+    if (lane < 16) { m[lane] = -3.402823466e38f; l[lane] = 0.f; }
+    __syncwarp();
+    float scale = rsqrtf((float) hd);
+    int len_max = pos_start + q0 + qmax;
+    for (int k0 = 0; k0 < len_max; k0 += 16) {
+        int kn = min(16, len_max - k0);
+        for (int i = lane; i < 16 * hd; i += 32) { int r = i / hd, d = i % hd;
+            Ksh[i] = (r < kn) ? __float2half(Kc[(size_t)(k0 + r) * kvd + kv_off + d]) : __float2half(0.f);
+            Vsh[i] = (r < kn) ? __float2half(Vc[(size_t)(k0 + r) * kvd + kv_off + d]) : __float2half(0.f); }
+        __syncwarp();
+        nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> cf;
+        nvcuda::wmma::fill_fragment(cf, 0.f);
+        for (int kt = 0; kt < HT; ++kt) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> af;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::col_major> bf;
+            nvcuda::wmma::load_matrix_sync(af, Qsh + kt * 16, hd);
+            nvcuda::wmma::load_matrix_sync(bf, Ksh + kt * 16, hd);   // col_major => K^T
+            nvcuda::wmma::mma_sync(cf, af, bf, cf);
+        }
+        nvcuda::wmma::store_matrix_sync(Ssh, cf, 16, nvcuda::wmma::mem_row_major);
+        __syncwarp();
+        if (lane < 16) {
+            if (lane < qmax) {
+                int qpos = pos_start + q0 + lane; float rmax = m[lane]; float s[16];
+                for (int k = 0; k < 16; ++k) { float sv = (k < kn && (k0 + k) <= qpos) ? Ssh[lane * 16 + k] * scale : -3.402823466e38f; s[k] = sv; rmax = fmaxf(rmax, sv); }
+                float corr = expf(m[lane] - rmax), lnew = l[lane] * corr;
+                for (int k = 0; k < 16; ++k) { float p = (s[k] > -3.0e38f) ? expf(s[k] - rmax) : 0.f; Psh[lane * 16 + k] = __float2half(p); lnew += p; }
+                for (int d = 0; d < hd; ++d) Osh[lane * hd + d] *= corr;
+                m[lane] = rmax; l[lane] = lnew;
+            } else for (int k = 0; k < 16; ++k) Psh[lane * 16 + k] = __float2half(0.f);
+        }
+        __syncwarp();
+        for (int n = 0; n < HT; ++n) {
+            nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> of;
+            nvcuda::wmma::load_matrix_sync(of, Osh + n * 16, hd, nvcuda::wmma::mem_row_major);
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> af;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::row_major> bf;
+            nvcuda::wmma::load_matrix_sync(af, Psh, 16);
+            nvcuda::wmma::load_matrix_sync(bf, Vsh + n * 16, hd);
+            nvcuda::wmma::mma_sync(of, af, bf, of);
+            nvcuda::wmma::store_matrix_sync(Osh + n * 16, of, hd, nvcuda::wmma::mem_row_major);
+        }
+        __syncwarp();
+    }
+    for (int i = lane; i < 16 * hd; i += 32) { int r = i / hd, d = i % hd; if (q0 + r < P) {
+        float g = g_all[(size_t)(q0 + r) * att + h * hd + d];
+        attn[(size_t)(q0 + r) * att + h * hd + d] = (Osh[i] / l[r]) * (1.f / (1.f + expf(-g))); } }
+}
+
 // Batched causal attention for a chunk: block = (h, t), threads = hd. Query
 // (head h, chunk-position t) attends over cache 0..pos_start+t with an ONLINE
 // (flash) softmax — no per-head scores scratch, one launch for all nq*P queries
@@ -3064,7 +3135,15 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             //  (aspida 95% == Ollama, faster). ASPIDA_FATTN_NAIVE=1 forces the
             //  bit-exact naive kernel (A/B, debugging).
             static int fattn_naive = getenv("ASPIDA_FATTN_NAIVE") ? 1 : 0;
-            if (!fattn_naive && L.hd <= 256 && (L.hd & 31) == 0) {
+            //  Tensor-core wmma path (opt-in, pending eval gate): ~1.6x tiled at
+            //  long context, fp16-precision. ~22 KB shared, under the 48 KB limit.
+            static int fattn_wmma = getenv("ASPIDA_FATTN_WMMA") ? 1 : 0;
+            if (fattn_wmma && L.hd <= 256 && (L.hd & 15) == 0) {
+                size_t shmem = (size_t)(48 * L.hd + 256) * 2 + (size_t)(16 * L.hd + 256) * 4;
+                dim3 grid((unsigned)((P + 15) / 16), (unsigned) L.nq);
+                k_fattn_wmma<<<grid, 32, shmem, st>>>(
+                    pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P);
+            } else if (!fattn_naive && L.hd <= 256 && (L.hd & 31) == 0) {
                 //  Tiled path (serving default): TK sized so the K+V tile
                 //  stays within the 48 KB default dynamic-shared limit.
                 int TK = (L.hd <= 128) ? 32 : 16;
