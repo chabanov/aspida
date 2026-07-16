@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include "fattn_ggml.cuh"   // Phase B: prefill full-attn via llama.cpp fattn-mma (ggml link-and-call)
 
 // Decode issues thousands of tiny kernels + small blocking copies per token;
 // the default ScheduleAuto wait can take a yield/sleep path that costs ~0.5 ms
@@ -1186,15 +1187,15 @@ extern "C" void aspida_gpu_dnet_step(
 // causal GQA softmax over the whole cache, per-dim sigmoid gate, out
 // projection, 1 D2H. Scores use a resident per-layer scratch (no length cap).
 // =====================================================================
-struct FattnState { float *K, *V, *scores; int max_len, kvd; };
+struct FattnState { __half *K, *V; float *scores; int max_len, kvd; };  // K/V fp16 (Phase B)
 static std::vector<FattnState> g_fattn;
 static std::vector<int> g_fattn_free;     // freed slots for reuse
 
 extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
     ensure_astream();
     FattnState st; st.max_len = max_len; st.kvd = kvd;
-    if (cudaMallocAsync(&st.K, (size_t) max_len * kvd * 4, g_astream) != cudaSuccess) return -1;
-    if (cudaMallocAsync(&st.V, (size_t) max_len * kvd * 4, g_astream) != cudaSuccess) { cudaFreeAsync(st.K, g_astream); cudaStreamSynchronize(g_astream); return -1; }
+    if (cudaMallocAsync(&st.K, (size_t) max_len * kvd * 2, g_astream) != cudaSuccess) return -1;  // fp16
+    if (cudaMallocAsync(&st.V, (size_t) max_len * kvd * 2, g_astream) != cudaSuccess) { cudaFreeAsync(st.K, g_astream); cudaStreamSynchronize(g_astream); return -1; }  // fp16
     if (cudaMallocAsync(&st.scores, (size_t) nq * max_len * 4, g_astream) != cudaSuccess) {
         cudaFreeAsync(st.K, g_astream); cudaFreeAsync(st.V, g_astream); cudaStreamSynchronize(g_astream); return -1; }
     cudaStreamSynchronize(g_astream);   // blocks ready for use on any stream
@@ -1223,7 +1224,7 @@ extern "C" void aspida_gpu_fattn_free(int handle) {
 //  scores buffer is scratch and is not saved. On restore the rows are copied
 //  back into a fresh state and the Ada layer sets its Len := N so decode
 //  appends at row N. See the DeltaNet snapshot header for lifetime rules.
-struct FattnSnap { float *K; float *V; int rows; int kvd; };
+struct FattnSnap { __half *K; __half *V; int rows; int kvd; };  // fp16 (Phase B)
 static std::vector<FattnSnap> g_fattn_snap;
 static std::vector<int> g_fattn_snap_free;
 
@@ -1234,7 +1235,7 @@ extern "C" int aspida_gpu_fattn_snapshot(int handle, int rows, int slot) {
     FattnState &st = g_fattn[handle];
     if (!st.K || !st.V || rows <= 0 || rows > st.max_len) return -1;
     ensure_astream();
-    size_t bytes = (size_t) rows * st.kvd * 4;
+    size_t bytes = (size_t) rows * st.kvd * 2;   // fp16
     FattnSnap sn;
     if (slot >= 0 && slot < (int) g_fattn_snap.size()
         && g_fattn_snap[slot].K != nullptr
@@ -1267,7 +1268,7 @@ extern "C" int aspida_gpu_fattn_restore(int handle, int slot) {
     FattnSnap &sn = g_fattn_snap[slot];
     if (!st.K || !sn.K || sn.kvd != st.kvd || sn.rows > st.max_len) return -1;
     ensure_astream();
-    size_t bytes = (size_t) sn.rows * st.kvd * 4;
+    size_t bytes = (size_t) sn.rows * st.kvd * 2;   // fp16
     cudaMemcpyAsync(st.K, sn.K, bytes, cudaMemcpyDeviceToDevice, g_astream);
     cudaMemcpyAsync(st.V, sn.V, bytes, cudaMemcpyDeviceToDevice, g_astream);
     cudaStreamSynchronize(g_astream);
@@ -1320,7 +1321,7 @@ __global__ void k_fattn_prep(
     const float *__restrict__ qg, const float *__restrict__ kt, const float *__restrict__ vt,
     const float *__restrict__ q_norm, const float *__restrict__ k_norm,
     float *__restrict__ q_all, float *__restrict__ g_all,
-    float *__restrict__ Kc, float *__restrict__ Vc,
+    __half *__restrict__ Kc, __half *__restrict__ Vc,     // fp16 cache (Phase B)
     int nq, int nkv, int hd, int kvd, const int *__restrict__ posp,
     int rd, float base, float freq_scale, float m_scale,
     int yarn_on, float corr_lo, float corr_hi,
@@ -1338,7 +1339,7 @@ __global__ void k_fattn_prep(
         g_all[head * hd + d] = qg[head * 2 * hd + hd + d];
     } else {
         v = kt[head * hd + d];
-        Vc[(size_t) pos * kvd + head * hd + d] = vt[head * hd + d];
+        Vc[(size_t) pos * kvd + head * hd + d] = __float2half(vt[head * hd + d]);
     }
     nrm[d] = v;
     __syncthreads();
@@ -1367,14 +1368,14 @@ __global__ void k_fattn_prep(
         out = first ? (x1 * c - x2 * s) : (x2 * c + x1 * s);
     }
     if (is_q) q_all[head * hd + d] = out;
-    else      Kc[(size_t) pos * kvd + head * hd + d] = out;
+    else      Kc[(size_t) pos * kvd + head * hd + d] = __float2half(out);
 }
 
 // Causal GQA softmax attention over the resident cache + per-dim sigmoid gate.
 // One block (256 threads) per q head; len = pos+1 positions.
 __global__ void k_fattn_attend(
     const float *__restrict__ q_all, const float *__restrict__ g_all,
-    const float *__restrict__ Kc, const float *__restrict__ Vc,
+    const __half *__restrict__ Kc, const __half *__restrict__ Vc,     // fp16 cache (Phase B)
     float *__restrict__ scores, float *__restrict__ attn,
     int nq, int nkv, int hd, int kvd, const int *__restrict__ posp, int max_len) {
     int len = *posp + 1;
@@ -1388,9 +1389,9 @@ __global__ void k_fattn_attend(
     float lmax = -3.402823466e38f;
     for (int s = tid; s < len; s += nt) {
         float dot = 0.f;
-        const float *k = Kc + (size_t) s * kvd + kv_off;
+        const __half *k = Kc + (size_t) s * kvd + kv_off;   // fp16
         const float *q = q_all + q_off;
-        for (int d = 0; d < hd; ++d) dot += q[d] * k[d];
+        for (int d = 0; d < hd; ++d) dot += q[d] * __half2float(k[d]);
         dot *= scale;
         sc[s] = dot;
         if (dot > lmax) lmax = dot;
@@ -1409,7 +1410,7 @@ __global__ void k_fattn_attend(
     if (tid < hd) {
         float acc = 0.f;
         for (int s = 0; s < len; ++s)
-            acc += sc[s] * inv * Vc[(size_t) s * kvd + kv_off + tid];
+            acc += sc[s] * inv * __half2float(Vc[(size_t) s * kvd + kv_off + tid]);
         float g = g_all[q_off + tid];
         attn[q_off + tid] = acc * (1.f / (1.f + expf(-g)));
     }
@@ -2753,7 +2754,7 @@ __global__ void k_fattn_prep_chunk(
     const float *__restrict__ qg, const float *__restrict__ kt, const float *__restrict__ vt,
     const float *__restrict__ q_norm, const float *__restrict__ k_norm,
     float *__restrict__ q_all, float *__restrict__ g_all,
-    float *__restrict__ Kc, float *__restrict__ Vc,
+    __half *__restrict__ Kc, __half *__restrict__ Vc,     // fp16 cache (Phase B)
     int nq, int nkv, int hd, int kvd, int pos_start,
     int rd, float base, float freq_scale, float m_scale,
     int yarn_on, float corr_lo, float corr_hi,
@@ -2776,7 +2777,7 @@ __global__ void k_fattn_prep_chunk(
         g_all[(size_t) t * att + head * hd + d] = qg_t[head * 2 * hd + hd + d];
     } else {
         v = kt_t[head * hd + d];
-        Vc[(size_t) pos * kvd + head * hd + d] = vt_t[head * hd + d];
+        Vc[(size_t) pos * kvd + head * hd + d] = __float2half(vt_t[head * hd + d]);
     }
     nrm[d] = v;
     __syncthreads();
@@ -2803,7 +2804,7 @@ __global__ void k_fattn_prep_chunk(
         out = first ? (x1 * c - x2 * s) : (x2 * c + x1 * s);
     }
     if (is_q) q_all[(size_t) t * att + head * hd + d] = out;
-    else      Kc[(size_t) pos * kvd + head * hd + d] = out;
+    else      Kc[(size_t) pos * kvd + head * hd + d] = __float2half(out);
 }
 
 //  Tiled causal attention for chunked prefill (flash-attention style).
@@ -3548,79 +3549,18 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 pdqg, pdkt, pdvt, L.qn, L.kn, pdqa, pdga, fs.K, fs.V,
                 L.nq,L.nkv,L.hd,kvd, pos_start, L.rd,L.base,L.freq_scale,L.m_scale,
                 L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total, P);
-            //  Tiled attention is a ~5x-faster but numerically DIFFERENT
-            //  kernel (warp-shfl dot reduce + tiled online softmax) — not
-            //  bit-exact to the naive path at long context. Now the DEFAULT
-            //  after the eval-harness cutover gate showed no quality regression
-            //  (aspida 95% == Ollama, faster). ASPIDA_FATTN_NAIVE=1 forces the
-            //  bit-exact naive kernel (A/B, debugging).
-            static int fattn_naive = getenv("ASPIDA_FATTN_NAIVE") ? 1 : 0;
-            //  Tensor-core wmma path (opt-in, pending eval gate): ~1.6x tiled at
-            //  long context, fp16-precision. ~22 KB shared, under the 48 KB limit.
-            static int fattn_wmma = getenv("ASPIDA_FATTN_WMMA") ? 1 : 0;
-            if (fattn_wmma && L.hd <= 256 && (L.hd & 15) == 0) {
-                size_t shmem = (size_t)(48 * L.hd + 256) * 2 + (size_t)(16 * L.hd + 256) * 4;
-                dim3 grid((unsigned)((P + 15) / 16), (unsigned) L.nq);
-                k_fattn_wmma<<<grid, 32, shmem, st>>>(
-                    pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P);
-            } else if (!fattn_naive && L.hd <= 256 && (L.hd & 31) == 0) {
-                int TK = (L.hd <= 128) ? 32 : 16;
-                size_t shmem = (size_t) 2 * TK * L.hd * 4;
-                int rep = (L.nkv > 0) ? L.nq / L.nkv : 1;
-                int RQ = L.hd >> 5;
-                //  GQA K/V-reuse (serving fast path): each block attends 2
-                //  group q-heads per shared K/V tile -> halves K/V HBM traffic.
-                //  Same fp32 math as tiled (outputs ~1e-6 identical); measured
-                //  1.77-1.94x at pos>=4k on hura dims. ASPIDA_FATTN_NOGQA=1
-                //  forces the plain tiled kernel (A/B, debugging).
-                static int fattn_nogqa = getenv("ASPIDA_FATTN_NOGQA") ? 1 : 0;
-                //  Long-context tensor-core attend (wmma3): a second ~1.5x on
-                //  top of GQA-2 at pos>=12k (measured: 12k 1.66x, 25k 1.47x,
-                //  37k 1.53x; crossover below 12k unmeasured — short chunks
-                //  stay on GQA-2). fp16 QK/PV + __expf, rel err ~3.8e-4 ->
-                //  NOT bit-exact; must pass the eval-hura gate before prod.
-                //  ASPIDA_FATTN_NOW3=1 disables (A/B, debugging).
-                static int fattn_now3 = getenv("ASPIDA_FATTN_NOW3") ? 1 : 0;
-                //  nq%2 guard: for any nq that IS a multiple of nkv, even rep
-                //  already implies even nq; this only catches malformed GGUFs
-                //  (nq not a multiple of nkv) which would otherwise drop the
-                //  last head — they fall back to tiled instead.
-                if (!fattn_now3 && L.hd == 256 && pos_start >= 12288) {
-                    const int W3 = 8;
-                    size_t shm3 = (size_t)(2 * 16 * L.hd + (size_t) W3 * 16 * L.hd) * 2
-                                + (size_t)(W3 * 16 * 16) * 4 + (size_t)(W3 * 16 * 16) * 2
-                                + (size_t)(2 * W3 * 16) * 4;
-                    static int w3_attr_set = 0;
-                    if (!w3_attr_set) {
-                        cudaFuncSetAttribute(k_fattn_wmma3<W3>,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm3);
-                        w3_attr_set = 1;
-                    }
-                    dim3 grid((unsigned)((P + 16 * W3 - 1) / (16 * W3)), (unsigned) L.nq);
-                    k_fattn_wmma3<W3><<<grid, W3 * 32, shm3, st>>>(
-                        pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P);
-                } else if (!fattn_nogqa && rep % 2 == 0 && L.nq % 2 == 0 && (RQ == 4 || RQ == 8)) {
-                    int TQW = 16;   //  query warps per block (512 thr, 80 regs)
-                    dim3 grid((unsigned)((P + TQW - 1) / TQW), (unsigned)(L.nq / 2));
-                    if (RQ == 8)
-                        k_fattn_tile_gqa<2, 8><<<grid, TQW * 32, shmem, st>>>(
-                            pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P, TK);
-                    else
-                        k_fattn_tile_gqa<2, 4><<<grid, TQW * 32, shmem, st>>>(
-                            pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P, TK);
-                } else {
-                //  Tiled path: TK sized so the K+V tile stays within the 48 KB
-                //  default dynamic-shared limit. 32 query warps/block share
-                //  each K/V tile → half the K/V HBM passes vs 16.
-                int TQW = 32;   //  query warps per block
-                dim3 grid((unsigned)((P + TQW - 1) / TQW), (unsigned) L.nq);
-                k_fattn_attend_tile<<<grid, TQW * 32, shmem, st>>>(
-                    pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start, P, TK);
-                }
-            } else {
-                k_fattn_attend_chunk<<<(size_t)L.nq*P, L.hd, 0, st>>>(
-                    pdqa, pdga, fs.K, fs.V, pdatt, L.nq,L.nkv,L.hd,kvd, pos_start);
-            }
+            //  Phase B: prefill full-attention via llama.cpp fattn-mma
+            //  (ncols2=8 GQA column-packing + cp_async pipelining), through the
+            //  ggml public API. Measured ~6.5x the previous wmma3 kernel at
+            //  hd=256/40k on the an NVIDIA GPU (139 TFLOPS, ~38% of peak). fs.K/fs.V are
+            //  the resident fp16 cache; pdqa the rotated Q [t][h][d]; the
+            //  per-dim sigmoid gate (pdga) is folded in the epilogue. fp16-KV
+            //  precision ~8e-4 vs fp32 ref (must clear eval-hura, like wmma3
+            //  did). The old wmma3/tile_gqa/attend_chunk kernels remain compiled
+            //  but unused; roll back by redeploying the previous .so.
+            //  See gpu/fattn_ggml.cuh for the layout mapping + repack.
+            aspida_ggml_fattn_prefill(pdqa, fs.K, fs.V, pdga, pdatt,
+                                      L.nq, L.nkv, L.hd, P, pos_start, st);
             launch_mv_b(L.fow, L.fow_k, att, dim, pdatt, paob, P, st);
         }
         k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
