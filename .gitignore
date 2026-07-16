@@ -70,3 +70,11 @@ Thumbs.db
 
 # P4 SVG run artifacts (dataset/targets/gguf/logs)
 svgdata/
+
+# Phase B build artifacts
+fattn_integ_test
+moe_integ_test
+libaspidagpu.so
+# Vendored ggml .so's shipped next to libaspidagpu.so (built from llama.cpp,
+# ~65 MB) — staged on the build box, never committed.
+deploy_bundle/

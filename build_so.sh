@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
-GG=/root/fattn_bench/llama.cpp
-cd /root/aspida-integ
+GG=${GG:-/root/fattn_bench/llama.cpp}
+cd "$(dirname "$0")"
 nvcc -O3 --fmad=false -arch=native -shared -Xcompiler -fPIC gpu/gpu_matvec.cu \
   -o libaspidagpu.so \
   -I$GG/ggml/include \

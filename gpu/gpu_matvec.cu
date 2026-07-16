@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <ctime>
 #include "fattn_ggml.cuh"   // Phase B: prefill full-attn via llama.cpp fattn-mma (ggml link-and-call)
+#include "moe_ggml.cuh"     // MoE Phase B: prefill MoE via llama.cpp mul_mat_id (MMQ int8, ggml link-and-call)
 
 // Decode issues thousands of tiny kernels + small blocking copies per token;
 // the default ScheduleAuto wait can take a yield/sleep path that costs ~0.5 ms
@@ -377,6 +378,7 @@ static uint8_t *upload_weight(const void *w, long wbytes) {
 //  leaks AND a later model whose host bytes are reallocated at the same address
 //  would be served this model's stale weights. No-op if w was never uploaded.
 extern "C" void aspida_gpu_free_weight(const void *w) {
+    aspida_ggml_free_weight(w);   // MoE Phase B: evict ggml-owned weights too
     auto it = g_wcache.find(w);
     if (it == g_wcache.end()) return;
     cudaFree(it->second);
@@ -1822,6 +1824,10 @@ struct ChainLayer {
     float *sgi; int sgi_len;
     int n_exp, top_k, intermed;
     int has_moe;
+    //  MoE Phase B: routed expert weights as ggml tensors (mul_mat_id prefill).
+    //  gdw/udw/ddw above point at THESE tensors' device data when set — the
+    //  decode kernels keep reading the same bytes.  null => grouped fallback.
+    void *ggt, *ugt, *dgt;
 };
 static std::vector<ChainLayer> g_chain;
 static float *g_ch_embed = nullptr, *g_ch_fnorm = nullptr;
@@ -1923,9 +1929,38 @@ extern "C" void aspida_gpu_chain_moe(
     if (g_chain.empty()) return;
     ChainLayer &L = g_chain.back();
     L.rw = upload_weight(router_w, router_b); L.rk = router_k;
-    L.gdw = upload_weight(gate_w, gate_b); L.gk = gate_k;
-    L.udw = upload_weight(up_w, up_b); L.uk = up_k;
-    L.ddw = upload_weight(down_w, down_b); L.dk = down_k;
+    //  MoE Phase B: allocate the ROUTED expert weights as ggml tensors so the
+    //  prefill can run llama.cpp's mul_mat_id (MMQ int8 tensor cores, measured
+    //  2.9x the grouped kernels).  ggml CUDA buffers are plain device memory,
+    //  so gdw/udw/ddw keep pointing at the same bytes for the decode kernels.
+    //  Bytes upload ONCE (into ggml memory) — no double residency.  Q8_0 only;
+    //  any mismatch (or ASPIDA_MOE_NOGGML=1) falls back to upload_weight and
+    //  the old grouped prefill path.
+    static int moe_noggml_ld = getenv("ASPIDA_MOE_NOGGML") ? 1 : 0;
+    L.ggt = L.ugt = L.dgt = nullptr;
+    if (!moe_noggml_ld && gate_k == 5 && up_k == 5 && down_k == 5 && n_exp > 0 && intermed > 0) {
+        long gbpe = gate_b / n_exp, ubpe = up_b / n_exp, dbpe = down_b / n_exp;
+        //  gate/up: m=intermed rows of k=dim cols; down: k=intermed, m=dim.
+        long gbpr = gbpe / intermed;                    //  bytes per row
+        int64_t kdim = (gbpr % 34 == 0) ? (gbpr / 34) * 32 : 0;
+        long dnb = intermed / 32, dbpr = dnb * 34;
+        int64_t mdim = (dbpr > 0 && dbpe % dbpr == 0) ? dbpe / dbpr : 0;
+        if (kdim > 0 && mdim > 0 && gbpe == ubpe) {
+            ggml_tensor *gt = aspida_ggml_upload_q8(gate_w, gate_b, kdim, intermed, n_exp);
+            ggml_tensor *ut = gt ? aspida_ggml_upload_q8(up_w, up_b, kdim, intermed, n_exp) : nullptr;
+            ggml_tensor *dt = ut ? aspida_ggml_upload_q8(down_w, down_b, intermed, mdim, n_exp) : nullptr;
+            if (gt && ut && dt) {
+                L.ggt = gt; L.ugt = ut; L.dgt = dt;
+                L.gdw = (uint8_t *) gt->data; L.udw = (uint8_t *) ut->data; L.ddw = (uint8_t *) dt->data;
+            }
+        }
+    }
+    if (!L.ggt) {
+        L.gdw = upload_weight(gate_w, gate_b);
+        L.udw = upload_weight(up_w, up_b);
+        L.ddw = upload_weight(down_w, down_b);
+    }
+    L.gk = gate_k; L.uk = up_k; L.dk = down_k;
     L.sgdw = upload_weight(shg_w, shg_b); L.sgk = shg_k;
     L.sudw = upload_weight(shu_w, shu_b); L.suk = shu_k;
     L.sddw = upload_weight(shd_w, shd_b); L.sdk = shd_k;
@@ -3459,6 +3494,32 @@ __global__ void k_moe_combine(const float *__restrict__ d_buf, const MoeRoute *_
     y_b[(size_t) p * dim + d] = acc;
 }
 
+//  MoE Phase B helpers (ggml mul_mat_id prefill) -----------------------------
+//  ids for ggml: i32 [P][top_k] from the routing.
+__global__ void k_moe_ids(const MoeRoute *__restrict__ route_b, int32_t *__restrict__ ids,
+                          int top_k, int P) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= P * top_k) return;
+    int p = i / top_k, k = i - p * top_k;
+    ids[i] = route_b[p].idx[k];
+}
+//  Combine for the ggml path: routed slots come from ggml's mm_id output
+//  [p][k][dim] (fp32, contiguous), the shared expert from d_buf slot top_k
+//  (written by the mode-1 grouped kernels).  Same fixed order as k_moe_combine.
+__global__ void k_moe_combine_ggml(const float *__restrict__ g_out,
+                                   const float *__restrict__ d_buf,
+                                   const MoeRoute *__restrict__ route_b,
+                                   float *__restrict__ y_b, int top_k, int dim, int P) {
+    int p = blockIdx.y; if (p >= P) return;
+    int d = blockIdx.x * blockDim.x + threadIdx.x; if (d >= dim) return;
+    const MoeRoute *r = route_b + p;
+    const float *G = g_out + (size_t) p * top_k * dim;
+    float acc = 0.f;
+    for (int k = 0; k < top_k; ++k) acc += r->w[k] * G[(size_t) k * dim + d];
+    acc += r->w[MOE_MAXK] * d_buf[((size_t) p * (MOE_MAXK + 1) + top_k) * dim + d];
+    y_b[(size_t) p * dim + d] = acc;
+}
+
 // Prefill P positions [pos_start .. pos_start+P-1] of ONE generation on LANE
 // `lane`, updating its resident per-layer state (handles[li]); return the
 // LM-head logits of the LAST position in last_logits (what the caller samples).
@@ -3575,7 +3636,36 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             int b1b=((size_t)P*w1*32+255)/256, b2b=((size_t)P*dim*32+255)/256;
             bool grouped = (L.gk==5 && L.uk==5 && L.sgk==5 && L.suk==5 &&
                             L.dk==5 && L.sdk==5 && pmg_cnt);
-            if (grouped) {
+            //  MoE Phase B: routed experts via llama.cpp mul_mat_id (MMQ int8
+            //  tensor cores) — measured 2.9x the grouped kernels at hura dims
+            //  (5.71 -> ~1.95 ms/layer-chunk).  The shared expert + the
+            //  deterministic combine stay on the aspida side.  Falls back to
+            //  the grouped path on any failure (latched) or ASPIDA_MOE_NOGGML=1.
+            static int moe_noggml = getenv("ASPIDA_MOE_NOGGML") ? 1 : 0;
+            static int moe_ggml_failed = 0;
+            const float *moe_gout = nullptr;
+            if (grouped && !moe_noggml && !moe_ggml_failed && L.ggt && L.top_k <= MOE_MAXK) {
+                //  ids for mul_mat_id — pmg_pos is unused by the ggml path and
+                //  the mode-1 (shared) kernels never read mg_*, so reuse it.
+                k_moe_ids<<<((size_t)P*L.top_k+255)/256,256,0,st>>>(pdroute, (int32_t*)pmg_pos, L.top_k, P);
+                //  shared expert via the existing mode-1 grouped kernels
+                //  (h_b/d_buf slot top_k), overlapped on the aspida stream.
+                dim3 grSh((L.intermed+15)/16,(P+15)/16,1);
+                k_moe_gu_grouped<<<grSh,32,0,st>>>(L.sgdw,L.sudw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
+                    0,0, dim,L.intermed, PCH, L.top_k, P, 1);
+                dim3 grDs((dim+15)/16,(P+15)/16,1);
+                k_moe_down_grouped<<<grDs,32,0,st>>>(L.sddw, pdhb, pdmoe, pmg_pos,pmg_k,pmg_cnt,
+                    0, L.intermed, dim, PCH, L.top_k, P, 1);
+                moe_gout = aspida_ggml_moe_prefill(
+                    (ggml_tensor *) L.ggt, (ggml_tensor *) L.ugt, (ggml_tensor *) L.dgt,
+                    pnxb, (const int32_t *) pmg_pos, dim, L.intermed, L.top_k, P, st);
+                if (!moe_gout) { moe_ggml_failed = 1;
+                    fprintf(stderr, "[MOE] ggml mul_mat_id failed — grouped fallback\n"); }
+            }
+            if (moe_gout) {
+                dim3 grC((dim+255)/256, P, 1);
+                k_moe_combine_ggml<<<grC,256,0,st>>>(moe_gout, pdmoe, pdroute, paob, L.top_k, dim, P);
+            } else if (grouped) {
                 //  Expert-grouped tensor-core MoE: bucket positions by expert
                 //  (once), then one GEMM per expert reading its weight once.
                 cudaMemsetAsync(pmg_cnt, 0, (size_t)L.n_exp*4, st);
