@@ -468,7 +468,14 @@ package body Aspida_CAPI is
             Repeat_Penalty => Float (Params.all.Repeat_Penalty),
             Repeat_Last_N  => Integer (Params.all.Repeat_Last_N),
             Min_Tokens     => Integer (Params.all.Min_Tokens),
-            Seed           => Long_Long_Integer (Params.all.Seed));
+            Seed           => Long_Long_Integer (Params.all.Seed),
+            --  Params_C is a frozen C struct: it carries only the fields above.
+            --  Anything LLM_Sampler.Params gains beyond them takes its engine
+            --  default until Params_C is extended to expose it (an ABI change).
+            --  Naming them individually here made this aggregate silently rot
+            --  out of date -- it stopped compiling when Presence_Penalty and
+            --  Enable_Thinking were added.
+            others         => <>);
 
          Stats_Obj : aliased LLM_Qwen.Gen_Stats;
          Stats_Ptr : constant access LLM_Qwen.Gen_Stats :=
