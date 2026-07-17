@@ -3710,3 +3710,201 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     cudaStreamSynchronize(st);
     pscr_release(slot);
 }
+
+// Per-position variant of chain_prefill: same resident forward, but projects
+// EVERY position through the LM head into all_logits[p*vocab + k], not just
+// the last. This is the verify primitive speculative decoding needs: score
+// gamma draft tokens in one pass and read the target's prediction at each.
+// The P hidden states already exist in pHb (the forward computes them all);
+// only the projection differs. Reuses the vocab-sized pdlog scratch per
+// position in a loop, so no P*vocab device buffer is needed.
+extern "C" void aspida_gpu_chain_prefill_logits(int lane, int P, const int *rows, int pos_start,
+                                                const int *handles, float *all_logits) {
+    if (P < 1) return; if (P > PCH) P = PCH;
+    (void) lane;   //  kept for ABI; the pool assigns the scratch set now
+    int slot = pscr_acquire();
+    if (slot < 0) { fprintf(stderr, "[PREFILL] scratch OOM — chunk aborted\n"); return; }
+    PScr &S = g_ps[slot];
+    float *pHb=S.Hb,*pnxb=S.nxb,*paob=S.aob,*pdqkv=S.dqkv,*pdcq=S.dcq,*pdar=S.dar,
+          *pdbr=S.dbr,*pdz=S.dz,*pdg=S.dg,*pdb=S.db,*pdor=S.dor,*pdqg=S.dqg,
+          *pdkt=S.dkt,*pdvt=S.dvt,*pdqa=S.dqa,*pdga=S.dga,*pdatt=S.datt,*pdrl=S.drl,
+          *pdhb=S.dhb,*pdlog=S.dlog,*pdkn=S.dkn,*pdqn=S.dqn,*pdosh=S.dosh;
+    MoeRoute *pdroute=S.droute;
+    int *p_rows=S.rows;
+    int *pmg_pos=S.mg_pos,*pmg_k=S.mg_k,*pmg_cnt=S.mg_cnt;
+    float *pdmoe=S.dmoe;
+    int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=S.stream;
+    //  Opt-in per-phase profiler (env ASPIDA_PREFILL_PROF): splits GPU time
+    //  into the attention/dnet block vs the MoE block, aggregated over layers.
+    //  Zero cost when the env is unset. Per-layer event syncs perturb wall
+    //  time (~2x) so use it only for measurement, never in a serving config.
+    static int pprof = getenv("ASPIDA_PREFILL_PROF") ? 1 : 0;
+    cudaEvent_t pe0=0,pe1=0,pe2=0; double acc_attn=0, acc_moe=0, acc_dnet=0, acc_fattn=0, acc_dproj=0, acc_recur=0;
+    if (pprof) { cudaEventCreate(&pe0); cudaEventCreate(&pe1); cudaEventCreate(&pe2); }
+    cudaMemcpyAsync(p_rows, rows, (size_t)P*4, cudaMemcpyHostToDevice, st);
+    k_embed_b<<<((size_t)dim*P+255)/256,256,0,st>>>(g_ch_embed, p_rows, pHb, dim, P);
+    for (int li=0; li<NL; ++li) {
+        ChainLayer &L=g_chain[li];
+        if (pprof) cudaEventRecord(pe0, st);
+        k_norm1_b<<<P,256,0,st>>>(pHb, L.attn_norm, pnxb, dim, P);
+        if (!L.is_fattn) {
+            DnetState ds = g_dnet[handles[li]];
+            //  Fused input projection (dnet lever): one k_q8_wmma over the
+            //  loader's concatenated qkv|alpha|beta|gate weight + a cheap
+            //  scatter. Bit-exact; ~1.3x over 4 separate launches (the 2048x32
+            //  alpha/beta matmuls alone are occupancy-starved: 32 warps/GPU).
+            if (L.proj_fused && S.dcomb) {
+                launch_mv_b(L.proj, L.qkv_k, dim, L.proj_out, pnxb, S.dcomb, P, st);
+                k_proj_scatter<<<((size_t)P*L.proj_out+255)/256,256,0,st>>>(
+                    S.dcomb, P, L.proj_out, pdqkv, L.qo, pdar, pdbr, L.nv, pdz, L.v_dim);
+            } else {
+                launch_mv_b(L.qkv, L.qkv_k, dim, L.qo, pnxb, pdqkv, P, st);
+                launch_mv_b(L.al, L.al_k, dim, L.nv, pnxb, pdar, P, st);
+                launch_mv_b(L.be, L.be_k, dim, L.nv, pnxb, pdbr, P, st);
+                launch_mv_b(L.ga, L.ga_k, dim, L.v_dim, pnxb, pdz, P, st);
+            }
+            size_t shmem=(size_t)(4*L.khd+2*L.vhd)*4;
+            k_dnet_conv_chunk<<<(L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.conv, pdcq, L.qo, L.kernel, P);
+            k_dnet_gates_b<<<((size_t)P*L.nv+255)/256,256,0,st>>>(pdar, pdbr, L.aw, L.dtw, pdg, pdb, L.nv, P);
+            if (pprof) { cudaEventRecord(pe1, st); cudaEventSynchronize(pe1); float p=0; cudaEventElapsedTime(&p, pe0, pe1); acc_dproj += p; }
+            //  Warp-parallel register-resident recurrence (~14x): DEFAULT after
+            //  the eval gate (no quality regression). ASPIDA_DNET_SEQ=1 forces
+            //  the bit-exact sequential kernel (A/B, debugging).
+            static int dnet_seq = getenv("ASPIDA_DNET_SEQ") ? 1 : 0;
+            if (!dnet_seq && (L.khd & 31) == 0 && L.khd <= 256 && L.vhd <= 256) {
+                //  Register-resident warp recurrence: normalise Q/K, run the
+                //  column-parallel scan (S in registers), then RMS+z-gate.
+                k_dnet_qk_norm<<<P * L.nkh, L.khd, 0, st>>>(
+                    pdcq, pdkn, pdqn, L.khd, L.q_dim, L.nkh, L.qo, P);
+                int RW = 8;   //  warps (=columns) per block
+                dim3 rg((unsigned) L.nv, (unsigned) ((L.vhd + RW - 1) / RW));
+                k_dnet_recur_warp<<<rg, RW * 32, (size_t) 2 * L.khd * 4, st>>>(
+                    ds.S, pdkn, pdqn, pdcq, pdg, pdb, pdosh,
+                    L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim, P);
+                k_dnet_out_norm<<<P * L.nv, L.vhd, 0, st>>>(
+                    pdosh, pdz, L.nw, pdor, L.vhd, L.nv, L.v_dim, P);
+            } else {
+                k_dnet_recur_chunk<<<L.nv, L.khd, shmem, st>>>(
+                    ds.S, pdcq, pdg, pdb, pdz, L.nw, pdor,
+                    L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim, P);
+            }
+            if (pprof) { cudaEventRecord(pe2, st); cudaEventSynchronize(pe2); float r=0; cudaEventElapsedTime(&r, pe1, pe2); acc_recur += r; }
+            launch_mv_b(L.ow, L.ow_k, L.v_dim, dim, pdor, paob, P, st);
+        } else {
+            FattnState fs = g_fattn[handles[li]];
+            int kvd=L.nkv*L.hd, att=L.nq*L.hd, qgd=L.nq*2*L.hd;
+            launch_mv_b(L.qw, L.qw_k, dim, qgd, pnxb, pdqg, P, st);
+            launch_mv_b(L.kw, L.kw_k, dim, kvd, pnxb, pdkt, P, st);
+            launch_mv_b(L.vw, L.vw_k, dim, kvd, pnxb, pdvt, P, st);
+            //  Write ALL P positions' K/V + rotated Q in one launch, then attend
+            //  all nq*P queries in one launch (causal by pos_start+t). K/V of
+            //  earlier chunk positions are resident before later queries read
+            //  them because the prep launch completes before the attend launch.
+            k_fattn_prep_chunk<<<(size_t)(L.nq+L.nkv)*P, L.hd, (size_t)L.hd*4, st>>>(
+                pdqg, pdkt, pdvt, L.qn, L.kn, pdqa, pdga, fs.K, fs.V,
+                L.nq,L.nkv,L.hd,kvd, pos_start, L.rd,L.base,L.freq_scale,L.m_scale,
+                L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total, P);
+            //  Phase B: prefill full-attention via llama.cpp fattn-mma
+            //  (ncols2=8 GQA column-packing + cp_async pipelining), through the
+            //  ggml public API. Measured ~6.5x the previous wmma3 kernel at
+            //  hd=256/40k on the an NVIDIA GPU (139 TFLOPS, ~38% of peak). fs.K/fs.V are
+            //  the resident fp16 cache; pdqa the rotated Q [t][h][d]; the
+            //  per-dim sigmoid gate (pdga) is folded in the epilogue. fp16-KV
+            //  precision ~8e-4 vs fp32 ref (must clear eval-hura, like wmma3
+            //  did). The old wmma3/tile_gqa/attend_chunk kernels remain compiled
+            //  but unused; roll back by redeploying the previous .so.
+            //  See gpu/fattn_ggml.cuh for the layout mapping + repack.
+            aspida_ggml_fattn_prefill(pdqa, fs.K, fs.V, pdga, pdatt,
+                                      L.nq, L.nkv, L.hd, P, pos_start, st);
+            launch_mv_b(L.fow, L.fow_k, att, dim, pdatt, paob, P, st);
+        }
+        k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
+        if (pprof) { cudaEventRecord(pe1, st); cudaEventSynchronize(pe1);
+            float a=0; cudaEventElapsedTime(&a, pe0, pe1);
+            acc_attn += a; if (L.is_fattn) acc_fattn += a; else acc_dnet += a; }
+        if (L.has_moe) {
+            k_norm1_b<<<P,256,0,st>>>(pHb, L.post_norm, pnxb, dim, P);
+            launch_mv_b(L.rw, L.rk, dim, L.n_exp, pnxb, pdrl, P, st);
+            k_moe_route_b<<<P,256,0,st>>>(pdrl, pnxb, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, pdroute, P);
+            int w1=(L.top_k+1)*L.intermed;
+            int b1b=((size_t)P*w1*32+255)/256, b2b=((size_t)P*dim*32+255)/256;
+            bool grouped = (L.gk==5 && L.uk==5 && L.sgk==5 && L.suk==5 &&
+                            L.dk==5 && L.sdk==5 && pmg_cnt);
+            //  MoE Phase B: routed experts via llama.cpp mul_mat_id (MMQ int8
+            //  tensor cores) — measured 2.9x the grouped kernels at hura dims
+            //  (5.71 -> ~1.95 ms/layer-chunk).  The shared expert + the
+            //  deterministic combine stay on the aspida side.  Falls back to
+            //  the grouped path on any failure (latched) or ASPIDA_MOE_NOGGML=1.
+            static int moe_noggml = getenv("ASPIDA_MOE_NOGGML") ? 1 : 0;
+            static int moe_ggml_failed = 0;
+            const float *moe_gout = nullptr;
+            if (grouped && !moe_noggml && !moe_ggml_failed && L.ggt && L.top_k <= MOE_MAXK) {
+                //  ids for mul_mat_id — pmg_pos is unused by the ggml path and
+                //  the mode-1 (shared) kernels never read mg_*, so reuse it.
+                k_moe_ids<<<((size_t)P*L.top_k+255)/256,256,0,st>>>(pdroute, (int32_t*)pmg_pos, L.top_k, P);
+                //  shared expert via the existing mode-1 grouped kernels
+                //  (h_b/d_buf slot top_k), overlapped on the aspida stream.
+                dim3 grSh((L.intermed+15)/16,(P+15)/16,1);
+                k_moe_gu_grouped<<<grSh,32,0,st>>>(L.sgdw,L.sudw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
+                    0,0, dim,L.intermed, PCH, L.top_k, P, 1);
+                dim3 grDs((dim+15)/16,(P+15)/16,1);
+                k_moe_down_grouped<<<grDs,32,0,st>>>(L.sddw, pdhb, pdmoe, pmg_pos,pmg_k,pmg_cnt,
+                    0, L.intermed, dim, PCH, L.top_k, P, 1);
+                moe_gout = aspida_ggml_moe_prefill(
+                    (ggml_tensor *) L.ggt, (ggml_tensor *) L.ugt, (ggml_tensor *) L.dgt,
+                    pnxb, (const int32_t *) pmg_pos, dim, L.intermed, L.top_k, P, st);
+                if (!moe_gout) { moe_ggml_failed = 1;
+                    fprintf(stderr, "[MOE] ggml mul_mat_id failed — grouped fallback\n"); }
+            }
+            if (moe_gout) {
+                dim3 grC((dim+255)/256, P, 1);
+                k_moe_combine_ggml<<<grC,256,0,st>>>(moe_gout, pdmoe, pdroute, paob, L.top_k, dim, P);
+            } else if (grouped) {
+                //  Expert-grouped tensor-core MoE: bucket positions by expert
+                //  (once), then one GEMM per expert reading its weight once.
+                cudaMemsetAsync(pmg_cnt, 0, (size_t)L.n_exp*4, st);
+                k_moe_group<<<(P+255)/256,256,0,st>>>(pdroute, P, L.top_k, pmg_pos, pmg_k, pmg_cnt, PCH);
+                //  gate+up+SwiGLU -> h_b[p][slot]
+                dim3 grR((L.intermed+15)/16, (PCH+15)/16, L.n_exp);
+                k_moe_gu_grouped<<<grR,32,0,st>>>(L.gdw,L.udw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
+                    L.g_bpe,L.u_bpe, dim,L.intermed, PCH, L.top_k, P, 0);
+                dim3 grSh((L.intermed+15)/16, (P+15)/16, 1);
+                k_moe_gu_grouped<<<grSh,32,0,st>>>(L.sgdw,L.sudw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
+                    0,0, dim,L.intermed, PCH, L.top_k, P, 1);
+                //  down -> per-(position,slot) d_buf, then deterministic combine
+                dim3 grD((dim+15)/16, (PCH+15)/16, L.n_exp);
+                k_moe_down_grouped<<<grD,32,0,st>>>(L.ddw, pdhb, pdmoe, pmg_pos,pmg_k,pmg_cnt,
+                    L.d_bpe, L.intermed, dim, PCH, L.top_k, P, 0);
+                dim3 grDs((dim+15)/16, (P+15)/16, 1);
+                k_moe_down_grouped<<<grDs,32,0,st>>>(L.sddw, pdhb, pdmoe, pmg_pos,pmg_k,pmg_cnt,
+                    0, L.intermed, dim, PCH, L.top_k, P, 1);
+                dim3 grC((dim+255)/256, P, 1);
+                k_moe_combine<<<grC,256,0,st>>>(pdmoe, pdroute, paob, L.top_k, dim, P);
+            } else {
+                k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
+                k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
+            }
+            k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
+            if (pprof) { cudaEventRecord(pe2, st); cudaEventSynchronize(pe2);
+                float m=0; cudaEventElapsedTime(&m, pe1, pe2); acc_moe += m; }
+        }
+    }
+    if (pprof) {
+        fprintf(stderr, "[PREFILLPROF] P=%d NL=%d | attn-block=%.2fms (dnet=%.2f [dproj=%.2f recur=%.2f] fattn=%.2f) "
+            "moe=%.2fms total=%.2fms | per-tok: attn=%.3f moe=%.3f sum=%.3f ms\n",
+            P, NL, acc_attn, acc_dnet, acc_dproj, acc_recur, acc_fattn, acc_moe, acc_attn+acc_moe,
+            acc_attn/P, acc_moe/P, (acc_attn+acc_moe)/P);
+        cudaEventDestroy(pe0); cudaEventDestroy(pe1); cudaEventDestroy(pe2);
+    }
+    // LM head on EVERY position. pHb holds all P hidden states; k_norm1 only
+    // reads its input (x is const __restrict__), so looping never corrupts pHb.
+    for (int p = 0; p < P; p++) {
+        const float *hp = pHb + (size_t) p * dim;
+        k_norm1<<<1,256,0,st>>>((float *) hp, g_ch_fnorm, pnxb, dim);
+        launch_mv_st(g_ch_lm, g_ch_lm_k, dim, g_ch_vocab, pnxb, pdlog, st);
+        cudaMemcpyAsync(all_logits + (size_t) p * g_ch_vocab, pdlog,
+                        (size_t) g_ch_vocab*4, cudaMemcpyDeviceToHost, st);
+    }
+    cudaStreamSynchronize(st);
+    pscr_release(slot);
+}
