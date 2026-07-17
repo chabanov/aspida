@@ -65,18 +65,30 @@ package body LLM_Catalog is
       end Add_Env_List;
 
       H : constant String := Home;
+      --  ASPIDA_MODELS_DIR is a DEPLOYMENT PIN, not an extra hint: when it is
+      --  set, it is the WHOLE list. The discovery fallbacks below are a
+      --  dev-machine convenience, and running them anyway made a configured
+      --  server advertise models the operator never listed -- prod offered
+      --  /root/models' Llama GGUFs next to its pinned model, and a client
+      --  picking one got model_not_available. Same rule as secure_server's
+      --  Model_Path: an explicit deployment env wins outright.
+      Pinned : constant Boolean :=
+        Ada.Environment_Variables.Exists ("ASPIDA_MODELS_DIR")
+        and then Ada.Environment_Variables.Value ("ASPIDA_MODELS_DIR") /= "";
    begin
       Add_Env_List;
-      Add ("models");                                  -- repo-local ./models
-      if H'Length > 0 then
-         Add (H & "/.lmstudio/models");
-         Add (H & "/.cache/lm-studio/models");
-         Add (H & "/.cache/huggingface");
-         Add (H & "/.ollama/models");
-         Add (H & "/models");
+      if not Pinned then
+         Add ("models");                               -- repo-local ./models
+         if H'Length > 0 then
+            Add (H & "/.lmstudio/models");
+            Add (H & "/.cache/lm-studio/models");
+            Add (H & "/.cache/huggingface");
+            Add (H & "/.ollama/models");
+            Add (H & "/models");
+         end if;
+         Add ("/root/models");
+         Add ("/root/aspida/models");
       end if;
-      Add ("/root/models");
-      Add ("/root/aspida/models");
       return V;
    end Roots;
 
