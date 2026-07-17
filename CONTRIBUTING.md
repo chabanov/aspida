@@ -136,7 +136,7 @@ QWEN_MODEL_PATH=/path/to/model.gguf make test-weights-real
 ## Documentation
 
 - Update README.md for user-facing changes
-- Update SNAGA.md for architecture changes
+- Update ARCHITECTURE.md for architecture changes
 - Add inline comments for complex logic
 - Update API documentation for new endpoints
 

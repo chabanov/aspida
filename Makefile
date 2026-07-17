@@ -30,7 +30,6 @@ SESSION     ?= new
 PUBKEY_FILE := server_pub.hex
 
 # ── Project files ────────────────────────────────────────────────────
-MAIN_GPR    := legacy/aspida_cli.gpr      # legacy HTTP-client-generator CLI (main.adb)
 SECURE_GPR  := server.gpr                 # the product: E2EE inference server + client
 CRYPTO_TEST_GPR := crypto_tests.gpr       # RFC KAT suite for the crypto library
 SECURE_TEST_GPR := secure_tests.gpr       # TCP transport + secure-channel integration
@@ -61,22 +60,15 @@ ASPIDA_LIB  := lib/aspida/libaspida.dylib
 # ARCH=portable drops -march=native (binaries run on any CPU); see shared.gpr.
 ARCH        ?= native
 GPR_FLAGS   := -XSDKROOT=$(SDKROOT) -XARCH=$(ARCH) -XOS=$(OS_NAME)
-SPARK_FLAGS := -P $(MAIN_GPR) $(GPR_FLAGS) --mode=flow
 
 # ── Default ──────────────────────────────────────────────────────────
-#  The product is the encrypted inference server (server.gpr); the legacy
-#  HTTP-client-generator CLI (legacy/aspida_cli.gpr) is built via `make build`
-#  but is no longer the default.
+#  The product is the encrypted inference server (server.gpr).
 .PHONY: all
 all: server
 
 # ══════════════════════════════════════════════════════════════════════
 #  BUILD
 # ══════════════════════════════════════════════════════════════════════
-
-.PHONY: build
-build: ## Build aspida CLI (debug)
-	$(GPRBUILD) -P $(MAIN_GPR) $(GPR_FLAGS)
 
 .PHONY: server
 server: ## Build the encrypted chat server + client (the ONLY chat path — no plaintext mode)
@@ -125,10 +117,6 @@ chat: server ## Open an interactive encrypted chat (needs a running `make serve`
 	@echo "connecting to $(HOST):$(PORT) — pinning $$(cat $(PUBKEY_FILE))"
 	./$(OBJ_DIR)/secure_client $(HOST) $(PORT) $$(cat $(PUBKEY_FILE)) $(SESSION)
 
-.PHONY: release
-release: ## Build aspida CLI (optimized)
-	$(GPRBUILD) -P $(MAIN_GPR) $(GPR_FLAGS) -XBUILD=release
-
 .PHONY: tests
 tests: ## Build every test suite (crypto/E2EE + model-free LLM)
 	$(GPRBUILD) -P $(CRYPTO_TEST_GPR) $(GPR_FLAGS)
@@ -148,7 +136,7 @@ test-json: ## Regression: JSON depth cap (Batch 1.2) — deep nesting raises, no
 	./obj/test_json
 
 .PHONY: check
-check: build test ## Build CLI + run model-free tests (CI target)
+check: server test ## Build the server + run model-free tests (CI target)
 
 .PHONY: train-test
 train-test: ## Build + run the from-scratch training-core self-tests (model-free; grad-check, distill, block, QAT, BPE, ckpt, mha)
@@ -276,7 +264,6 @@ prove-egress: ## H19 Phase 6: SPARK flow analysis of the client egress encoder (
 
 .PHONY: clean
 clean: ## Remove build artifacts
-	$(GPRCLEAN) -P $(MAIN_GPR) $(GPR_FLAGS) || true
 	$(GPRCLEAN) -P $(SECURE_GPR) $(GPR_FLAGS) || true
 	$(GPRCLEAN) -P $(CRYPTO_TEST_GPR) $(GPR_FLAGS) || true
 	$(GPRCLEAN) -P $(SECURE_TEST_GPR) $(GPR_FLAGS) || true
@@ -293,11 +280,11 @@ distclean: clean ## Remove Alire cache too
 
 .PHONY: fmt
 fmt: ## Format all ADA sources
-	$(FORMATTER) -P $(MAIN_GPR) $(GPR_FLAGS) --pipe
+	$(FORMATTER) -P $(SECURE_GPR) $(GPR_FLAGS) --pipe
 
 .PHONY: fmt-check
 fmt-check: ## Check formatting (CI)
-	$(FORMATTER) -P $(MAIN_GPR) $(GPR_FLAGS) --pipe --check
+	$(FORMATTER) -P $(SECURE_GPR) $(GPR_FLAGS) --pipe --check
 
 # ══════════════════════════════════════════════════════════════════════
 #  WATCH (dev loop — requires fswatch)
