@@ -9,7 +9,7 @@
 -- cybersecurity prompts. Demonstration of the pipeline on real data — the
 -- model is intentionally tiny, so this proves the loop, not capability.
 --
---   ./obj/cyber_train [corpus.txt]      (default: data/cyber_corpus.txt)
+--   ./obj/cyber_train [corpus.txt]      (default: tools/cyber_corpus.txt)
 ------------------------------------------------------------------------
 
 with Ada.Text_IO;           use Ada.Text_IO;
@@ -59,7 +59,7 @@ procedure Cyber_Train is
 
    Corpus_Path : constant String :=
      (if Ada.Command_Line.Argument_Count >= 1
-      then Ada.Command_Line.Argument (1) else "data/cyber_corpus.txt");
+      then Ada.Command_Line.Argument (1) else "tools/cyber_corpus.txt");
 
    Tk  : BPE_Train.Trainer;
 begin
