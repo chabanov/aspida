@@ -387,6 +387,15 @@ package body LLM_Qwen is
    procedure Free_Block_Arr is
      new Ada.Unchecked_Deallocation (Block_Array, Block_Array_Ptr);
 
+   --  Phase C: full resident forward chain — registered once per loaded model,
+   --  keyed by the embedding table address. Package-level because the resident
+   --  GPU state it tracks (g_chain in the shim) is itself one-per-process.
+   --  Declared HERE, ahead of Free, so Free can reset it on eviction; that is
+   --  load-bearing, see the comment in Free.
+   Chain_Tag  : System.Address := System.Null_Address;
+   Chain_OK   : Boolean := False;
+   Bench_Done : Boolean := False;
+
    procedure Free (M : in out Qwen_Model) is
    begin
       if M.Blocks /= null then
@@ -416,6 +425,23 @@ package body LLM_Qwen is
       --  weight, so a second Free is a no-op.
       LLM_GPU.Free_Weight (LLM_Weight.Raw_Address (M.LM_Head_Q));
       LLM_Weight.Free_Bytes (M.LM_Head_Q);
+
+      --  Reset the resident-chain registration. Chain_Tag caches the embedding
+      --  table's ADDRESS as an identity for "this model's chain is already on
+      --  the GPU". Without clearing it here, evicting this model leaves the tag
+      --  pointing at freed memory: the allocator can hand the same address to
+      --  the NEXT model's token_embd (it is the first and largest allocation of
+      --  a load), Register_Chain's `Chain_Tag = Data_Address (M.Token_Emb)`
+      --  early-out then fires, the new model is NOT re-registered, and decode
+      --  runs it through the previous model's resident device weights — silent
+      --  wrong output, no error. Chain_Reset also clears the shim's g_chain so
+      --  the stale device pointers cannot be reused. Only reached under
+      --  multi-model eviction (ASPIDA_MAX_LOADED_MODELS with a non-default
+      --  slot); a single pinned model never frees.
+      Chain_Tag  := System.Null_Address;
+      Chain_OK   := False;
+      Bench_Done := False;
+      LLM_Qwen_GPU.Chain_Reset;
    end Free;
 
    --------------------------------------------------------------------
@@ -556,15 +582,6 @@ package body LLM_Qwen is
    --  Shared cached-decode core: prefill the prompt token ids, then greedily
    --  generate up to Max_New_Tokens, stopping early at Stop1/Stop2 (ids; -1 =
    --  none). Returns the decoded text of the GENERATED tokens only.
-   --  Phase C: full resident forward chain — registered once per loaded
-   --  model (keyed by the embedding table address). When registered AND all
-   --  per-generation states allocated on the device, Decode runs one
-   --  Chain_Forward per token: embedding row in, logits out, hidden state
-   --  never leaves VRAM.
-   Chain_Tag : System.Address := System.Null_Address;
-   Chain_OK  : Boolean := False;
-   Bench_Done : Boolean := False;
-
    procedure Register_Chain (M : Qwen_Model) is
       use type System.Address;
       use LLM_Qwen_GPU;
