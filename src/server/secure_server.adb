@@ -716,7 +716,14 @@ procedure Secure_Server is
                         if P.Temperature < 0.0 then P.Temperature := 0.0;
                         elsif P.Temperature > 2.0 then P.Temperature := 2.0; end if;
                         if P.Top_P <= 0.0 or else P.Top_P > 1.0 then P.Top_P := 1.0; end if;
-                        if P.Top_K < 0 then P.Top_K := 0; end if;
+                        --  Clamp BOTH ends. The sampler sizes stack arrays and
+                        --  an O(vocab*Top_K) scan from this value, so an
+                        --  unbounded client Top_K is seconds per token (or a
+                        --  Storage_Error) while holding Infer_Lock. 0 means
+                        --  "disabled" and takes the sampler's own 256 cap;
+                        --  1000 is far above any useful setting (default 20).
+                        if P.Top_K < 0 then P.Top_K := 0;
+                        elsif P.Top_K > 1000 then P.Top_K := 1000; end if;
                         if P.Min_P < 0.0 or else P.Min_P > 1.0 then P.Min_P := 0.0; end if;
                         if P.Presence_Penalty < -2.0 then P.Presence_Penalty := -2.0;
                         elsif P.Presence_Penalty > 2.0 then P.Presence_Penalty := 2.0; end if;
