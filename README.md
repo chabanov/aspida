@@ -214,7 +214,7 @@ native/browser client ──AEAD-sealed channel──► secure_server   (handsh
 ## Testing
 
 ```bash
-# Run all tests
+# Run the model-free test suite (crypto + JSON + LLM units; no model needed)
 make test
 
 # Crypto-specific tests (RFC test vectors)
@@ -280,7 +280,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Acknowledgments
 
 - Built with [Ada/SPARK](https://ada-lang.io)
-- Inspired by [llama.cpp](https://github.com/ggerganov/llama.cpp)
+- Inspired by [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - Cryptographic primitives follow [RFC 8439](https://tools.ietf.org/html/rfc8439) (ChaCha20-Poly1305)
 
 ## Further Reading
