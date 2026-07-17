@@ -818,10 +818,23 @@ procedure Secure_Server is
                      if Leased then LLM_Registry.Release (Lse); end if;
                      Send_Tagged (Protocol.Tag_Resp,
                        OpenAI.Error_Response ("bad request", "bad_request"));
-                  when others =>
+                  when E : others =>
                      --  Anything else (inference/engine failure): server fault
                      --  -> 500-style error. Don't mislabel a crash as "bad
                      --  request", which hides engine bugs from the client.
+                     --
+                     --  LOG IT. The client only ever sees "internal error", so
+                     --  without this line an engine failure leaves no trace
+                     --  anywhere and is undiagnosable after the fact — which is
+                     --  exactly what happened when a ~138k-token prompt started
+                     --  failing and the journal had nothing to show for it.
+                     --  Message only (no traceback): this runs on a handler task
+                     --  serving an untrusted peer, and the exception text is our
+                     --  own.
+                     Put_Line ("  [chat] engine failure: "
+                               & Exception_Name (E) & ": "
+                               & Exception_Message (E));
+                     Flush;
                      if Locked then Infer_Lock.Release; end if;
                      if Leased then LLM_Registry.Release (Lse); end if;
                      Send_Tagged (Protocol.Tag_Resp,
@@ -877,7 +890,20 @@ procedure Secure_Server is
          exception when others => null; end;
    end Handle_Connection;
 
-   task type Handler;
+   --  Handler stack. The default (~2 MB) capped the SERVED CONTEXT far below
+   --  the model's: a chat turn holds several Token_Array copies of the prompt
+   --  on this stack (Encode returns by value), ~4 bytes/token each, so a
+   --  ~130k-token prompt exhausted it and every longer one died with
+   --  STORAGE_ERROR (s-intman: stack overflow) reported to the client as a bare
+   --  "internal error". Measured: 107k tokens fine, ~138k dead — 4 copies x
+   --  539 KB = 2.1 MB, right at the default.
+   --
+   --  Hura is trained for 262k and its KV costs only ~2.5 GB there (30 of 40
+   --  layers are DeltaNet with constant state), so the stack — not memory, not
+   --  the GPU — was the whole limit. 256 MB leaves room for 262k tokens with a
+   --  wide margin. It is virtual address space reserved per task, committed
+   --  lazily, so the idle cost of Max_Clients x 256 MB is pages never touched.
+   task type Handler with Storage_Size => 256 * 1024 * 1024;
    task body Handler is
       Conn : Socket_Type;
    begin
