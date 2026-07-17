@@ -215,6 +215,8 @@ test-llm: ## Build + run all LLM unit tests
 	./obj/test_kv_pool
 	./obj/test_sampler
 	./obj/test_kv_overflow
+	./obj/test_toolcap
+	./obj/test_batcher_cfg
 
 .PHONY: test-crypto
 test-crypto: ## Build + run the crypto / E2EE test vectors (no model needed)

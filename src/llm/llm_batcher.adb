@@ -217,19 +217,30 @@ package body LLM_Batcher is
 
    --------------------------------------------------------------------------
    --  Driver — the single GPU forward caller.
+   --
+   --  A task TYPE created on demand by Configure, not a library-level task
+   --  object. As an object it was elaborated into every program that links the
+   --  engine and then spun `exit when Configured; delay 0.02;` forever — 50
+   --  wakeups/s in a server that never enables batching (ASPIDA_BATCH_SERVE
+   --  unset, so Configure is never called), and, because a task blocked in a
+   --  spin or on a protected entry can never reach a terminate alternative, it
+   --  also kept the environment task from ever completing: every test binary
+   --  that linked the engine hung at exit after passing, which is why make test
+   --  never finished. Created here only once the batcher is really configured,
+   --  a program that never batches never has it at all, and one that does gets
+   --  exactly the loop below. The spin is gone with it: Configure allocates the
+   --  buffers and publishes Configured BEFORE activating this task.
    --------------------------------------------------------------------------
-   task Driver;
+   task type Driver_T;
+   type Driver_Acc is access Driver_T;
+   Drv : Driver_Acc;   -- null until the winning Configure creates it
 
-   task body Driver is
+   task body Driver_T is
       Lanes, Rows, Poss, NLs, Seqs : Int_Arr;
       H, Logs : Addr_Arr;
       N : Integer;
       Fwd_Count, Sum_B, Max_B : Integer := 0;
    begin
-      loop
-         exit when Configured;
-         delay 0.02;
-      end loop;
       loop
          Pool.Wait_Pending;
          --  Coalesce: poll up to ~6 ms for every active client to post, but
@@ -297,20 +308,62 @@ package body LLM_Batcher is
                Pool.Mark_Failed (Lanes, Seqs, N);
          end;
       end loop;
-   end Driver;
+   end Driver_T;
 
    --------------------------------------------------------------------------
    --  Public API.
    --------------------------------------------------------------------------
+   --  Configure runs on the HANDLER tasks (LLM_Qwen.Decode_Tokens calls it on
+   --  the first batched generation), so `if Configured then return` alone never
+   --  made it one-shot: two handlers could both read False and both allocate.
+   --  That was survivable while it only leaked a duplicate buffer set; it is
+   --  not now that the winner also activates the Driver, since a second Driver
+   --  would race the first for the same lanes. Setup_Gate hands exactly one
+   --  caller the job. Claim only flips a flag — the allocation and the task
+   --  activation stay OUTSIDE the protected action (activating a task inside
+   --  one is a bounded error, and `new` under a lock would serialise handlers
+   --  for no reason).
+   protected Setup_Gate is
+      procedure Claim (Won : out Boolean);
+   private
+      Taken : Boolean := False;
+   end Setup_Gate;
+
+   protected body Setup_Gate is
+      procedure Claim (Won : out Boolean) is
+      begin
+         Won   := not Taken;
+         Taken := True;
+      end Claim;
+   end Setup_Gate;
+
    procedure Configure (N_Layers, Vocab : Integer) is
+      Won : Boolean;
    begin
       if Configured then return; end if;
+      Setup_Gate.Claim (Won);
+      if not Won then
+         --  Someone else is mid-setup. Wait for it to publish rather than
+         --  returning early: the caller goes straight on to Begin_Gen and the
+         --  Driver it wakes reads Batch_Log / CHandles.
+         while not Configured loop
+            delay 0.001;
+         end loop;
+         return;
+      end if;
       Cfg_NL := N_Layers; Cfg_Vocab := Vocab;
       CRows    := new C_Int_Arr (0 .. Max_Lanes - 1);
       CPos     := new C_Int_Arr (0 .. Max_Lanes - 1);
       CHandles := new C_Int_Arr (0 .. Max_Lanes * N_Layers - 1);
       Batch_Log := new F_Arr (0 .. Max_Lanes * Vocab - 1);
+      --  Publish the buffers BEFORE activating the Driver: it dereferences
+      --  them as soon as it has a batch, and it no longer waits on Configured.
       Configured := True;
+      --  Setup_Gate already makes this one-shot; the null test keeps "exactly
+      --  one Driver" checkable here rather than only in the gate's history.
+      if Drv = null then
+         Drv := new Driver_T;
+      end if;
    end Configure;
 
    procedure Begin_Gen (Lane : out Integer) is
