@@ -407,6 +407,15 @@ package body LLM_Qwen is
          end loop;
          Free_Block_Arr (M.Blocks);   --  nulls M.Blocks -> idempotent
       end if;
+      --  Model-level weights. Token_Emb / Final_Norm are controlled Tensors and
+      --  finalize themselves, but LM_Head_Q is an LLM_Weight.Weight -- a plain
+      --  record owning heap bytes plus a GPU mirror keyed on their address, so
+      --  nothing reclaims it implicitly. Llama and Gemma already drop their
+      --  model-level weights this way; Qwen leaked output.weight (~0.5 GB at
+      --  35B Q8_0) on every eviction. Both calls are idempotent on an empty
+      --  weight, so a second Free is a no-op.
+      LLM_GPU.Free_Weight (LLM_Weight.Raw_Address (M.LM_Head_Q));
+      LLM_Weight.Free_Bytes (M.LM_Head_Q);
    end Free;
 
    --------------------------------------------------------------------
