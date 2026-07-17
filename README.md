@@ -27,10 +27,10 @@ Aspida dispatches on the GGUF `general.architecture` field through a one-row-per
 
 | GGUF architecture | Backend | Model families | Status |
 |---|---|---|---|
-| `llama` | Dense Llama — GQA + RMSNorm + SwiGLU + NeoX RoPE | Llama 3.1 / 3.2, Mistral, and any dense GQA+RMSNorm+SwiGLU+RoPE model | ✅ Validated — Llama-3.2-1B (Q3_K_L) bit-correct vs llama.cpp; Llama-8B & 70B served on NVIDIA GPU |
+| `llama` | Dense Llama — GQA + RMSNorm + SwiGLU + NeoX RoPE | Llama 3.1 / 3.2, Mistral, and any dense GQA+RMSNorm+SwiGLU+RoPE model | ✅ Validated — Llama-3.2-1B (Q3_K_L) bit-correct vs llama.cpp; Llama-8B & 70B previously served on NVIDIA GPU |
 | `qwen2` | Qwen — dense path | Qwen2 0.5B / 1.5B / 7B | ✅ Supported (routed to the Qwen dense path) |
-| `qwen35` | Qwen — dense path | Qwen3.5 dense, Hura-9b | ✅ Validated — Hura-9b end-to-end via the C ABI (Swift bridge): reasoning/code prompts emit coherent multi-hundred-token turns |
-| `qwen35moe` | Qwen — MoE top-k router + shared expert + gated DeltaNet/SSM hybrid | Qwen3.5-MoE 35B-A3B | ✅ Validated — tensor shapes and hyperparameters verified against the real GGUF |
+| `qwen35` | Qwen — dense path | Qwen3.5 dense | ✅ Validated — a dense Qwen3.5 model end to end via the C ABI (Swift bridge): reasoning/code prompts emit coherent multi-hundred-token turns |
+| `qwen35moe` | Qwen — MoE top-k router + shared expert + gated DeltaNet/SSM hybrid | Qwen3.5-MoE | ✅ Validated — router + gated DeltaNet/SSM verified against a real GGUF; served end to end over the E2EE channel on an NVIDIA GPU |
 | `gemma4` | Gemma — PLE + shared-KV + sliding-window attention + dual RoPE + logit softcap | Gemma 3n E4B, 12B, 26B (PLE and non-PLE/MQA variants) | ✅ Validated — greedy decode bit-identical to llama.cpp on real E4B + 12B models |
 
 **Quantization (read):** F32, F16, BF16, Q8_0, Q4_0, Q5_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K — 12 ggml formats, with fused decode+dot paths for all five K-quants. Unsupported types (IQ\*, ternary, Q4_1/Q5_1/Q8_1) are rejected at load with a clear error — never silently zero-filled.
@@ -144,7 +144,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $ASPIDA_CLIENT_TOKEN" \
   -d '{
-    "model": "qwen3.5-35b",
+    "model": "my-model",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
@@ -260,6 +260,7 @@ make prove
 - [x] GPU kernels for Q2_K/Q3_K — CUDA matvec/matmul (kinds 3/4), validated on an NVIDIA GPU vs CPU reference (`gpu/test_matvec.cu`)
 - [x] mRoPE positional encoding — per-section rotation (`Apply_Sections`) implemented
 - [x] Gated DeltaNet/SSM hybrid — implemented in the Qwen MoE backend
+- [x] Speculative decoding — draft-model and prompt-lookup CPU reference, proven byte-identical to the target's own greedy output (exact, no quality change); GPU integration is WIP
 - [ ] Standalone Mamba selective-scan GGUF (separate from the DeltaNet/SSM hybrid above)
 - [ ] Multi-GPU support
 
