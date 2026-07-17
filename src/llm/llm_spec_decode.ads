@@ -57,4 +57,24 @@ package LLM_Spec_Decode is
       Result_Stats   : access Stats := null)
       return LLM_Tokenizer.Token_Array;
 
+   --  PROMPT-LOOKUP speculative decode: no draft model. The "draft" is the
+   --  context itself — the last Ngram tokens are matched against earlier text
+   --  and up to Gamma following tokens are proposed, then verified by the
+   --  target exactly as above. Byte-identical to target-alone greedy (the
+   --  target verifies every token); it only wins where the output repeats
+   --  material already in context (code, quoting, structured/agentic replies).
+   --  Free: no second model, no extra VRAM, and it gets MORE effective as the
+   --  context grows (more to match). Where nothing repeats it costs nothing
+   --  extra — each round degenerates to one ordinary target step.
+   function Generate_Lookup
+     (Target         : LLM_Qwen.Qwen_Model;
+      Prompt_Ids     : LLM_Tokenizer.Token_Array;
+      Max_New_Tokens : Positive;
+      Stop_Id        : Integer;
+      Ngram          : Positive := 3;
+      Gamma          : Positive := 8;
+      Params         : LLM_Sampler.Params := LLM_Sampler.Greedy;
+      Result_Stats   : access Stats := null)
+      return LLM_Tokenizer.Token_Array;
+
 end LLM_Spec_Decode;

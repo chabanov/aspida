@@ -75,10 +75,18 @@ begin
    declare
       Target : LLM_Qwen.Qwen_Model := LLM_Qwen.Load (T_Path);
       Draft  : LLM_Qwen.Qwen_Model := LLM_Qwen.Load (D_Path);
+      --  The model-draft phase runs the 35B twice per step and is very slow on
+      --  CPU (~40 min for 24 tokens). SPEC_LOOKUP_ONLY skips it to iterate fast
+      --  on the lookup path (verified vs the 9B in seconds), since the fix under
+      --  active development — Verify_Round's bounds-agnostic indexing — is
+      --  model-independent. Unset, both phases run.
+      Skip_Model_Draft : constant Boolean :=
+        Ada.Environment_Variables.Exists ("SPEC_LOOKUP_ONLY");
    begin
       Chk ("vocab sizes match",
            LLM_Qwen.Vocab_Size (Target) = LLM_Qwen.Vocab_Size (Draft));
 
+      if not Skip_Model_Draft then
       declare
          --  A short prompt with a determinate continuation keeps the run fast
          --  on CPU while still exercising several accept/reject rounds.
@@ -124,6 +132,61 @@ begin
             Put_Line ("  tokens per target forward ="
                       & Integer'Image (St.Emitted * 100 / St.Target_Forwards)
                       & "/100  (>100 = speculation is winning)");
+         end if;
+      end;
+      end if;  -- Skip_Model_Draft
+
+      --  PROMPT-LOOKUP path: no draft model, target only. Same invariant —
+      --  byte-identical to target-alone greedy — and it should actually WIN
+      --  here, because the prompt asks for a verbatim repeat, which is exactly
+      --  what lookup drafts for free. Verified against the 9B (already loaded)
+      --  rather than the 35B: the invariant holds for ANY Qwen target, and the
+      --  fix under test (Verify_Round indexing a non-1-based lookup slice) is
+      --  model-independent, so the 9B is a faster but equally valid witness.
+      New_Line;
+      Put_Line ("  --- prompt-lookup (no draft model, verified vs 9B) ---");
+      declare
+         LTgt : LLM_Qwen.Qwen_Model renames Draft;   -- 9B, ~4x faster to run
+         Prompt : constant Token_Array :=
+           LLM_Qwen.Encode
+             (LTgt,
+              "abc abc abc abc abc abc");
+         --  Small on purpose: the CPU reference re-projects the whole vocab at
+         --  every position each step (O(n^2) x 248k vocab), so keep it short.
+         --  6 tokens on a repeating "abc" still exercises multiple lookup
+         --  hits, the bounds-agnostic Verify_Round indexing, and the G=0
+         --  fallback. It is a correctness witness, not a benchmark.
+         Max_New : constant Positive := 6;
+         Stop    : constant Integer := -1;
+         St      : aliased LLM_Spec_Decode.Stats;
+
+         Baseline : constant Token_Array :=
+           Greedy_Baseline (LTgt, Prompt, Max_New, Stop);
+         Look     : constant Token_Array :=
+           LLM_Spec_Decode.Generate_Lookup
+             (Target => LTgt, Prompt_Ids => Prompt, Max_New_Tokens => Max_New,
+              Stop_Id => Stop, Ngram => 3, Gamma => 8, Result_Stats => St'Access);
+
+         Ident : Boolean := Baseline'Length = Look'Length;
+      begin
+         if Ident then
+            for I in Baseline'Range loop
+               if Baseline (I) /= Look (Baseline'First + (I - Baseline'First))
+               then Ident := False; end if;
+            end loop;
+         end if;
+         Put_Line ("  baseline: " & LLM_Qwen.Decode (LTgt, Baseline));
+         Put_Line ("  lookup  : " & LLM_Qwen.Decode (LTgt, Look));
+         Chk ("lookup: same length", Baseline'Length = Look'Length);
+         Chk ("lookup: BYTE-IDENTICAL to target-alone greedy", Ident);
+         Put_Line ("  proposed=" & St.Proposed'Image
+                   & " accepted=" & St.Accepted'Image
+                   & " target_forwards=" & St.Target_Forwards'Image
+                   & " emitted=" & St.Emitted'Image);
+         if St.Target_Forwards > 0 then
+            Put_Line ("  tokens per target forward ="
+                      & Integer'Image (St.Emitted * 100 / St.Target_Forwards)
+                      & "/100  (draft is FREE here, so this is the raw win)");
          end if;
       end;
 
