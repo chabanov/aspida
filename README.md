@@ -230,8 +230,15 @@ make prove
 ## Security
 
 - **No third-party crypto** — All cryptographic primitives implemented from scratch
-- **SPARK contracts** — Cryptographic core verified for absence of runtime errors
-- **Constant-time operations** — Timing-safe comparisons, secure memory wiping
+- **SPARK proof, honestly scoped** — the crypto root, ChaCha20, SHA-256, HKDF and
+  PBKDF2 are machine-proved free of runtime errors and against functional
+  contracts (`make prove`). Everything else — including X25519, Poly1305 and the
+  AEAD layer — passes SPARK **flow** analysis only; those field-arithmetic proofs
+  are future work. Read any "formally verified" claim with that scope
+  (ARCHITECTURE.md §6)
+- **Constant-time where it matters** — X25519's ladder is branch-free on secrets
+  (no `if` on a secret; verified via `objdump`), comparisons are constant-time and
+  keys are zeroized. Poly1305/AEAD are **not** hardened against timing analysis
 - **Forward secrecy** — Ephemeral key exchange per session
 - **Trust boundary** — Network traffic is AEAD-sealed end to end; the only
   plaintext is the same-machine loopback hop on the OpenAI proxy (binds

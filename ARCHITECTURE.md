@@ -210,10 +210,13 @@ forward pass. What Aspida guarantees today:
 
 **SPARK proof scope (stated honestly):** the whole codebase compiles in SPARK
 mode (flow analysis: data/initialization/aliasing). Absence-of-runtime-error
-and selected functional proofs (`--mode=all`) currently cover the core
-primitives (ChaCha20, SHA-256, and the crypto root); extending machine-checked
-proofs across the session/AEAD layer is ongoing. Claims of "formally verified"
-should be read with this scope.
+and functional proofs (`--mode=all --level=2`) cover exactly five units — the
+crypto root, ChaCha20, SHA-256, HKDF and PBKDF2 — which is what `make prove`
+runs. X25519, Poly1305 and the AEAD layer are flow-analysed but **not**
+AoRTE-proved; their field arithmetic is future work, and Poly1305/AEAD are not
+hardened against timing analysis either. X25519 *is* constant-time by design
+(branch-free on secrets). Claims of "formally verified" should be read with this
+scope.
 
 ---
 

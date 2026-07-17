@@ -144,8 +144,7 @@ trained two differently-sized configs end-to-end on an NVIDIA GPU (both loss →
 A shared-memory **tiled FP32 GEMM** (`test_gemm_tiled.cu`, 1.3× faster on 1024³,
 bit-exact) is wired into the Student forward. Remaining perf lever: FP16/
 tensor-core (WMMA) — changes numerics, needs FP16 I/O. Then scale-out
-(data-parallel across droplets, gated by a measured all-reduce benchmark) and the
-MVP turnkey loop.
+(data-parallel across hosts, gated by a measured all-reduce benchmark).
 
 ### Roadmap to multi-GPU-server training
 | Stage | Build | State |
