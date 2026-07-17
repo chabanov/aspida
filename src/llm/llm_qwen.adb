@@ -1048,6 +1048,15 @@ package body LLM_Qwen is
       In_Reason    : Boolean := Reason_Seeded;   -- prompt opened <think>?
       Reason_Start : Natural := 0;               -- Produced when reasoning began
       Think_Forced : Boolean := False;           -- already forced the close
+      --  UTF-8 boundary tracking for the reasoning force-close. Forcing
+      --  </think> in place of the sampled token would split a multi-byte
+      --  character if the emitted bytes end mid-character (Ukrainian is 2
+      --  bytes) — producing a broken char in reasoning_content. Pending is the
+      --  continuation bytes still owed by the last lead byte (0 = on a
+      --  boundary); the guard waits for a boundary before forcing, bounded by
+      --  Force_Grace so a model that never completes a char still gets cut.
+      Pending_UTF8 : Natural := 0;
+      Force_Grace  : Natural := 0;
 
       --  Per-token host-tail profiler (env ASPIDA_TAIL_PROF): sampling vs stream.
       Tail_Prof : constant Boolean :=
@@ -1454,8 +1463,15 @@ package body LLM_Qwen is
                  and then Produced - Reason_Start >= Think_Budget
                  and then Tid /= Think_Close_Id
                then
-                  Tid := Think_Close_Id;
-                  Think_Forced := True;
+                  if Pending_UTF8 = 0 or else Force_Grace >= 4 then
+                     Tid := Think_Close_Id;
+                     Think_Forced := True;
+                  else
+                     --  Mid-multi-byte-character: let this token through to
+                     --  finish the char, then force on a later step. Bounded by
+                     --  Force_Grace (a char is <= 4 bytes) so this never hangs.
+                     Force_Grace := Force_Grace + 1;
+                  end if;
                end if;
                if Tid = Think_Open_Id then
                   In_Reason := True; Reason_Start := Produced; Think_Forced := False;
@@ -1488,6 +1504,23 @@ package body LLM_Qwen is
                Piece : constant String := LLM_Tokenizer.Decode_One (M.Tok, Tid);
             begin
                Append (Out_Buf, Piece);
+               --  Advance the UTF-8 boundary state over this token's bytes so
+               --  the reasoning force-close above never lands mid-character.
+               for I in Piece'Range loop
+                  declare
+                     B : constant Natural := Character'Pos (Piece (I));
+                  begin
+                     if B >= 16#80# and then B < 16#C0# then   -- continuation
+                        if Pending_UTF8 > 0 then
+                           Pending_UTF8 := Pending_UTF8 - 1;
+                        end if;
+                     elsif B < 16#80# then Pending_UTF8 := 0;   -- ASCII
+                     elsif B < 16#E0# then Pending_UTF8 := 1;   -- 2-byte lead
+                     elsif B < 16#F0# then Pending_UTF8 := 2;   -- 3-byte lead
+                     else                  Pending_UTF8 := 3;   -- 4-byte lead
+                     end if;
+                  end;
+               end loop;
                if Sink /= null then            -- stream this token now
                   declare
                      T_Emt : constant Ada.Real_Time.Time :=
