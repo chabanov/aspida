@@ -47,6 +47,9 @@ Aspida dispatches on the GGUF `general.architecture` field through a one-row-per
 - CUDA Toolkit 12+ (optional, for GPU offload)
 - Make, Git
 
+On a bare Ubuntu/Debian box, `scripts/setup-linux.sh` installs Alire and the
+GNAT/gprbuild toolchain into the exact location the Makefile looks for.
+
 ### Build
 
 ```bash
@@ -57,16 +60,18 @@ cd aspida
 # Build the server
 make server
 
-# (Optional) Build CUDA kernels — nvcc directly, not a Make target (see gpu/README.md)
-nvcc -O3 --fmad=false -arch=native -shared -Xcompiler -fPIC \
-     gpu/gpu_matvec.cu -o libaspidagpu.so   # then run with ASPIDA_GPU=1 + ASPIDA_GPU_LIB=…
+# (Optional) Build the CUDA shim — not a Make target; build_so.sh pins the
+# llama.cpp/ggml commit it links against (see gpu/README.md)
+GG=/path/to/llama.cpp ./build_so.sh        # then run with ASPIDA_GPU=1 + ASPIDA_GPU_LIB=…
 ```
 
 ### Run
 
 ```bash
-# Start the server with a model
-QWEN_MODEL_PATH=/path/to/model.gguf ./obj/secure_server 8080
+# Start the encrypted server with a model (8765 is the default port).
+# On first run it generates its static keypair and writes the public half
+# to server_pub.hex — clients pin that key.
+QWEN_MODEL_PATH=/path/to/model.gguf ./obj/secure_server 8765
 
 # Or use the convenience target
 make serve
@@ -74,11 +79,21 @@ make serve
 
 ### Connect
 
-```bash
-# Interactive client
-make chat
+The server speaks the AEAD channel protocol, **not** HTTP — an OpenAI SDK
+pointed straight at it gets ciphertext. Pick a client:
 
-# Or point any OpenAI SDK at http://localhost:8080/v1
+```bash
+# Interactive encrypted client (does the handshake itself)
+make chat
+```
+
+```bash
+# Or, for OpenAI SDKs: run the local proxy, which does the handshake for you
+# and tunnels every request over the channel. It binds 127.0.0.1 ONLY.
+#   openai_proxy <server_host> <server_port> <server_pub_hex> [local_port]
+./obj/openai_proxy 127.0.0.1 8765 "$(cat server_pub.hex)" 8080
+
+# Now any OpenAI SDK works against http://localhost:8080/v1 (any api_key).
 ```
 
 ## Architecture
@@ -104,6 +119,12 @@ context management, security model, and configuration.
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | Chat completions (non-stream + SSE streaming) |
 | `/v1/models` | GET | List available models |
+| `/api/chat` | POST | Ollama-native chat (same channel, Ollama's request/response shape) |
+
+`/api/chat` is there so tools that already speak Ollama work unchanged: it
+accepts Ollama's body (`options.num_predict`, `think`) and answers in Ollama's
+shape (`message`, `thinking`). A bare model name means the `:latest` tag, as
+Ollama does.
 
 Responses follow the OpenAI schema: real `usage` (`prompt_tokens` /
 `completion_tokens` / `total_tokens`) and a correct `finish_reason` —
