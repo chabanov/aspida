@@ -1,15 +1,15 @@
 ------------------------------------------------------------------------
--- test_eval — Step 2 rigor: the delivery gate must use HELD-OUT (hidden) tests
--- for evaluation, separate from the VISIBLE tests used for best-of-N selection.
--- This is what makes "beats teachers" honest: a solution that overfits / hard-
--- codes the visible answers passes selection but FAILS the hidden eval, so it
--- cannot game the guarantee. Model-free (uses the real python3 verifier, no LLM).
+-- test_eval — evaluation rigor: scoring must use HELD-OUT (hidden) tests,
+-- separate from the VISIBLE tests used for best-of-N selection. This is what
+-- makes "the student beats its teacher" an honest claim: a solution that
+-- overfits / hard-codes the visible answers passes selection but FAILS the
+-- hidden eval, so it cannot game the result. Model-free (uses the real python3
+-- verifier, no LLM).
 ------------------------------------------------------------------------
 
 with Ada.Text_IO;      use Ada.Text_IO;
 with Ada.Command_Line; use Ada.Command_Line;
 with Exec_Verifier;    use Exec_Verifier;
-with Platform;
 
 procedure Test_Eval is
    Vf   : Python_Verifier;
@@ -45,23 +45,9 @@ begin
    Chk ("wrong: fails selection", not Vf.Is_Correct (1, Wrong));
    Chk ("wrong: fails held-out eval", not Eval_Correct (1, Wrong));
 
-   --  gate wiring: only the held-out pass-rate may feed the guarantee
-   declare
-      --  Suppose selection-inflated pass looked like 1.0, but the honest
-      --  held-out student pass is 0.90 vs a teacher at 0.40 over N=60.
-      R : constant Platform.Job_Report :=
-        Platform.Make_Report (Domain_Verified => True, Eval_N => 60,
-                              Teacher_Pass => 0.40, Student_Pass => 0.90);
-   begin
-      Chk ("gate beats-teachers on honest held-out numbers", R.Beats_Teachers);
-      --  if we'd (wrongly) reported a thin 0.41 vs 0.40, the margin rule rejects
-      Chk ("gate rejects sub-margin win",
-           not Platform.Make_Report (True, 60, 0.40, 0.41).Beats_Teachers);
-   end;
-
    New_Line;
    if Pass then
-      Put_Line ("RESULT: PASS  (held-out eval catches overfit; gate is honest)");
+      Put_Line ("RESULT: PASS  (held-out eval catches the overfit)");
    else
       Put_Line ("RESULT: FAIL");
       Set_Exit_Status (Failure);

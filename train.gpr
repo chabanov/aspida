@@ -21,13 +21,9 @@ project Train is
                  "train_aspida.adb", "teacher_probe.adb",
                  "cyber_train.adb", "code_distill.adb",
                  "code_iterate.adb", "exec_distill.adb",
-                 "gen_verify.adb", "test_platform.adb",
+                 "gen_verify.adb",
                  "test_eval.adb", "train_resident_probe.adb",
-                 "student_gpu_probe.adb", "test_turnkey.adb",
-                 "turnkey_demo.adb", "turnkey_serve_demo.adb",
-                 "test_data_pipeline.adb", "train_svg.adb",
-                 "test_job_store.adb", "platform_auth_probe.adb",
-                 "train_worker.adb");
+                 "student_gpu_probe.adb", "test_data_pipeline.adb", "train_svg.adb");
 
    package Compiler is
       for Default_Switches ("Ada") use Shared.Ada_O2;
