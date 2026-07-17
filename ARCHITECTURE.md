@@ -219,19 +219,60 @@ should be read with this scope.
 
 ## 7. Configuration (environment)
 
+The knobs an operator needs. (The engine reads more, but the rest are
+diagnostic or experimental switches — `ASPIDA_*_PROF`, `ASPIDA_NO_*`,
+`ASPIDA_BATCH_*` — plus a few the CUDA shim reads directly via `getenv`.)
+
+**Model & serving**
+
 | Variable | Effect |
 |---|---|
-| `QWEN_MODEL_PATH` | Active model path (any supported GGUF) |
-| `ASPIDA_GPU` | Enable GPU offload |
-| `ASPIDA_CTX` | Served context window (≤ model context) |
+| `QWEN_MODEL_PATH` | Active model path (any supported GGUF). Historical name: it accepts any architecture. No built-in default |
+| `ASPIDA_MODELS_DIR` | `:`-separated scan paths for the `/v1/models` catalog. A **deployment pin**: when set, it is the whole list and the discovery fallbacks are skipped |
+| `ASPIDA_MAX_LOADED_MODELS` | Resident model slots (default 3, clamped 1..64). Slot 1 is the pinned default and is never evicted |
+| `ASPIDA_AUTORELOAD` | Allow runtime model switching (exits for a supervisor to restart; used by `make serve`) |
 | `ASPIDA_MAX_TOKENS` | Per-turn generation cap (default 2048) |
+
+**GPU**
+
+| Variable | Effect |
+|---|---|
+| `ASPIDA_GPU` | Enable GPU offload (transparent CPU fallback if the shim is absent) |
+| `ASPIDA_GPU_LIB` | Path to `libaspidagpu.so` (default `./libaspidagpu.so`) |
+
+**Context**
+
+| Variable | Effect |
+|---|---|
+| `ASPIDA_CTX` | Served context window (≤ model context) |
 | `ASPIDA_NO_CTX_SHIFT` | Disable context-shift |
 | `ASPIDA_STRICT_CTX` | Return `context_length_exceeded` instead of trimming |
 | `ASPIDA_ROPE_NTK` | NTK-aware context extension for an unscaled model |
+
+**Network & anti-DoS**
+
+| Variable | Effect |
+|---|---|
+| `ASPIDA_BIND` | Restrict the listener address (e.g. `127.0.0.1`) |
 | `ASPIDA_CLIENT_TOKEN` | Require client auth token |
-| `ASPIDA_BIND` | Restrict the listener address |
-| `ASPIDA_RATE_MAX` / `ASPIDA_RATE_WINDOW` | New-connection rate limit |
-| `ASPIDA_TEMP` / `ASPIDA_TOP_P` / `ASPIDA_TOP_K` / `ASPIDA_MIN_P` / `ASPIDA_REPEAT_PENALTY` / `ASPIDA_SEED` | Sampling |
+| `ASPIDA_RATE_MAX` / `ASPIDA_RATE_WINDOW` | New-connection rate limit (default off) |
+| `ASPIDA_HANDSHAKE_TIMEOUT` | Seconds a peer may stall before its handshake is dropped (default 10) |
+| `ASPIDA_IDLE_TIMEOUT` | Seconds a connection may stay silent (default 600) |
+| `ASPIDA_SEND_TIMEOUT` | Seconds a blocked send may pin a handler when the peer stops reading (default 5) |
+
+**At rest**
+
+| Variable | Effect |
+|---|---|
+| `ASPIDA_STORE_PASSWORD` | Seal session history at rest (PBKDF2, 600k iterations + ChaCha20-Poly1305). Unset ⇒ history is stored in the clear |
+
+**Sampling & diagnostics**
+
+| Variable | Effect |
+|---|---|
+| `ASPIDA_TEMP` / `ASPIDA_TOP_P` / `ASPIDA_TOP_K` / `ASPIDA_MIN_P` / `ASPIDA_REPEAT_PENALTY` / `ASPIDA_REPEAT_LAST_N` / `ASPIDA_SEED` | Sampling defaults (a client request overrides them; server-side clamps still apply) |
+| `ASPIDA_PROF` | Print coarse per-step timings (attention vs matvec vs RoPE vs FFN) |
+| `ASPIDA_DBG` | Verbose tensor dumps |
 
 ---
 

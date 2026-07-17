@@ -52,6 +52,27 @@ Aspida implements several security features:
 
 4. **Network**: Default configuration binds to `0.0.0.0`. Use `ASPIDA_BIND=127.0.0.1` for local-only access.
 
+5. **Untrusted code execution**: the verifier-driven training path (`Exec_Verifier`, `src/train/exec_verifier.adb`) **runs model-generated code** — that is the point of a verifier, and it is the sharpest attack surface in this repo. In-process hardening (unique scratch path, direct exec with no shell, suppressed output, wall-clock timeout) is a down-payment, not containment.
+
+   Set `ASPIDA_VERIFY_SANDBOX` to a sandbox command prefix and **every execution is wrapped by it**. This is **required before any multi-tenant or rented-host use**:
+
+   ```bash
+   # Preinstalled util-linux only (unshare -n + setpriv nobody + timeout -KILL + ulimits);
+   # verified on Linux to block network egress incl. cloud metadata, run as nobody,
+   # and kill runaways at the timeout.
+   ASPIDA_VERIFY_SANDBOX=tools/verify_sandbox.sh
+
+   # or firejail:
+   ASPIDA_VERIFY_SANDBOX='firejail --quiet --net=none --private \
+     --rlimit-cpu=10 --rlimit-as=536870912 --seccomp'
+
+   # or a container wrapper:
+   ASPIDA_VERIFY_SANDBOX='docker run --rm -i --network=none --read-only \
+     --user 65534 --memory=512m --pids-limit=64 --cap-drop=ALL aspida-verify'
+   ```
+
+   Whatever you choose must provide: non-root, read-only rootfs, fresh tmpfs, **no network and blocked cloud-metadata (169.254.169.254)**, rlimits/cgroups, and seccomp. While untrusted code runs, give one tenant one dedicated host.
+
 ### Security Best Practices
 
 1. **Authentication**: Always set `ASPIDA_CLIENT_TOKEN` in production

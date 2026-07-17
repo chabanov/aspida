@@ -441,7 +441,7 @@ extern "C" void aspida_gpu_matmul(const void *w, long wbytes, int kind,
 // =====================================================================
 // Increment 1 — fused resident MoE FFN decode (declared in qwen_resident.cu;
 // implemented here where the K-quant warp kernels + g_wcache live).
-// See GPU_RESIDENT_FORWARD.md. Router GEMV -> softmax/top-k (on host, matching
+// Router GEMV -> softmax/top-k (on host, matching
 // LLM_MoE.Forward) -> K SwiGLU experts -> weighted combine -> shared expert,
 // every matvec on RESIDENT device buffers. Per MoE layer: one H2D of x, one
 // tiny D2H of the router logits, one D2H of the result — vs the 28 activation

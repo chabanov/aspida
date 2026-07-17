@@ -111,7 +111,8 @@ package body Exec_Verifier is
    --  / rented-droplet use set ASPIDA_VERIFY_SANDBOX to an isolator command
    --  prefix (microVM/container/firejail: non-root, read-only rootfs, no network
    --  + blocked cloud-metadata, rlimits/cgroups, seccomp) — every execution is
-   --  then wrapped by it. See PLATFORM.md §Security for the required recipe.
+   --  then wrapped by it. SECURITY.md §Known Security Considerations carries the
+   --  required recipe and a ready one: tools/verify_sandbox.sh.
    function Run (Code : String) return Boolean is
       use GNAT.OS_Lib;
       Path : constant String := "/tmp/aspida_verify_" &

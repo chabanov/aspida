@@ -1,6 +1,6 @@
 // qwen_resident.cu — resident-GPU decode blocks for the Qwen/MoE backend.
 //
-// See GPU_RESIDENT_FORWARD.md. Increment 1 (the fused MoE experts) is
+// Increment 1 (the fused MoE experts) is
 // IMPLEMENTED in gpu_matvec.cu (co-located with the K-quant warp kernels +
 // g_wcache it reuses), exported as `aspida_gpu_moe_experts` and bound from
 // src/llm/llm_qwen_gpu.ad[sb]. This file is kept as the design anchor / home
