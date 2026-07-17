@@ -991,16 +991,43 @@ package body LLM_Qwen is
       --  force-emit </think> so the model concludes and answers. 0 disables.
       Think_Open_Id  : constant Integer := LLM_Tokenizer.Token_To_Id (M.Tok, "<think>");
       Think_Close_Id : constant Integer := LLM_Tokenizer.Token_To_Id (M.Tok, "</think>");
-      --  Absolute cap, but never let reasoning eat the whole reply budget:
-      --  also cap at 3/4 of Max_New_Tokens so a low max_tokens request still
-      --  leaves room for the answer (else it reasons to the cap -> empty).
       Think_Budget_Env : constant Natural :=
         (if Ada.Environment_Variables.Exists ("ASPIDA_THINK_BUDGET")
          then Natural'Value (Ada.Environment_Variables.Value ("ASPIDA_THINK_BUDGET"))
          else 512);
+      --  RESERVE THE ANSWER; do not ration it. The rule here used to hand
+      --  reasoning 3/4 of Max_New_Tokens, which inverts the priority: a small
+      --  request spends most of its budget thinking and has a quarter left to
+      --  speak with. Measured on this model: max_tokens=128 gave reasoning 96
+      --  tokens and the answer 32 -- exactly enough for "I'll write a detailed
+      --  plan." and then finish_reason=length. EVERY budget behaved that way;
+      --  the reply was always truncated, never finished. The same question with
+      --  thinking off completes on its own in 561 tokens.
+      --
+      --  So: the answer is guaranteed Answer_Reserve tokens (or the entire
+      --  budget when that is smaller), and reasoning gets only the surplus,
+      --  still capped absolutely. At max_tokens >= 1024 this is identical to the
+      --  old rule (512 thinking); it only stops the small-budget case from
+      --  strangling itself.
+      --
+      --  llama.cpp keeps --reasoning-budget absolute and independent of
+      --  n_predict: that avoids the strangling, but lets a small budget be spent
+      --  entirely on thought and return an EMPTY answer. Reserving the answer
+      --  avoids both failure modes.
+      Answer_Reserve : constant Natural :=
+        (if Ada.Environment_Variables.Exists ("ASPIDA_ANSWER_RESERVE")
+         then Natural'Value (Ada.Environment_Variables.Value ("ASPIDA_ANSWER_RESERVE"))
+         else 512);
+      --  ASPIDA_THINK_BUDGET=0 disables the guard entirely (documented): the
+      --  model then reasons until it closes the block itself.
+      Think_Limit_On : constant Boolean := Think_Budget_Env > 0;
+      --  0 here means "no room to think" -> close a stray <think> on its first
+      --  token so the reply keeps the whole budget. It does NOT mean unlimited;
+      --  Think_Limit_On carries that.
       Think_Budget   : constant Natural :=
-        Natural'Min (Think_Budget_Env,
-                     Natural'Max (32, (Max_New_Tokens * 3) / 4));
+        (if Max_New_Tokens > Answer_Reserve
+         then Natural'Min (Think_Budget_Env, Max_New_Tokens - Answer_Reserve)
+         else 0);
       In_Reason    : Boolean := Reason_Seeded;   -- prompt opened <think>?
       Reason_Start : Natural := 0;               -- Produced when reasoning began
       Think_Forced : Boolean := False;           -- already forced the close
@@ -1405,7 +1432,7 @@ package body LLM_Qwen is
             --  budget without closing, force this token to </think> so the
             --  model concludes and produces the answer (prevents the runaway
             --  empty reply). Then track reasoning state from the token in play.
-            if Think_Budget > 0 and then Think_Close_Id >= 0 then
+            if Think_Limit_On and then Think_Close_Id >= 0 then
                if In_Reason and then not Think_Forced
                  and then Produced - Reason_Start >= Think_Budget
                  and then Tid /= Think_Close_Id
@@ -1617,6 +1644,28 @@ package body LLM_Qwen is
       Params : LLM_Sampler.Params;
       Stats : access Gen_Stats) return Chat_Result
    is
+      --  Don't start a thought there is no room to finish. Decode_Tokens
+      --  reserves ASPIDA_ANSWER_RESERVE tokens for the reply and gives
+      --  reasoning only the surplus; when the surplus is zero, letting the
+      --  model open <think> at all just burns tokens that get force-closed a
+      --  moment later and reported as reasoning_content the caller did not ask
+      --  for. Prefill the canonical closed block instead (the same thing
+      --  Ollama's `think:false` does) so the whole budget is the answer's.
+      --
+      --  Measured: this question with max_tokens=128 produced 96 tokens of
+      --  discarded reasoning and a 32-token stub; with thinking off the same
+      --  128 tokens are all answer.
+      Answer_Reserve : constant Natural :=
+        (if Ada.Environment_Variables.Exists ("ASPIDA_ANSWER_RESERVE")
+         then Natural'Value (Ada.Environment_Variables.Value ("ASPIDA_ANSWER_RESERVE"))
+         else 512);
+      No_Room_To_Think : constant Boolean :=
+        Params.Enable_Thinking and then Max_New_Tokens <= Answer_Reserve;
+      Params_Eff : constant LLM_Sampler.Params :=
+        (if No_Room_To_Think
+         then (Params with delta Enable_Thinking => False)
+         else Params);
+
       LF     : constant String := [1 => ASCII.LF];
       --  The platform api ends the conversation with an assistant `<think></think>`
       --  prefill. On Ollama that is a no-op and the hura template re-opens
@@ -1637,7 +1686,7 @@ package body LLM_Qwen is
       --  <think></think> as "answer directly" (stable, fast). Opt back into
       --  forced visible thinking with ASPIDA_FORCE_THINK once guarded.
       Think_Open   : constant Boolean :=
-        Empty_Think and then Params.Enable_Thinking
+        Empty_Think and then Params_Eff.Enable_Thinking
         and then Ada.Environment_Variables.Exists ("ASPIDA_FORCE_THINK");
       P      : aliased LLM_Chat_Parser.Parser :=
         LLM_Chat_Parser.New_Parser (Start_In_Reasoning => Think_Open);
@@ -1855,7 +1904,7 @@ package body LLM_Qwen is
             else
               Prefix
               & One (M.Im_Start_Id)
-              & (if Params.Enable_Thinking then
+              & (if Params_Eff.Enable_Thinking then
                     LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
                  else
                     LLM_Tokenizer.Encode (M.Tok, "assistant" & LF)
@@ -1869,7 +1918,7 @@ package body LLM_Qwen is
            (Token_Sink with Psr => P'Access, Tgt => SinkRef);
          Raw : constant String :=
            Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id,
-                          Bridge'Access, Params, Stats,
+                          Bridge'Access, Params_Eff, Stats,
                           Prefix_Len => Sys_Prefix_Len,
                           Cache_Bounds => Hist_B,
                           Reason_Seeded => Think_Open);
