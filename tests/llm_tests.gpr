@@ -17,7 +17,7 @@ project LLM_Tests is
                  "test_tokenizer.adb", "test_tensor.adb",
                  "test_deltanet.adb", "test_deltanet_blk.adb", "test_fullattn.adb", "test_block.adb",
                  "test_tokenizer_real.adb", "test_weights_real.adb", "test_qmatvec_real.adb",
-                 "test_qwen35_real.adb",
+                 "test_qwen35_real.adb", "test_spec_decode.adb",
                  "test_gemma.adb",
                  "test_qmatvec_q4k.adb", "test_qmatvec_guard.adb",
                  "test_quant.adb", "test_kquant_synth.adb",

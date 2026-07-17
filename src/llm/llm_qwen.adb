@@ -2048,4 +2048,12 @@ package body LLM_Qwen is
    function Arch_Name   (M : Qwen_Model) return String is
      (To_String (M.Arch));
 
+   function Encode (M : Qwen_Model; Text : String)
+     return LLM_Tokenizer.Token_Array is
+     (LLM_Tokenizer.Encode (M.Tok, Text));
+
+   function Decode (M : Qwen_Model; Ids : LLM_Tokenizer.Token_Array)
+     return String is
+     (LLM_Tokenizer.Decode (M.Tok, Ids));
+
 end LLM_Qwen;

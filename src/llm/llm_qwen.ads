@@ -157,6 +157,15 @@ package LLM_Qwen is
    --  general.architecture this model was loaded as (qwen35moe / qwen35 / qwen2).
    function Arch_Name (M : Qwen_Model) return String;
 
+   --  Tokenizer access. Speculative decoding needs to encode a prompt and
+   --  decode accepted ids with the SAME tokenizer the model was loaded with;
+   --  the draft and target must share a vocabulary for that to be sound (they
+   --  do here — hura 9b and 35b have byte-identical vocabs).
+   function Encode (M : Qwen_Model; Text : String)
+     return LLM_Tokenizer.Token_Array;
+   function Decode (M : Qwen_Model; Ids : LLM_Tokenizer.Token_Array)
+     return String;
+
 private
 
    type Block_Access is access LLM_Qwen_Blk.Qwen_Block;

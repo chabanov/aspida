@@ -308,3 +308,8 @@ help: ## Show this help
 test-qmatvec-real: ## Validate streaming quantized matvec on real tensors (needs model)
 	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
 	./obj/test_qmatvec_real
+
+.PHONY: test-spec-decode
+test-spec-decode: ## Speculative decoding: prove byte-identity vs target-alone greedy (needs HURA_MODEL + HURA_DRAFT)
+	$(GPRBUILD) -P tests/llm_tests.gpr $(GPR_FLAGS)
+	./obj/test_spec_decode
