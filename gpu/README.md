@@ -29,8 +29,11 @@ on real Llama-3.3-70B.
   end-to-end on the real engine.
 
 ## How to run (on an NVIDIA GPU box, image `gpu-h100x1-base`)
+
+The shim links against upstream llama.cpp's ggml (fattn-mma + mul_mat_id prefill),
+so build that first — `build_so.sh` documents the pinned commit and cmake flags:
 ```
-nvcc -O3 --fmad=false -arch=native -shared -Xcompiler -fPIC gpu/gpu_matvec.cu -o libaspidagpu.so
+GG=/path/to/llama.cpp ./build_so.sh          # -> libaspidagpu.so
 gprbuild -P probe.gpr -XOS=linux            # build the engine (Alire GNAT)
 ASPIDA_GPU=1 ASPIDA_GPU_LIB=$PWD/libaspidagpu.so LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
   ./obj/llama_probe model.gguf "The capital of France is" 8
