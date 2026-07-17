@@ -249,8 +249,11 @@ package body LLM_Chat_Parser is
       end if;
 
       if not P.Tool_Cap_Reached and then Nm /= Null_Unbounded_String then
-         P.N_Calls := P.N_Calls + 1;
-         if P.N_Calls <= P.Calls'Last then
+         --  Check the cap BEFORE incrementing: N_Calls indexes Calls and is
+         --  also the slice bound in Tool_Calls_Of, so letting it reach
+         --  Calls'Last + 1 raises Constraint_Error out of every later Chat.
+         if P.N_Calls < P.Calls'Last then
+            P.N_Calls := P.N_Calls + 1;
             declare
                Idx_C : constant String := Id_For (P.N_Calls);
             begin
