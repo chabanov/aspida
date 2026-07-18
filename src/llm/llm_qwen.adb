@@ -1191,6 +1191,21 @@ package body LLM_Qwen is
 
       Last_Logits : Tensor;
    begin
+      --  Fail loud on an over-window prompt. Ctx_Len is the trained context;
+      --  a prompt longer than it would drive RoPE past the range the model was
+      --  trained on and return coherent-looking garbage with no error. Refuse
+      --  instead: set Overflow (the server maps it to context_length_exceeded)
+      --  and return nothing, before any forward runs.
+      if Prompt_Ids'Length > M.Ctx_Len then
+         if Stats /= null then
+            Stats.all := (Prompt_Tokens     => Prompt_Ids'Length,
+                          Completion_Tokens => 0,
+                          Truncated         => False,
+                          Overflow          => True);
+         end if;
+         return "";
+      end if;
+
       --  Device-state allocation (Dnet_New/Fattn_New push to shared GPU vectors)
       --  is serialised in batch-serve mode, where several handler tasks set up
       --  generations concurrently.
