@@ -2260,6 +2260,25 @@ __global__ void k_dense_mv_b(const float *__restrict__ w, const float *__restric
     for (int i = lane; i < in; i += 32) { float wv = r[i]; for (int b = 0; b < B; ++b) acc[b] += wv * x[(size_t) b * in + i]; }
     for (int b = 0; b < B; ++b) { float a = warp_reduce(acc[b]); if (lane == 0) y[(size_t) b * out + row] = a; }
 }
+
+//  Compile-time-B twin of k_dense_mv_b (fp32 dense) — acc[BT] not acc[MAXB],
+//  same occupancy win as k_q8_0_wb_T. Dispatched for small B by launch_mv_b's
+//  fp32 default branch; bit-identical.
+template <int BT>
+__global__ void k_dense_mv_b_T(const float *__restrict__ w, const float *__restrict__ x,
+                               float *__restrict__ y, int in, int out) {
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (row >= out) return;
+    const float *r = w + (size_t) row * in;
+    float acc[BT];
+    #pragma unroll
+    for (int b = 0; b < BT; ++b) acc[b] = 0.f;
+    for (int i = lane; i < in; i += 32) { float wv = r[i];
+        #pragma unroll
+        for (int b = 0; b < BT; ++b) acc[b] += wv * x[(size_t) b * in + i]; }
+    #pragma unroll
+    for (int b = 0; b < BT; ++b) { float a = warp_reduce(acc[b]); if (lane == 0) y[(size_t) b * out + row] = a; }
+}
 // Batched matvec dispatch (weight read once for B lanes).
 // Tensor-core batched Q8_0 matmul: Y[B,out] = X[B,in] @ W[out,in]^T.
 // One warp computes a 16(M)x16(N) output tile, looping K in 32-wide Q8 blocks;
@@ -2450,7 +2469,24 @@ static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
         else if (kind == 2) k_q5k_wb<<<blocks, TPB, 0, st>>>(dw, xb, yb, in, out, bb);
         else if (kind == 3) k_q3k_wb<<<blocks, TPB, 0, st>>>(dw, xb, yb, in, out, bb);
         else if (kind == 4) k_q2k_wb<<<blocks, TPB, 0, st>>>(dw, xb, yb, in, out, bb);
-        else                k_dense_mv_b<<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out, bb);
+        else switch (bb) {   // fp32 dense: compile-time-B for small (decode) sub-batches
+            case  2: k_dense_mv_b_T< 2><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case  3: k_dense_mv_b_T< 3><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case  4: k_dense_mv_b_T< 4><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case  5: k_dense_mv_b_T< 5><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case  6: k_dense_mv_b_T< 6><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case  7: k_dense_mv_b_T< 7><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case  8: k_dense_mv_b_T< 8><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case  9: k_dense_mv_b_T< 9><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case 10: k_dense_mv_b_T<10><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case 11: k_dense_mv_b_T<11><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case 12: k_dense_mv_b_T<12><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case 13: k_dense_mv_b_T<13><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case 14: k_dense_mv_b_T<14><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case 15: k_dense_mv_b_T<15><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            case 16: k_dense_mv_b_T<16><<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out); break;
+            default: k_dense_mv_b<<<blocks, TPB, 0, st>>>((const float *) dw, xb, yb, in, out, bb); break;
+        }
     }
 }
 
