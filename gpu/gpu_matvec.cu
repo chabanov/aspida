@@ -1735,10 +1735,12 @@ __global__ void k_moe_gu_p_b(const uint8_t *__restrict__ gdw, const uint8_t *__r
                              const float *__restrict__ x_b, float *__restrict__ h_b,
                              const MoeRoute *__restrict__ route_b, int top_k, int dim, int intermed,
                              long g_bpe, long u_bpe, int gk, int uk, int sgk, int suk, int B) {
+    extern __shared__ uint8_t moe_async_smem[];   // cp.async staging, 2*272B/warp
     int total = (top_k + 1) * intermed;
     int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     int bl = gw / total, wid = gw % total;
     if (bl >= B) return;
+    uint8_t *stg = moe_async_smem + (size_t) (threadIdx.x >> 5) * (2 * MOE_ASYNC_CHUNK_B);
     const MoeRoute *route = route_b + bl;
     const float *x = x_b + (size_t) bl * dim;
     float *h = h_b + (size_t) bl * (MOE_MAXK + 1) * intermed;
@@ -1754,8 +1756,8 @@ __global__ void k_moe_gu_p_b(const uint8_t *__restrict__ gdw, const uint8_t *__r
         urow = sudw + (size_t) r * (dim / 256) * kq_bpb(suk);
         gkind = sgk; ukind = suk;
     }
-    float g = wrow(grow, gkind, x, dim, lane);
-    float u = wrow(urow, ukind, x, dim, lane);
+    float g = wrow_maybe_async(grow, gkind, x, dim, lane, stg);
+    float u = wrow_maybe_async(urow, ukind, x, dim, lane, stg);
     if (lane == 0) h[(size_t) k * intermed + r] = (g / (1.f + expf(-g))) * u;
 }
 
@@ -1763,9 +1765,11 @@ __global__ void k_moe_down_p_b(const uint8_t *__restrict__ ddw, const uint8_t *_
                                const float *__restrict__ h_b, float *__restrict__ y_b,
                                const MoeRoute *__restrict__ route_b, int top_k, int intermed, int dim,
                                long d_bpe, int dk, int sdk, int B) {
+    extern __shared__ uint8_t moe_async_smem[];   // cp.async staging, 2*272B/warp
     int gw = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     int bl = gw / dim, wid = gw % dim;
     if (bl >= B) return;
+    uint8_t *stg = moe_async_smem + (size_t) (threadIdx.x >> 5) * (2 * MOE_ASYNC_CHUNK_B);
     const MoeRoute *route = route_b + bl;
     const float *h = h_b + (size_t) bl * (MOE_MAXK + 1) * intermed;
     size_t bpr_d = (size_t) (intermed / 256) * kq_bpb(dk);
@@ -1773,10 +1777,10 @@ __global__ void k_moe_down_p_b(const uint8_t *__restrict__ ddw, const uint8_t *_
     float acc = 0.f;
     for (int k = 0; k < top_k; ++k) {
         const uint8_t *row = ddw + (size_t) route->idx[k] * d_bpe + (size_t) wid * bpr_d;
-        acc += route->w[k] * wrow(row, dk, h + (size_t) k * intermed, intermed, lane);
+        acc += route->w[k] * wrow_maybe_async(row, dk, h + (size_t) k * intermed, intermed, lane, stg);
     }
     acc += route->w[MOE_MAXK]
-           * wrow(sddw + (size_t) wid * bpr_s, sdk, h + (size_t) top_k * intermed, intermed, lane);
+           * wrow_maybe_async(sddw + (size_t) wid * bpr_s, sdk, h + (size_t) top_k * intermed, intermed, lane, stg);
     if (lane == 0) y_b[(size_t) bl * dim + wid] = acc;
 }
 
@@ -2573,8 +2577,8 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
             k_moe_route_b<<<B,256,0,st>>>(drlb, nxb, L.sgi, L.sgi_len, L.n_exp, L.top_k, dim, drouteb, B);
             int w1=(L.top_k+1)*L.intermed;
             int b1b=((size_t)B*w1*32+255)/256, b2b=((size_t)B*dim*32+255)/256;
-            k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, nxb, dhbb, drouteb, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, B);
-            k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, dhbb, aob, drouteb, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, B);
+            k_moe_gu_p_b<<<b1b,256,MOE_ASYNC_SHMEM(256),st>>>(L.gdw,L.udw,L.sgdw,L.sudw, nxb, dhbb, drouteb, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, B);
+            k_moe_down_p_b<<<b2b,256,MOE_ASYNC_SHMEM(256),st>>>(L.ddw,L.sddw, dhbb, aob, drouteb, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, B);
             k_axpy_b<<<((size_t)dim*B+255)/256,256,0,st>>>(Hb, aob, dim, B);
             DSEG(l_moe);
         }
@@ -3735,8 +3739,8 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 dim3 grC((dim+255)/256, P, 1);
                 k_moe_combine<<<grC,256,0,st>>>(pdmoe, pdroute, paob, L.top_k, dim, P);
             } else {
-                k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
-                k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
+                k_moe_gu_p_b<<<b1b,256,MOE_ASYNC_SHMEM(256),st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
+                k_moe_down_p_b<<<b2b,256,MOE_ASYNC_SHMEM(256),st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
             }
             k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
             if (pprof) { cudaEventRecord(pe2, st); cudaEventSynchronize(pe2);
@@ -3929,8 +3933,8 @@ extern "C" void aspida_gpu_chain_prefill_logits(int lane, int P, const int *rows
                 dim3 grC((dim+255)/256, P, 1);
                 k_moe_combine<<<grC,256,0,st>>>(pdmoe, pdroute, paob, L.top_k, dim, P);
             } else {
-                k_moe_gu_p_b<<<b1b,256,0,st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
-                k_moe_down_p_b<<<b2b,256,0,st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
+                k_moe_gu_p_b<<<b1b,256,MOE_ASYNC_SHMEM(256),st>>>(L.gdw,L.udw,L.sgdw,L.sudw, pnxb, pdhb, pdroute, L.top_k,dim,L.intermed,L.g_bpe,L.u_bpe,L.gk,L.uk,L.sgk,L.suk, P);
+                k_moe_down_p_b<<<b2b,256,MOE_ASYNC_SHMEM(256),st>>>(L.ddw,L.sddw, pdhb, paob, pdroute, L.top_k,L.intermed,dim,L.d_bpe,L.dk,L.sdk, P);
             }
             k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);
             if (pprof) { cudaEventRecord(pe2, st); cudaEventSynchronize(pe2);
