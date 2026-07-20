@@ -1445,6 +1445,59 @@ __global__ void k_fattn_attend(
     }
 }
 
+//  Batched full-attention decode: ONE launch over grid(nq, B) instead of B
+//  serial launches of nq blocks. blockIdx.y = lane; per-lane K/V/scores come
+//  from pointer tables (like the delta-net gb_Sptr), q/g/attn are the batched
+//  contiguous [B, att] buffers, pos is the batched array. Math is byte-identical
+//  to k_fattn_attend per (h, lane) — this only fills the GPU (nq*B blocks vs nq)
+//  and removes the per-lane launch overhead that made attention ~25% of decode.
+__global__ void k_fattn_attend_b(
+    const float *__restrict__ q_all_b, const float *__restrict__ g_all_b,
+    const __half *const *__restrict__ K_arr, const __half *const *__restrict__ V_arr,
+    float *const *__restrict__ Sc_arr, float *__restrict__ attn_b,
+    int nq, int nkv, int hd, int kvd, const int *__restrict__ posp, int max_len, int att) {
+    int b = blockIdx.y;
+    const __half *Kc = K_arr[b];
+    const __half *Vc = V_arr[b];
+    float *scores = Sc_arr[b];
+    const float *q_all = q_all_b + (size_t) b * att;
+    const float *g_all = g_all_b + (size_t) b * att;
+    float *attn = attn_b + (size_t) b * att;
+    int len = posp[b] + 1;
+    int h = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+    int rep = nq / nkv, kvh = h / rep;
+    int q_off = h * hd, kv_off = kvh * hd;
+    float *sc = scores + (size_t) h * max_len;
+    __shared__ float red[256];
+    float scale = rsqrtf((float) hd);
+    float lmax = -3.402823466e38f;
+    for (int s = tid; s < len; s += nt) {
+        float dot = 0.f;
+        const __half *k = Kc + (size_t) s * kvd + kv_off;
+        const float *q = q_all + q_off;
+        for (int d = 0; d < hd; ++d) dot += q[d] * __half2float(k[d]);
+        dot *= scale;
+        sc[s] = dot;
+        if (dot > lmax) lmax = dot;
+    }
+    red[tid] = lmax; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] = fmaxf(red[tid], red[tid + o]); __syncthreads(); }
+    float bmax = red[0]; __syncthreads();
+    float lsum = 0.f;
+    for (int s = tid; s < len; s += nt) { float e = expf(sc[s] - bmax); sc[s] = e; lsum += e; }
+    red[tid] = lsum; __syncthreads();
+    for (int o = nt / 2; o > 0; o >>= 1) { if (tid < o) red[tid] += red[tid + o]; __syncthreads(); }
+    float inv = 1.f / red[0];
+    __syncthreads();
+    if (tid < hd) {
+        float acc = 0.f;
+        for (int s = 0; s < len; ++s)
+            acc += sc[s] * inv * __half2float(Vc[(size_t) s * kvd + kv_off + tid]);
+        float g = g_all[q_off + tid];
+        attn[q_off + tid] = acc * (1.f / (1.f + expf(-g)));
+    }
+}
+
 // One full-attention decode layer on the device. pos = 0-based position (the
 // Ada St.Len before this token); the caller advances its Len afterwards.
 extern "C" void aspida_gpu_fattn_step(
@@ -2505,6 +2558,9 @@ static MoeRoute *drouteb=nullptr;
 static int *gb_rows=nullptr,*gb_pos=nullptr;
 static void **gb_Sptr=nullptr;    // device table of B per-lane delta-net S pointers
 static void **gb_histptr=nullptr; // device table of B per-lane conv hist pointers
+static void **gb_fK=nullptr;      // [NL*B] per-lane full-attn K-cache pointers
+static void **gb_fV=nullptr;      // [NL*B] per-lane full-attn V-cache pointers
+static void **gb_fSc=nullptr;     // [NL*B] per-lane full-attn scores-scratch pointers
 static int chb_inited=0;
 static cudaStream_t gb_stream=0;
 
@@ -2527,6 +2583,9 @@ static void chain_alloc_b(void) {
     cudaMalloc(&gb_rows, Bd*4); cudaMalloc(&gb_pos, Bd*4);
     cudaMalloc(&gb_Sptr, (size_t) g_chain.size() * Bd * sizeof(void*));
     cudaMalloc(&gb_histptr, (size_t) g_chain.size() * Bd * sizeof(void*));
+    cudaMalloc(&gb_fK, (size_t) g_chain.size() * Bd * sizeof(void*));
+    cudaMalloc(&gb_fV, (size_t) g_chain.size() * Bd * sizeof(void*));
+    cudaMalloc(&gb_fSc, (size_t) g_chain.size() * Bd * sizeof(void*));
     cudaStreamCreateWithPriority(&gb_stream, cudaStreamDefault, aspida_stream_prio(1));
     chb_inited=1;
 }
@@ -2553,6 +2612,7 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
     //  staging is untouched for the rest of this forward, so the async copy is
     //  race-free). k_dnet_recur_b then reads gb_Sptr[li*B + lane].
     static void *hSptr[BMAX * 64], *hHptr[BMAX * 64];
+    static void *hfK[BMAX * 64], *hfV[BMAX * 64], *hfSc[BMAX * 64];
     for (int li = 0; li < NL; ++li)
         if (!g_chain[li].is_fattn)
             for (int b = 0; b < B; ++b) {
@@ -2560,10 +2620,20 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
                 hSptr[(size_t) li * B + b] = ds.S;
                 hHptr[(size_t) li * B + b] = ds.hist;
             }
+        else
+            for (int b = 0; b < B; ++b) {
+                FattnState fs = g_fattn[handles[b * NL + li]];
+                hfK[(size_t) li * B + b]  = fs.K;
+                hfV[(size_t) li * B + b]  = fs.V;
+                hfSc[(size_t) li * B + b] = fs.scores;
+            }
     cudaMemcpyAsync(gb_Sptr, hSptr, (size_t) NL * B * sizeof(void*),
                     cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(gb_histptr, hHptr, (size_t) NL * B * sizeof(void*),
                     cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(gb_fK, hfK,   (size_t) NL * B * sizeof(void*), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(gb_fV, hfV,   (size_t) NL * B * sizeof(void*), cudaMemcpyHostToDevice, st);
+    cudaMemcpyAsync(gb_fSc, hfSc, (size_t) NL * B * sizeof(void*), cudaMemcpyHostToDevice, st);
     k_embed_b<<<((size_t)dim*B+255)/256,256,0,st>>>(g_ch_embed, gb_rows, Hb, dim, B);
     if (dprof) cudaEventRecord(dpa,st);
     for (int li=0; li<NL; ++li) {
@@ -2590,16 +2660,24 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
             launch_mv_b(L.qw, L.qw_k, dim, qgd, nxb, dqgb, B, st);
             launch_mv_b(L.kw, L.kw_k, dim, kvd, nxb, dktb, B, st);
             launch_mv_b(L.vw, L.vw_k, dim, kvd, nxb, dvtb, B, st);
+            int fmaxlen = 0;
             for (int b=0;b<B;++b) {
                 FattnState fs=g_fattn[handles[b*NL+li]];
+                fmaxlen = fs.max_len;   // uniform across lanes (model config)
                 k_fattn_prep<<<L.nq+L.nkv,L.hd,(size_t)L.hd*4,st>>>(
                     dqgb+(size_t)b*qgd, dktb+(size_t)b*kvd, dvtb+(size_t)b*kvd, L.qn, L.kn,
                     dqab+(size_t)b*att, dgab+(size_t)b*att, fs.K, fs.V,
                     L.nq,L.nkv,L.hd,kvd, gb_pos+b, L.rd,L.base,L.freq_scale,L.m_scale,
                     L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total);
-                k_fattn_attend<<<L.nq,256,0,st>>>(dqab+(size_t)b*att, dgab+(size_t)b*att, fs.K, fs.V, fs.scores, dattb+(size_t)b*att,
-                    L.nq,L.nkv,L.hd,kvd, gb_pos+b, fs.max_len);
             }
+            //  One batched attention launch over grid(nq, B) — byte-identical to
+            //  the B serial k_fattn_attend calls, but nq*B blocks fill the GPU.
+            k_fattn_attend_b<<<dim3(L.nq, B), 256, 0, st>>>(
+                dqab, dgab,
+                (const __half *const *)(gb_fK  + (size_t) li * B),
+                (const __half *const *)(gb_fV  + (size_t) li * B),
+                (float *const *)      (gb_fSc + (size_t) li * B),
+                dattb, L.nq, L.nkv, L.hd, kvd, gb_pos, fmaxlen, att);
             launch_mv_b(L.fow, L.fow_k, att, dim, dattb, aob, B, st);
         }
         k_axpy_b<<<((size_t)dim*B+255)/256,256,0,st>>>(Hb, aob, dim, B);
