@@ -55,15 +55,17 @@ package body OpenAI is
          --  1.1 that never matched the real Modelfile; that looser candidate set
          --  — esp. min_p 0 — let the model ramble/hallucinate where Ollama, with
          --  min_p 0.05 + top_k 20 + top_p 0.8, stays focused.)
-         --  Defaults = the OFFICIAL Ornith-1.0 eval settings (deep-reinforce
-         --  benchmark harness: temperature=1.0, top_p=1.0, no top-k/min-p
-         --  truncation). The model is RL-trained under pure sampling; the old
-         --  near-greedy defaults (0.15/0.8/20/0.05) squeezed a reasoning
-         --  model's distribution it was never tuned for. Callers still
-         --  override per request.
-         R.Params.Temperature      := JSON.As_Float (JSON.Get (V, "temperature"), 1.0);
-         R.Params.Top_P            := JSON.As_Float (JSON.Get (V, "top_p"), 1.0);
-         R.Params.Top_K            := JSON.As_Int   (JSON.Get (V, "top_k"), 0);
+         --  Prod default = RELIABILITY (operator decision 2026-07-20). The
+         --  official eval settings (temp=1.0/top_p=1.0, pure sampling) maximise
+         --  the trained distribution and coding-exploration diversity, but the
+         --  prod-metrics run measured occasional factual slips under pure
+         --  sampling (e.g. "Sydney" for Australia's capital) that temp=0.2
+         --  fixes deterministically. We serve general chat, so default to the
+         --  low-variance config; a caller wanting the benchmark distribution
+         --  passes temperature=1.0/top_p=1.0 explicitly per request.
+         R.Params.Temperature      := JSON.As_Float (JSON.Get (V, "temperature"), 0.2);
+         R.Params.Top_P            := JSON.As_Float (JSON.Get (V, "top_p"), 0.95);
+         R.Params.Top_K            := JSON.As_Int   (JSON.Get (V, "top_k"), 20);
          R.Params.Min_P            := JSON.As_Float (JSON.Get (V, "min_p"), 0.0);
          R.Params.Presence_Penalty := JSON.As_Float (JSON.Get (V, "presence_penalty"), 0.0);
          --  Ollama-native `think` maps to this on the /api/chat bridge; default
