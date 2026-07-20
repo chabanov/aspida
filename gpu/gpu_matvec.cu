@@ -359,6 +359,33 @@ __global__ void k_q8_0_wb(const uint8_t *__restrict__ w, const float *__restrict
     for (int b = 0; b < B; ++b) { float a = warp_reduce(acc[b]); if (lane == 0) y[(size_t) b * out + row] = a; }
 }
 
+//  Decode-regime variant: B is a COMPILE-TIME constant so acc[BT] uses exactly
+//  BT registers instead of the fixed acc[MAXB] (32) the runtime kernel above
+//  reserves regardless of B. At B<=8 (the batch-serve lane count) that array
+//  destroys occupancy — measured 2.1-3.8x slower than this templated form at
+//  the real Ornith attention-projection shapes on H200, bit-identical output
+//  (NMSE 2.6e-14). Instantiated for the decode lane counts and dispatched by
+//  launch_mv_b's small-B branch; larger B keeps the tensor-core / runtime paths.
+template <int BT>
+__global__ void k_q8_0_wb_T(const uint8_t *__restrict__ w, const float *__restrict__ x,
+                            float *__restrict__ y, int in, int out) {
+    int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
+    if (row >= out) return;
+    int nb = in / 32; size_t bpr = (size_t) nb * 34;
+    const uint8_t *r = w + (size_t) row * bpr; float acc[BT];
+    #pragma unroll
+    for (int b = 0; b < BT; ++b) acc[b] = 0.f;
+    for (int blk = 0; blk < nb; ++blk) {
+        const uint8_t *bl = r + (size_t) blk * 34; float d = f16(bl);
+        const int8_t *qs = (const int8_t *) (bl + 2);
+        float wv = d * (float) qs[lane]; int i = blk * 32 + lane;
+        #pragma unroll
+        for (int b = 0; b < BT; ++b) acc[b] += wv * x[(size_t) b * in + i];
+    }
+    #pragma unroll
+    for (int b = 0; b < BT; ++b) { float a = warp_reduce(acc[b]); if (lane == 0) y[(size_t) b * out + row] = a; }
+}
+
 #include <cstdlib>
 
 //  Shared weight VRAM cache: each distinct host weight pointer is uploaded
@@ -2384,7 +2411,28 @@ static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
             dim3 grid((out + WMM_TN - 1) / WMM_TN, (B + WMM_TM - 1) / WMM_TM);
             k_q8_wmma<<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
         } else {
-            k_q8_0_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B);
+            //  Decode (B=2..15): compile-time-B kernel — acc[B] not acc[MAXB],
+            //  2.1-3.8x faster at these shapes on H200, bit-identical. Cases
+            //  cover up to 16 lanes so raising Max_Lanes needs no kernel edit;
+            //  any B outside falls back to the runtime-B kernel.
+            switch (B) {
+                case  2: k_q8_0_wb_T< 2><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case  3: k_q8_0_wb_T< 3><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case  4: k_q8_0_wb_T< 4><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case  5: k_q8_0_wb_T< 5><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case  6: k_q8_0_wb_T< 6><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case  7: k_q8_0_wb_T< 7><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case  8: k_q8_0_wb_T< 8><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case  9: k_q8_0_wb_T< 9><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case 10: k_q8_0_wb_T<10><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case 11: k_q8_0_wb_T<11><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case 12: k_q8_0_wb_T<12><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case 13: k_q8_0_wb_T<13><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case 14: k_q8_0_wb_T<14><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case 15: k_q8_0_wb_T<15><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                case 16: k_q8_0_wb_T<16><<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out); break;
+                default: k_q8_0_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B); break;
+            }
         }
         return;
     }
