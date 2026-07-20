@@ -1011,7 +1011,11 @@ package body LLM_Qwen is
       Think_Budget_Env : constant Natural :=
         (if Ada.Environment_Variables.Exists ("ASPIDA_THINK_BUDGET")
          then Natural'Value (Ada.Environment_Variables.Value ("ASPIDA_THINK_BUDGET"))
-         else 512);
+         --  2048, not 512: Ornith is an RL-trained coding reasoner whose hard
+         --  answers routinely spend 1-3k tokens thinking (measured on the
+         --  eval-hura hard set); 512 force-closed mid-thought and cost quality.
+         --  Still a hard guard against run-away (0 disables entirely).
+         else 2048);
       --  RESERVE THE ANSWER; do not ration it. The rule here used to hand
       --  reasoning 3/4 of Max_New_Tokens, which inverts the priority: a small
       --  request spends most of its budget thinking and has a quarter left to
@@ -1744,15 +1748,21 @@ package body LLM_Qwen is
       Empty_Think  : constant Boolean :=
         Last_Is_Asst
         and then Is_Empty_Think (To_String (Conversation (Conversation'Last).Text));
-      --  Forcing an OPEN <think> makes the model reason visibly (matches
-      --  Ollama), but for some prompts it runs AWAY in reasoning to the token
-      --  cap and never emits the answer — an empty 40 s+ reply. Until a decode
-      --  thinking-budget guard lands, default to honouring the platform's empty
-      --  <think></think> as "answer directly" (stable, fast). Opt back into
-      --  forced visible thinking with ASPIDA_FORCE_THINK once guarded.
+      --  Ornith-1.0 is an RL-trained REASONING model: its benchmark quality
+      --  (SWE-Bench/Terminal-Bench) is achieved WITH thinking, and its official
+      --  chat template ALWAYS ends the generation prompt with an OPEN
+      --  "<think>\n" (enable_thinking=false is the exception, not the rule).
+      --  The old default suppressed thinking because reasoning could run away
+      --  to the token cap — that blocker is gone: Decode_Tokens carries a
+      --  think-budget guard (ASPIDA_THINK_BUDGET force-close + answer reserve).
+      --  So thinking is now ON by default for BOTH the platform's empty
+      --  <think></think> prefill and fresh turns, matching the official
+      --  template exactly. Opt out with ASPIDA_NO_FORCE_THINK (or per-request
+      --  enable_thinking=false, which prefills the canonical closed block).
       Think_Open   : constant Boolean :=
-        Empty_Think and then Params_Eff.Enable_Thinking
-        and then Ada.Environment_Variables.Exists ("ASPIDA_FORCE_THINK");
+        Params_Eff.Enable_Thinking
+        and then (Empty_Think or else not Last_Is_Asst)
+        and then not Ada.Environment_Variables.Exists ("ASPIDA_NO_FORCE_THINK");
       P      : aliased LLM_Chat_Parser.Parser :=
         LLM_Chat_Parser.New_Parser (Start_In_Reasoning => Think_Open);
       Nullish : constant Null_Sink_Access := New_Null_Sink;

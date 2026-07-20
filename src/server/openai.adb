@@ -55,10 +55,16 @@ package body OpenAI is
          --  1.1 that never matched the real Modelfile; that looser candidate set
          --  — esp. min_p 0 — let the model ramble/hallucinate where Ollama, with
          --  min_p 0.05 + top_k 20 + top_p 0.8, stays focused.)
-         R.Params.Temperature      := JSON.As_Float (JSON.Get (V, "temperature"), 0.15);
-         R.Params.Top_P            := JSON.As_Float (JSON.Get (V, "top_p"), 0.8);
-         R.Params.Top_K            := JSON.As_Int   (JSON.Get (V, "top_k"), 20);
-         R.Params.Min_P            := JSON.As_Float (JSON.Get (V, "min_p"), 0.05);
+         --  Defaults = the OFFICIAL Ornith-1.0 eval settings (deep-reinforce
+         --  benchmark harness: temperature=1.0, top_p=1.0, no top-k/min-p
+         --  truncation). The model is RL-trained under pure sampling; the old
+         --  near-greedy defaults (0.15/0.8/20/0.05) squeezed a reasoning
+         --  model's distribution it was never tuned for. Callers still
+         --  override per request.
+         R.Params.Temperature      := JSON.As_Float (JSON.Get (V, "temperature"), 1.0);
+         R.Params.Top_P            := JSON.As_Float (JSON.Get (V, "top_p"), 1.0);
+         R.Params.Top_K            := JSON.As_Int   (JSON.Get (V, "top_k"), 0);
+         R.Params.Min_P            := JSON.As_Float (JSON.Get (V, "min_p"), 0.0);
          R.Params.Presence_Penalty := JSON.As_Float (JSON.Get (V, "presence_penalty"), 0.0);
          --  Ollama-native `think` maps to this on the /api/chat bridge; default
          --  thinking ON (the model reasons unless the caller disables it).
@@ -87,54 +93,50 @@ package body OpenAI is
             --    </function>
             --    <tool_call>
             --
+            --  VERBATIM mirror of the official Ornith-1.0 chat template's tools
+            --  block (deepreinforce-ai/Ornith-1.0-35B chat_template.jinja):
+            --  header text, one-line `tojson` of each WHOLE tool object,
+            --  the exact example format (parameter values on their own lines),
+            --  and the <IMPORTANT> reminder. The previous synthesized prompt
+            --  (different wording, pretty-printed JSON, an invented "Form B")
+            --  deviated from the train-time distribution and measurably hurt
+            --  tool-call reliability.
             declare
                Acc : Unbounded_String :=
-                 Null_Unbounded_String & "# Tools" & ASCII.LF
-                 & "You may call one or more functions to assist with the user"
-                 & " query." & ASCII.LF & "Here are the available tools:" & ASCII.LF
-                 & ASCII.LF & "<tools>" & ASCII.LF;
+                 Null_Unbounded_String & "# Tools" & ASCII.LF & ASCII.LF
+                 & "You have access to the following functions:" & ASCII.LF
+                 & ASCII.LF & "<tools>";
             begin
                for I in 1 .. JSON.Length (T) loop
                   declare
                      Ti : constant JSON.Value_Ref := JSON.Item (T, I);
-                     F  : constant JSON.Value_Ref := JSON.Get (Ti, "function");
-                     Nm : constant String :=
-                       JSON.As_String (JSON.Get (F, "name"), "");
-                     Desc : constant String :=
-                       JSON.As_String (JSON.Get (F, "description"), "");
-                     Params : constant JSON.Value_Ref := JSON.Get (F, "parameters");
                   begin
-                     if Nm /= "" then
-                        Acc := Acc & "{" & ASCII.LF
-                          & "  ""name"": """ & Nm & """,";
-                        if Desc /= "" then
-                           Acc := Acc & ASCII.LF
-                             & "  ""description"": """ & Desc & """,";
-                        end if;
-                        Acc := Acc & ASCII.LF
-                          & "  ""parameters"": "
-                          & JSON.To_String (Params) & ASCII.LF
-                          & "}" & ASCII.LF;
-                     end if;
+                     Acc := Acc & ASCII.LF & JSON.To_String (Ti);
                   end;
                end loop;
-               Acc := Acc & "</tools>" & ASCII.LF & ASCII.LF
-                 & "When you make a tool call, emit a tag and a body. Two equivalent forms are accepted:" & ASCII.LF
-                 & "  Form A (canonical):" & ASCII.LF
-                 & "    <tool_call>" & ASCII.LF
-                 & "    <function=NAME>" & ASCII.LF
-                 & "    <parameter=KEY>VALUE</parameter>" & ASCII.LF
-                 & "    </function>" & ASCII.LF
-                 & "    </tool_call>" & ASCII.LF
-                 & "  Form B (bare tags, line-aligned):" & ASCII.LF
-                 & "    tool_call" & ASCII.LF
-                 & "    <function=NAME>" & ASCII.LF
-                 & "    <parameter=KEY>VALUE</parameter>" & ASCII.LF
-                 & "    </function>" & ASCII.LF
-                 & "    tool_call" & ASCII.LF
-                 & "Pick Form A unless you were fine-tuned on Form B. In either form, output" & ASCII.LF
-                 & "the angle brackets literally and do NOT wrap in Markdown fences or code blocks." & ASCII.LF
-                 & "Otherwise answer normally. Do not make up parameter values." & ASCII.LF;
+               Acc := Acc & ASCII.LF & "</tools>" & ASCII.LF & ASCII.LF
+                 & "If you choose to call a function ONLY reply in the following format with NO suffix:" & ASCII.LF
+                 & ASCII.LF
+                 & "<tool_call>" & ASCII.LF
+                 & "<function=example_function_name>" & ASCII.LF
+                 & "<parameter=example_parameter_1>" & ASCII.LF
+                 & "value_1" & ASCII.LF
+                 & "</parameter>" & ASCII.LF
+                 & "<parameter=example_parameter_2>" & ASCII.LF
+                 & "This is the value for the second parameter" & ASCII.LF
+                 & "that can span" & ASCII.LF
+                 & "multiple lines" & ASCII.LF
+                 & "</parameter>" & ASCII.LF
+                 & "</function>" & ASCII.LF
+                 & "</tool_call>" & ASCII.LF
+                 & ASCII.LF
+                 & "<IMPORTANT>" & ASCII.LF
+                 & "Reminder:" & ASCII.LF
+                 & "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags" & ASCII.LF
+                 & "- Required parameters MUST be specified" & ASCII.LF
+                 & "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after" & ASCII.LF
+                 & "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls" & ASCII.LF
+                 & "</IMPORTANT>";
                R.Tools_Sysmsg := Acc;
             end;
          end if;
