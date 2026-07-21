@@ -35,16 +35,18 @@ __global__ void k_gdn_log(const float *__restrict__ src, float *__restrict__ dst
     size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = logf(src[i]);
 }
-// aspida state S[(h*hd+key)*hd+val] -> ggml [val*hd+key + h*hd*hd] (transpose key<->val)
+// ggml result-state layout (kernel writes state[h*hd*hd + col*hd + i], col=val, i=key):
+//   ggml flat = h*hd*hd + val*hd + key   (val is the MIDDLE stride, key is INNER)
+// aspida state = [(h*hd+key)*hd+val]     (key MIDDLE, val INNER)  -> key<->val transpose.
 __global__ void k_gdn_st_in(const float *__restrict__ src, float *__restrict__ dst, int hd, int H) {
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(size_t)H*hd*hd)return;
-    int val=i%hd; size_t r=i/hd; int key=r%hd; int h=r/hd;   // ggml flat = h*hd*hd + val*hd + key (i here)
+    int key=i%hd; size_t r=i/hd; int val=r%hd; int h=r/hd;   // ggml flat i = h*hd*hd + val*hd + key
     dst[i]=src[((size_t)h*hd+key)*hd+val];
 }
 __global__ void k_gdn_st_out(const float *__restrict__ src, float *__restrict__ dst, int hd, int H) {
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x; if(i>=(size_t)H*hd*hd)return;
-    int val=i%hd; size_t r=i/hd; int key=r%hd; int h=r/hd;
-    dst[((size_t)h*hd+key)*hd+val]=src[i];   // ggml[val*hd+key+h*hd*hd] -> aspida[(h*hd+key)*hd+val]
+    int key=i%hd; size_t r=i/hd; int val=r%hd; int h=r/hd;   // ggml flat i = h*hd*hd + val*hd + key
+    dst[((size_t)h*hd+key)*hd+val]=src[i];   // -> aspida[(h*hd+key)*hd+val]
 }
 
 struct GgmlGDN {
@@ -95,6 +97,13 @@ static bool aspida_ggml_dnet_prefill(
     k_gdn_log<<<((size_t)P*nv+bs-1)/bs,bs>>>(gate, (float*)S.g->data, (size_t)P*nv);
     k_gdn_copy<<<((size_t)P*nv+bs-1)/bs,bs>>>(beta, (float*)S.b->data, (size_t)P*nv);
     k_gdn_st_in<<<((size_t)vhd*vhd*nv+bs-1)/bs,bs>>>(stateS, (float*)S.s->data, vhd, nv);
+    cudaDeviceSynchronize();   // repack (stream 0) MUST complete before ggml (own stream) reads inputs
+    // The very first ggml graph compute of the process carries a one-time CUDA
+    // warmup transient (lazy module/kernel load) that races the result. The op
+    // is functional (reads S.s, writes S.out; never mutates its inputs), so we
+    // absorb it by computing twice on the first call — the second is warm+correct.
+    static bool gdn_warmed = false;
+    if (!gdn_warmed) { ggml_backend_graph_compute(g_gfa.be, S.gr); cudaDeviceSynchronize(); gdn_warmed = true; }
     ggml_backend_graph_compute(g_gfa.be, S.gr);
     cudaDeviceSynchronize();   // ggml output ready before the st-stream copies (race fix)
     // out = [vhd, nv, P] (== aspida osh [t][h*vhd+v]); new state = [vhd,vhd,nv] after
