@@ -394,13 +394,14 @@ __global__ void k_q8_0_wb_T(const uint8_t *__restrict__ w, const float *__restri
 
 //  Shared weight VRAM cache: each distinct host weight pointer is uploaded
 //  once and reused by both matvec and matmul (same model weights).
-static std::unordered_map<const void *, uint8_t *> g_wcache;
+struct WCacheEnt { uint8_t *dw; long bytes; };
+static std::unordered_map<const void *, WCacheEnt> g_wcache;
 static uint8_t *upload_weight(const void *w, long wbytes) {
     auto it = g_wcache.find(w);
-    if (it != g_wcache.end()) return it->second;
+    if (it != g_wcache.end()) return it->second.dw;
     uint8_t *dw; cudaMalloc(&dw, wbytes);
     cudaMemcpy(dw, w, wbytes, cudaMemcpyHostToDevice);
-    g_wcache[w] = dw; return dw;
+    g_wcache[w] = { dw, wbytes }; return dw;
 }
 
 //  Phase 1b eviction: drop the VRAM mirror of one host weight pointer. Called
@@ -412,7 +413,7 @@ extern "C" void aspida_gpu_free_weight(const void *w) {
     aspida_ggml_free_weight(w);   // MoE Phase B: evict ggml-owned weights too
     auto it = g_wcache.find(w);
     if (it == g_wcache.end()) return;
-    cudaFree(it->second);
+    cudaFree(it->second.dw);
     g_wcache.erase(it);
 }
 
@@ -1929,8 +1930,36 @@ struct ChainLayer {
 };
 static std::vector<ChainLayer> g_chain;
 static float *g_ch_embed = nullptr, *g_ch_fnorm = nullptr;
+
+//  Weight-integrity forensics: 64-bit XOR-reduce of a device buffer. Used by
+//  the [STATS] telemetry to detect stray writes into long-lived memory
+//  (weights) — the corrupted-engine investigation (2026-07-21).
+__global__ void k_xor64(const unsigned long long *__restrict__ p, size_t n64,
+                        unsigned long long *__restrict__ out) {
+    __shared__ unsigned long long sh[256];
+    size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long v = 0;
+    for (; i < n64; i += (size_t) gridDim.x * blockDim.x) v ^= p[i];
+    sh[threadIdx.x] = v; __syncthreads();
+    for (int k = 128; k > 0; k >>= 1) {
+        if (threadIdx.x < k) sh[threadIdx.x] ^= sh[threadIdx.x + k];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicXor(out, sh[0]);
+}
+static unsigned long long dev_xor64(const void *p, size_t bytes) {
+    if (!p || bytes < 8) return 0;
+    static unsigned long long *d_out = nullptr;
+    if (!d_out) cudaMalloc(&d_out, 8);
+    cudaMemset(d_out, 0, 8);
+    k_xor64<<<256, 256>>>((const unsigned long long *) p, bytes / 8, d_out);
+    unsigned long long h = 0;
+    cudaMemcpy(&h, d_out, 8, cudaMemcpyDeviceToHost);
+    return h;
+}
 static uint8_t *g_ch_lm = nullptr; static int g_ch_lm_k = -1;  // LM head kept in native quant
 static int g_ch_dim = 0, g_ch_vocab = 0, g_ch_ready = 0;
+static int g_ch_embed_rows = 0;   // embed table rows — bounds guard for token ids
 static int g_mx_qo = 0, g_mx_nv = 0, g_mx_vd = 0, g_mx_qgd = 0, g_mx_kvd = 0,
            g_mx_att = 0, g_mx_hbuf = 0, g_mx_nexp = 0;
 
@@ -2081,6 +2110,7 @@ extern "C" void aspida_gpu_chain_model(
     // dequantized F32) — it is read in full every token, so this is ~1.7ms/token.
     g_ch_lm = upload_weight(lm, lm_b); g_ch_lm_k = lm_k;
     g_ch_dim = dim; g_ch_vocab = vocab; g_ch_ready = 1;
+    g_ch_embed_rows = (int) (embed_b / ((long) dim * 4));
 }
 
 extern "C" int aspida_gpu_chain_ready(void) { return g_ch_ready && !g_chain.empty(); }
@@ -2665,6 +2695,12 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
     double l_attn=0,l_moe=0,l_lm=0;
     if (dprof && !dpa) { cudaEventCreate(&dpa); cudaEventCreate(&dpb); }
     #define DSEG(acc) do{ if(dprof){ cudaEventRecord(dpb,st); cudaEventSynchronize(dpb); float _m=0; cudaEventElapsedTime(&_m,dpa,dpb); (acc)+=_m; cudaEventRecord(dpa,st);} }while(0)
+    for (int j = 0; j < B; ++j)
+        if (rows[j] < 0 || rows[j] >= g_ch_embed_rows) {
+            fprintf(stderr, "[EMBED-OOB] decode row[%d]=%d (max %d) — clamped\n",
+                    j, rows[j], g_ch_embed_rows);
+            ((int *) rows)[j] = 0;
+        }
     cudaMemcpy(gb_rows, rows, (size_t)B*4, cudaMemcpyHostToDevice);
     cudaMemcpy(gb_pos, pos, (size_t)B*4, cudaMemcpyHostToDevice);
     //  Per-lane delta-net S pointers for every layer, assembled once (the host
@@ -3817,6 +3853,53 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     struct timespec tw0, tw1, tw2;
     if (pwall) clock_gettime(CLOCK_MONOTONIC, &tw0);
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // whole-chunk exclusion vs decode batch
+    //  Cumulative-state telemetry: request count, state/snapshot table sizes,
+    //  free VRAM — the crash-after-~N-requests hunt (prints every 20 requests).
+    {
+        static long stats_reqs = 0;
+        if (pos_start == 0 && ++stats_reqs % 20 == 0) {
+            size_t mfree = 0, mtot = 0; cudaMemGetInfo(&mfree, &mtot);
+            fprintf(stderr, "[STATS] reqs=%ld dnet=%zu(free %zu) fattn=%zu(free %zu) "
+                    "dsnap=%zu fsnap=%zu vram_free=%.2fGB\n",
+                    stats_reqs, g_dnet.size(), g_dnet_free.size(),
+                    g_fattn.size(), g_fattn_free.size(),
+                    g_dnet_snap.size(), g_fattn_snap.size(),
+                    mfree / 1073741824.0);
+            //  Weight-integrity: any hash change vs the first print = a stray
+            //  device write landed in long-lived memory.
+            unsigned long long he = dev_xor64(g_ch_embed, (size_t) g_ch_embed_rows * g_ch_dim * 4);
+            unsigned long long hf = dev_xor64(g_ch_fnorm, (size_t) g_ch_dim * 4);
+            unsigned long long hproj = 0; size_t nproj = 0;
+            for (auto &kv : g_proj_wmap)
+                if (kv.second.t) { hproj ^= dev_xor64(kv.second.t->data, ggml_nbytes(kv.second.t)); nproj++; }
+            unsigned long long hall = 0; size_t nall = 0; double gb = 0;
+            for (auto &kv : g_wcache) {
+                hall ^= dev_xor64(kv.second.dw, (size_t) kv.second.bytes);
+                nall++; gb += kv.second.bytes / 1073741824.0;
+            }
+            unsigned long long hmoe = 0; size_t nmoe = 0; double gbm = 0;
+            for (auto &kv : g_ggml_wcache)
+                if (kv.second.t) {
+                    hmoe ^= dev_xor64(kv.second.t->data, ggml_nbytes(kv.second.t));
+                    nmoe++; gbm += ggml_nbytes(kv.second.t) / 1073741824.0;
+                }
+            fprintf(stderr, "[WSUM] embed=%016llx fnorm=%016llx proj(%zu)=%016llx "
+                    "all(%zu,%.1fGB)=%016llx moe(%zu,%.1fGB)=%016llx\n",
+                    he, hf, nproj, hproj, nall, gb, hall, nmoe, gbm, hmoe);
+            //  Host-struct integrity (bent pointers/dims give deterministic
+            //  garbage with intact weights): FNV over the descriptor arrays.
+            auto fnv = [](const void *pp, size_t n) {
+                const unsigned char *b = (const unsigned char *) pp;
+                unsigned long long h = 1469598103934665603ULL;
+                for (size_t q = 0; q < n; ++q) { h ^= b[q]; h *= 1099511628211ULL; }
+                return h;
+            };
+            fprintf(stderr, "[HSUM] chain(%zu)=%016llx ps=%016llx\n",
+                    g_chain.size(),
+                    fnv(g_chain.data(), g_chain.size() * sizeof(ChainLayer)),
+                    fnv(&g_ps, sizeof(g_ps)));
+        }
+    }
     int slot = pscr_acquire();
     if (slot < 0) { fprintf(stderr, "[PREFILL] scratch OOM — chunk aborted\n"); return; }
     PScr &S = g_ps[slot];
@@ -3836,6 +3919,12 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     static int pprof = getenv("ASPIDA_PREFILL_PROF") ? 1 : 0;
     cudaEvent_t pe0=0,pe1=0,pe2=0; double acc_attn=0, acc_moe=0, acc_dnet=0, acc_fattn=0, acc_dproj=0, acc_recur=0;
     if (pprof) { cudaEventCreate(&pe0); cudaEventCreate(&pe1); cudaEventCreate(&pe2); }
+    for (int j = 0; j < P; ++j)
+        if (rows[j] < 0 || rows[j] >= g_ch_embed_rows) {
+            fprintf(stderr, "[EMBED-OOB] prefill row[%d]=%d (max %d) — clamped\n",
+                    j, rows[j], g_ch_embed_rows);
+            ((int *) rows)[j] = 0;
+        }
     cudaMemcpyAsync(p_rows, rows, (size_t)P*4, cudaMemcpyHostToDevice, st);
     k_embed_b<<<((size_t)dim*P+255)/256,256,0,st>>>(g_ch_embed, p_rows, pHb, dim, P);
     aspida_gpu_vision_inject_chunk(pHb, pos_start, P, dim, st);
