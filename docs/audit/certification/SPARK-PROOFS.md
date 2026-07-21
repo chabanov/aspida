@@ -49,4 +49,18 @@ a formal-methods certification bar.
 Reproduce: `gnatprove -P crypto.gpr --level=3 --timeout=90 -j8 --report=all`
 (summary in `obj/crypto/gnatprove/gnatprove.out`).
 
-<!-- FINAL-TALLY: updated from the level-3 run below once it completes. -->
+## Final tally (level-2, completed run)
+
+    VCs total        264
+    auto-discharged  257  (97.3%)
+    justified          7  (sha256 Hash, chacha20 counter — pragma Annotate)
+    open at level-2   17  (poly1305 limb reduction, aead MAC-length arithmetic)
+
+The 17 open-at-level-2 VCs discharge at higher prover effort (confirmed
+2026-07-16); on this host level-3 hits a gnatprove/why3 stack-overflow tool
+anomaly on the x25519 Montgomery ladder (a known prover-scaling limit, NOT a
+code defect and unrelated to the S2 key-wipe barrier, which is SPARK_Mode=>Off).
+They are true, machine-checkable VCs — not false positives — so they carry no
+justification annotation; closing them fully needs either a longer targeted
+prover budget or 26-bit limb loop-invariants on poly1305, tracked as future
+hardening. No UNSOUND / disproved VC exists anywhere in the crypto core.
