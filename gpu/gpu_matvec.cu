@@ -15,6 +15,7 @@
 #include <ctime>
 #include "fattn_ggml.cuh"   // Phase B: prefill full-attn via llama.cpp fattn-mma (ggml link-and-call)
 #include "moe_ggml.cuh"
+#include "dnet_ggml.cuh"
 extern "C" void aspida_gpu_vision_inject_chunk(float*,int,int,int,void*);
      // MoE Phase B: prefill MoE via llama.cpp mul_mat_id (MMQ int8, ggml link-and-call)
 
@@ -3828,6 +3829,15 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                     pdcq, pdkn, pdqn, L.khd, L.q_dim, L.nkh, L.qo, P);
                 int RW = 8;   //  warps (=columns) per block
                 dim3 rg((unsigned) L.nv, (unsigned) ((L.vhd + RW - 1) / RW));
+                static int dnet_ggml = getenv("ASPIDA_DNET_GGML") ? 1 : 0;
+                static int dnet_ggml_fail = 0;
+                bool did_ggml = false;
+                if (dnet_ggml && !dnet_ggml_fail && L.khd == L.vhd) {
+                    did_ggml = aspida_ggml_dnet_prefill(ds.S, pdkn, pdqn, pdcq, pdg, pdb, pdosh,
+                        L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim, P, st);
+                    if (!did_ggml) { dnet_ggml_fail = 1; fprintf(stderr, "[GDN] ggml failed — recur fallback\n"); }
+                }
+                if (!did_ggml)
                 k_dnet_recur_warp<<<rg, RW * 32, (size_t) 2 * L.khd * 4, st>>>(
                     ds.S, pdkn, pdqn, pdcq, pdg, pdb, pdosh,
                     L.khd, L.vhd, L.q_dim, L.nkh, L.nv, L.qo, L.v_dim, P);
