@@ -45,6 +45,7 @@ static std::unordered_map<const void *, GgmlWeight> g_ggml_wcache;
 //  the aspida upload path).  Cached by host pointer like upload_weight.
 static ggml_tensor *aspida_ggml_upload_q8(const void *w, long bytes,
                                           int64_t k, int64_t m, int64_t n_mats) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
     auto it = g_ggml_wcache.find(w);
     if (it != g_ggml_wcache.end()) return it->second.t;
     if (k <= 0 || m <= 0 || n_mats <= 0 || (k % 32) != 0) return nullptr;
@@ -62,6 +63,7 @@ static ggml_tensor *aspida_ggml_upload_q8(const void *w, long bytes,
 
 //  Model-unload eviction (called from aspida_gpu_free_weight).
 static void aspida_ggml_free_weight(const void *w) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
     auto it = g_ggml_wcache.find(w);
     if (it == g_ggml_wcache.end()) return;
     ggml_backend_buffer_free(it->second.buf);
@@ -83,9 +85,10 @@ static GgmlMoE g_gmoe;
 //  call), or nullptr on failure (caller falls back to the grouped kernels).
 static const float *aspida_ggml_moe_prefill(
         ggml_tensor *gW, ggml_tensor *uW, ggml_tensor *dW,
-        const float *x_b, const int32_t *ids_dev,
+        const float *x_b, const int32_t *ids_dev, float *dst_priv,
         int dim, int intermed, int top_k, int P, cudaStream_t st) {
     if (!gW || !uW || !dW || !aspida_ggml_be()) return nullptr;
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
     if (!g_gmoe.ga) g_gmoe.ga = ggml_gallocr_new(g_gfa.buft);
     //  node context: tensor structs only (no_alloc); ~10 nodes
     struct ggml_init_params ip = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true };
@@ -106,8 +109,13 @@ static const float *aspida_ggml_moe_prefill(
     cudaMemcpy(x->data,  x_b,     (size_t) P * dim * 4,   cudaMemcpyDeviceToDevice);
     cudaMemcpy(ids->data, ids_dev, (size_t) P * top_k * 4, cudaMemcpyDeviceToDevice);
     ggml_backend_graph_compute(g_gfa.be, gr);   // MMQ int8 tensor-core mul_mat_id
-    cudaDeviceSynchronize();                    // out ready for the combine on st
-    const float *res = (const float *) out->data;
+    cudaDeviceSynchronize();                    // out ready
+    //  The gallocr buffer is SHARED across lanes: the caller's combine kernel
+    //  runs on `st` AFTER we release g_ggml_mu, by which time another lane may
+    //  have reused the buffer. Copy into the caller's private scratch and
+    //  complete it before unlock.
+    cudaMemcpy(dst_priv, out->data, (size_t) P * top_k * dim * 4, cudaMemcpyDeviceToDevice);
+    cudaDeviceSynchronize();
     ggml_free(ctx);        // frees node structs only; data lives in the gallocr buffer
-    return res;
+    return dst_priv;
 }

@@ -891,6 +891,7 @@ static void ensure_astream() {
 }
 
 extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // async-pool churn vs ggml computes
     ensure_astream();
     DnetState st; size_t n = (size_t) nv * khd * vhd;
     if (cudaMallocAsync(&st.S, n * 4, g_astream) != cudaSuccess) return -1;
@@ -911,6 +912,8 @@ extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel)
 // States are per-generation (allocated in Init_State) — without this they
 // leak ~8 MB VRAM per delta-net layer per request. Slot is reused by _new.
 extern "C" void aspida_gpu_dnet_free(int handle) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // async-pool churn vs ggml computes
+    cudaDeviceSynchronize();   // in-flight lane/batcher work may still touch st.S/st.hist
     if (handle < 0 || handle >= (int) g_dnet.size()) return;
     DnetState &st = g_dnet[handle];
     if (st.S)    { cudaFreeAsync(st.S, g_astream); st.S = nullptr; }
@@ -943,6 +946,7 @@ static std::mutex g_snap_mtx;
 //  Snapshot delta-net state `handle` into slot `slot` (-1 = allocate a new
 //  slot). Returns the slot id, or -1 on error. Reusing a slot overwrites it.
 extern "C" int aspida_gpu_dnet_snapshot(int handle, int slot) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // vs ggml computes (pool-interaction crash)
     std::lock_guard<std::mutex> lk(g_snap_mtx);
     if (handle < 0 || handle >= (int) g_dnet.size()) return -1;
     DnetState &st = g_dnet[handle];
@@ -973,6 +977,7 @@ extern "C" int aspida_gpu_dnet_snapshot(int handle, int slot) {
 
 //  Restore snapshot `slot` into a fresh delta-net state `handle`.
 extern "C" int aspida_gpu_dnet_restore(int handle, int slot) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // vs ggml computes (pool-interaction crash)
     std::lock_guard<std::mutex> lk(g_snap_mtx);
     if (handle < 0 || handle >= (int) g_dnet.size()) return -1;
     if (slot < 0 || slot >= (int) g_dnet_snap.size()) return -1;
@@ -1225,6 +1230,7 @@ static std::vector<FattnState> g_fattn;
 static std::vector<int> g_fattn_free;     // freed slots for reuse
 
 extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // async-pool churn vs ggml computes
     ensure_astream();
     FattnState st; st.max_len = max_len; st.kvd = kvd;
     if (cudaMallocAsync(&st.K, (size_t) max_len * kvd * 2, g_astream) != cudaSuccess) return -1;  // fp16
@@ -1243,6 +1249,8 @@ extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
 // Per-generation KV caches — must be released when the generation ends or
 // they leak tens of MB VRAM per request. Slot is reused by _new.
 extern "C" void aspida_gpu_fattn_free(int handle) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // async-pool churn vs ggml computes
+    cudaDeviceSynchronize();   // in-flight lane/batcher work may still touch st.K/st.V/st.scores
     if (handle < 0 || handle >= (int) g_fattn.size()) return;
     FattnState &st = g_fattn[handle];
     if (st.K)      { cudaFreeAsync(st.K, g_astream); st.K = nullptr; }
@@ -1263,6 +1271,7 @@ static std::vector<int> g_fattn_snap_free;
 
 //  Snapshot the first `rows` K/V rows of state `handle` into `slot` (-1 = new).
 extern "C" int aspida_gpu_fattn_snapshot(int handle, int rows, int slot) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // vs ggml computes (pool-interaction crash)
     std::lock_guard<std::mutex> lk(g_snap_mtx);
     if (handle < 0 || handle >= (int) g_fattn.size()) return -1;
     FattnState &st = g_fattn[handle];
@@ -1294,6 +1303,7 @@ extern "C" int aspida_gpu_fattn_snapshot(int handle, int rows, int slot) {
 
 //  Restore snapshot `slot` (its `rows` K/V rows) into fresh state `handle`.
 extern "C" int aspida_gpu_fattn_restore(int handle, int slot) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // vs ggml computes (pool-interaction crash)
     std::lock_guard<std::mutex> lk(g_snap_mtx);
     if (handle < 0 || handle >= (int) g_fattn.size()) return -1;
     if (slot < 0 || slot >= (int) g_fattn_snap.size()) return -1;
@@ -2642,6 +2652,7 @@ static void chain_alloc_b(void) {
 // rows[b], pos[b] = lane b's embedding row and position. logits[b*vocab] out.
 extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int *pos,
                                                const int *handles, float *logits) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // whole-forward exclusion vs prefill
     if (B < 1) return; if (B > BMAX) B = BMAX;
     chain_alloc_b();
     int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=gb_stream;
@@ -2683,6 +2694,12 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
     cudaMemcpyAsync(gb_fV, hfV,   (size_t) NL * B * sizeof(void*), cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(gb_fSc, hfSc, (size_t) NL * B * sizeof(void*), cudaMemcpyHostToDevice, st);
     k_embed_b<<<((size_t)dim*B+255)/256,256,0,st>>>(g_ch_embed, gb_rows, Hb, dim, B);
+    static int lprobe_pre = getenv("ASPIDA_LOGIT_PROBE") ? 1 : 0;
+    static float *gb_probe = nullptr;
+    if (lprobe_pre) {
+        if (!gb_probe) cudaMalloc(&gb_probe, (size_t) BMAX * dim * 4);
+        cudaMemcpyAsync(gb_probe, Hb, (size_t) B * dim * 4, cudaMemcpyDeviceToDevice, st);
+    }
     if (dprof) cudaEventRecord(dpa,st);
     for (int li=0; li<NL; ++li) {
         ChainLayer &L=g_chain[li];
@@ -2754,6 +2771,28 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
             B, a_attn/a_n, a_moe/a_n, a_lm/a_n, (a_attn+a_moe+a_lm)/a_n, a_n);
     }
     cudaMemcpyAsync(logits, dlogb, (size_t)B*g_ch_vocab*4, cudaMemcpyDeviceToHost, st);
+    static int lprobe = getenv("ASPIDA_LOGIT_PROBE") ? 1 : 0;
+    if (lprobe) {
+        cudaStreamSynchronize(st);
+        for (int b = 0; b < B; ++b) {
+            double ss = 0; float mx = -1e30f; int arg = -1;
+            for (int v = 0; v < g_ch_vocab; ++v) {
+                float x = logits[(size_t) b * g_ch_vocab + v];
+                ss += (double) x * x; if (x > mx) { mx = x; arg = v; }
+            }
+            if (ss < 1e-6 || arg == 0) {
+                float *hrow = (float*) malloc((size_t) dim * 4);
+                double se = 0, sh = 0;
+                cudaMemcpy(hrow, gb_probe + (size_t) b * dim, (size_t) dim * 4, cudaMemcpyDeviceToHost);
+                for (int q = 0; q < dim; ++q) se += (double) hrow[q] * hrow[q];
+                cudaMemcpy(hrow, Hb + (size_t) b * dim, (size_t) dim * 4, cudaMemcpyDeviceToHost);
+                for (int q = 0; q < dim; ++q) sh += (double) hrow[q] * hrow[q];
+                free(hrow);
+                fprintf(stderr, "[LPROBE] B=%d lane=%d row=%d pos=%d |log|=%.3g argmax=%d |embed|=%.3g |Hb_end|=%.3g\n",
+                        B, b, rows[b], pos[b], sqrt(ss), arg, sqrt(se), sqrt(sh));
+            }
+        }
+    }
     cudaStreamSynchronize(st);
 }
 
@@ -3516,6 +3555,7 @@ struct PScr {
     int *rows;
     int *mg_pos, *mg_k, *mg_cnt;   // expert-grouped MoE: positions/slots per expert + counts
     float *dmoe;                   // grouped-down per-(position,slot) outputs [P][MOE_MAXK+1][dim]
+    float *dmoe_g;                 // PRIVATE copy of the ggml mul_mat_id output [P][top_k][dim]
     cudaStream_t stream;
 };
 static PScr g_ps[PMAXLANE];
@@ -3560,6 +3600,7 @@ static void alloc_one(PScr &S) {
                     ckmalloc((void**)&S.mg_k,(size_t)g_mx_nexp*Pd*4,"mg_k");
                     ckmalloc((void**)&S.mg_cnt,(size_t)g_mx_nexp*4,"mg_cnt"); }
     ckmalloc((void**)&S.dmoe,Pd*(size_t)(MOE_MAXK+1)*dim*4,"dmoe");
+    ckmalloc((void**)&S.dmoe_g,Pd*(size_t)MOE_MAXK*dim*4,"dmoe_g");
     cudaStreamCreateWithPriority(&S.stream, cudaStreamDefault, aspida_stream_prio(0));
 }
 static bool g_ps_inited[PMAXLANE]={false}, g_ps_busy[PMAXLANE]={false};
@@ -3775,6 +3816,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     static int pwall = getenv("ASPIDA_PREFILL_WALL") ? 1 : 0;
     struct timespec tw0, tw1, tw2;
     if (pwall) clock_gettime(CLOCK_MONOTONIC, &tw0);
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // whole-chunk exclusion vs decode batch
     int slot = pscr_acquire();
     if (slot < 0) { fprintf(stderr, "[PREFILL] scratch OOM — chunk aborted\n"); return; }
     PScr &S = g_ps[slot];
@@ -3918,7 +3960,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                     0, L.intermed, dim, PCH, L.top_k, P, 1);
                 moe_gout = aspida_ggml_moe_prefill(
                     (ggml_tensor *) L.ggt, (ggml_tensor *) L.ugt, (ggml_tensor *) L.dgt,
-                    pnxb, (const int32_t *) pmg_pos, dim, L.intermed, L.top_k, P, st);
+                    pnxb, (const int32_t *) pmg_pos, S.dmoe_g, dim, L.intermed, L.top_k, P, st);
                 if (!moe_gout) { moe_ggml_failed = 1;
                     fprintf(stderr, "[MOE] ggml mul_mat_id failed — grouped fallback\n"); }
             }

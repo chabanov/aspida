@@ -40,6 +40,7 @@ static ggml_tensor *proj_ggml_weight(const uint8_t *dw, int in, int out) {
 //  Returns false to fall back to the aspida kernels.
 static bool aspida_ggml_proj(const uint8_t *dw, int in, int out,
                              const float *dx, float *dy, int B, cudaStream_t st) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
     ggml_tensor *w = proj_ggml_weight(dw, in, out);
     if (!w) return false;
     if (!g_proj_ga) g_proj_ga = ggml_gallocr_new(g_gfa.buft);
@@ -59,6 +60,7 @@ static bool aspida_ggml_proj(const uint8_t *dw, int in, int out,
     ggml_backend_graph_compute(g_gfa.be, gr);
     cudaDeviceSynchronize();                          // y ready before st copies
     cudaMemcpyAsync(dy, y->data, (size_t) B * out * 4, cudaMemcpyDeviceToDevice, st);
+    cudaStreamSynchronize(st);   // y lives in the shared gallocr pool — consume before unlock
     ggml_free(ctx);
     return true;
 }

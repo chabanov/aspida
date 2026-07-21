@@ -85,6 +85,7 @@ static bool aspida_ggml_dnet_prefill(
         float *stateS, const float *kn, const float *qn, const float *cq,
         const float *gate, const float *beta, float *osh,
         int khd, int vhd, int q_dim, int nkh, int nv, int qo, int v_dim, int P, cudaStream_t st) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
     GgmlGDN &S = g_ggdn;
     if (S.P!=P || S.nkh!=nkh || S.nv!=nv || S.khd!=khd || S.vhd!=vhd)
         if (!ggdn_rebuild(S, nkh, nv, khd, vhd, P)) return false;
@@ -117,5 +118,8 @@ static bool aspida_ggml_dnet_prefill(
     // new state -> aspida stateS
     k_gdn_st_out<<<((size_t)vhd*vhd*nv+bs-1)/bs,bs,0,st>>>(go + attn_elems, stateS, vhd, nv);
     (void) scale;
+    //  Complete the copies out of the SHARED graph buffers before releasing
+    //  g_ggml_mu — the next lane's rebuild/alloc reuses them (concurrency race).
+    cudaStreamSynchronize(st);
     return true;
 }

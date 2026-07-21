@@ -1,7 +1,7 @@
 // fattn_ggml.cuh — aspida prefill full-attention via llama.cpp's fattn-mma
 // (ncols2=8 GQA column-packing + cp_async pipelining), through the ggml public
 // API (link-and-call).  Proven 6.5x faster than the wmma3 kernel at hd=256/40k
-// on the an NVIDIA GPU.  See fattn_bench / fattn_mma_wrapper (Phase A) for the isolated
+// on the L40S.  See fattn_bench / fattn_mma_wrapper (Phase A) for the isolated
 // validation.  llama.cpp / ggml are MIT licensed, (c) 2023-2024 The ggml authors.
 //
 // Layout mapping (aspida native -> ggml FA):
@@ -18,6 +18,7 @@
 #include "ggml-cuda.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include <mutex>
 
 // ---- repack / mask / gate kernels ----
 __global__ void k_ggml_repack_Q(const float *__restrict__ qa, float *__restrict__ qg,
@@ -59,6 +60,13 @@ struct GgmlFA {
 };
 static GgmlFA g_gfa;
 
+//  ggml backends are NOT thread-safe, and the batcher prefills lanes
+//  CONCURRENTLY (per-lane Chain_Prefill threads). Every helper that touches
+//  the shared backend (graph compute, gallocr, weight-tensor creation) must
+//  hold this mutex — a data race here corrupts the compute (decode collapses
+//  to repeated tokens) or trips an illegal memory access inside ggml-cuda.
+static std::recursive_mutex g_ggml_mu;
+
 static bool gfa_rebuild(GgmlFA &s, int nq, int nkv, int hd, int P, int len) {
     if (!s.be) {
         s.be = ggml_backend_cuda_init(0);          // shares aspida's runtime-API
@@ -92,6 +100,7 @@ static void aspida_ggml_fattn_prefill(
         const float *q_all, const __half *fsK, const __half *fsV,
         const float *gate, float *out,
         int nq, int nkv, int hd, int P, int pos_start, cudaStream_t st) {
+    std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
     GgmlFA &s = g_gfa;
     int len = pos_start + P;
     if (s.P != P || s.len != len || s.nq != nq || s.nkv != nkv || s.hd != hd) {
@@ -107,7 +116,9 @@ static void aspida_ggml_fattn_prefill(
     k_ggml_build_mask<<<((size_t) P * len + bs - 1) / bs, bs>>>((__half *) s.m->data, len, P, pos_start);
     cudaDeviceSynchronize();                 // inputs ready before ggml (own stream)
     ggml_backend_graph_compute(s.be, s.gr);  // <-- fattn-mma (ncols2=8 + cp_async)
+    cudaDeviceSynchronize();   // ggml output ready (compute runs on ggml's own stream)
     // ggml FA output layout == aspida [t][h*hd+d]; copy out then fold the gate.
     cudaMemcpy(out, s.out->data, (size_t) P * nq * hd * sizeof(float), cudaMemcpyDeviceToDevice);
+    cudaDeviceSynchronize();   // D2D is async on the legacy stream — complete before unlock
     k_ggml_apply_gate<<<((size_t) P * nq * hd + bs - 1) / bs, bs, 0, st>>>(out, gate, P * nq * hd);
 }

@@ -19,7 +19,6 @@ package body LLM_Batcher is
    function Enabled return Boolean is (Serve);
 
    type Int_Arr   is array (0 .. Max_Lanes - 1) of Integer;
-   type Addr_Arr  is array (0 .. Max_Lanes - 1) of System.Address;
 
    --  C-side scratch (heap, sized at Configure).
    type C_Int_Arr is array (Natural range <>) of Interfaces.C.int;
@@ -31,15 +30,26 @@ package body LLM_Batcher is
    CHandles    : C_Int_Ptr;   -- [Max_Lanes * NL]
    Batch_Log   : F_Ptr;       -- [Max_Lanes * Vocab]
 
+   Max_NL : constant := 64;
+   type H_Copy_Arr is array (0 .. Max_NL - 1) of Interfaces.C.int;
+
    type Lane_Rec is record
       In_Use   : Boolean := False;
       Pending  : Boolean := False;
       Ready    : Boolean := False;
       Failed   : Boolean := False;  -- the forward covering this lane raised
       Row, Pos : Integer := 0;
-      H_Addr   : System.Address := System.Null_Address;
+      --  Handle VALUES copied at Post. The Driver used to read the handler
+      --  task's stack array through an address — if the handler was aborted
+      --  (client disconnect / step timeout) mid-batch, that read dangled and
+      --  fed garbage handles to the GPU (wild pointers: the flaky illegal-
+      --  access crashes and cross-lane state corruption). Values can't dangle.
+      HV       : H_Copy_Arr := [others => 0];
       NL       : Integer := 0;
-      Log_Addr : System.Address := System.Null_Address;
+      --  Batch slot of the last forward covering this lane (-1 = none):
+      --  Wait_Done copies the logits slice itself, inside the protected
+      --  action, where the caller's buffer is guaranteed alive.
+      BIdx     : Integer := -1;
       --  Generation epoch. Bumped on every Claim (and on Abandon). A batch's
       --  Take snapshots each lane's Seq; Mark_Done / the scatter only touch a
       --  lane whose Seq still matches — so a step whose handler already timed
@@ -57,16 +67,14 @@ package body LLM_Batcher is
       --  to the (unsafe-when-concurrent) single-request path.
       entry Claim (Lane : out Integer);
       procedure Free  (L : Integer);
-      procedure Post  (L, Row, Pos, NL : Integer; H, Lg : System.Address);
-      entry Wait_Done (Lane_Id) (Failed : out Boolean);
+      procedure Post  (L, Row, Pos, NL : Integer; H : System.Address);
+      entry Wait_Done (Lane_Id) (Failed : out Boolean; Log : System.Address);
       entry Wait_Pending;                       -- gate: ≥1 lane posted
       function All_Pending return Boolean;       -- every active lane is pending
+      --  Fills the package-level CHandles staging from the per-lane VALUE
+      --  copies (never from caller memory).
       procedure Take (Lanes, Rows, Poss, NLs, Seqs : out Int_Arr;
-                      H, Logs : out Addr_Arr; N : out Integer);
-      --  True iff lane L is still the same generation the batch snapshotted
-      --  (In_Use and Seq unchanged) — gates the Driver's scatter so it never
-      --  writes into a buffer an abandoned/reused lane no longer owns.
-      function Live (L, Seq : Integer) return Boolean;
+                      N : out Integer);
       procedure Mark_Done (Lanes, Seqs : Int_Arr; N : Integer);
       --  The forward covering these lanes raised: wake the callers with the
       --  Failed flag so each aborts its own generation (Step raises).
@@ -117,27 +125,41 @@ package body LLM_Batcher is
          S (Id).Seq := S (Id).Seq + 1;
       end Abandon;
 
-      function Live (L, Seq : Integer) return Boolean is
-      begin
-         return S (Lane_Id (L)).In_Use and then S (Lane_Id (L)).Seq = Seq;
-      end Live;
-
-      procedure Post (L, Row, Pos, NL : Integer; H, Lg : System.Address) is
+      procedure Post (L, Row, Pos, NL : Integer; H : System.Address) is
          Id : constant Lane_Id := Lane_Id (L);
+         Src : C_Int_Arr (0 .. NL - 1) with Import, Address => H;
       begin
-         S (Id).Row := Row; S (Id).Pos := Pos; S (Id).NL := NL;
-         S (Id).H_Addr := H; S (Id).Log_Addr := Lg;
+         S (Id).Row := Row; S (Id).Pos := Pos;
+         S (Id).NL := Integer'Min (NL, Max_NL);
+         for K in 0 .. S (Id).NL - 1 loop
+            S (Id).HV (K) := Src (K);
+         end loop;
+         S (Id).BIdx := -1;
          S (Id).Ready := False; S (Id).Pending := True;
          Pending_Count := Pending_Count + 1;
       end Post;
 
       --  A handler blocks here until the forward covering its lane is done.
-      entry Wait_Done (for L in Lane_Id) (Failed : out Boolean)
+      entry Wait_Done (for L in Lane_Id) (Failed : out Boolean; Log : System.Address)
         when S (L).Ready is
       begin
          S (L).Ready  := False;
          Failed       := S (L).Failed;
          S (L).Failed := False;
+         --  Copy this lane's logit slice HERE: the entry body is a protected
+         --  action executed on the caller's behalf, so the caller cannot have
+         --  unwound — its buffer is alive. (The Driver previously scattered
+         --  into caller buffers from its own task: a use-after-free when a
+         --  handler aborted between the Live check and the write.)
+         if not Failed and then S (L).BIdx >= 0 then
+            declare
+               Dst : F_Arr (0 .. Cfg_Vocab - 1) with Import, Address => Log;
+               Base : constant Natural := S (L).BIdx * Cfg_Vocab;
+            begin
+               Dst := Batch_Log (Base .. Base + Cfg_Vocab - 1);
+            end;
+         end if;
+         S (L).BIdx := -1;
       end Wait_Done;
 
       --  The Driver waits here for the first pending lane, then (after a short
@@ -156,7 +178,7 @@ package body LLM_Batcher is
       end All_Pending;
 
       procedure Take (Lanes, Rows, Poss, NLs, Seqs : out Int_Arr;
-                      H, Logs : out Addr_Arr; N : out Integer) is
+                      N : out Integer) is
       begin
          N := 0;
          for L in Lane_Id loop
@@ -166,8 +188,9 @@ package body LLM_Batcher is
                Poss (N)  := S (L).Pos;
                NLs (N)   := S (L).NL;
                Seqs (N)  := S (L).Seq;
-               H (N)     := S (L).H_Addr;
-               Logs (N)  := S (L).Log_Addr;
+               for K in 0 .. S (L).NL - 1 loop
+                  CHandles (N * Cfg_NL + K) := S (L).HV (K);
+               end loop;
                S (L).Pending := False;
                N := N + 1;
             end if;
@@ -181,6 +204,7 @@ package body LLM_Batcher is
             --  Skip a lane whose handler timed out and freed/reused it (epoch
             --  changed) — waking it would hand the wrong generation these logits.
             if S (Lane_Id (Lanes (I))).Seq = Seqs (I) then
+               S (Lane_Id (Lanes (I))).BIdx  := I;
                S (Lane_Id (Lanes (I))).Ready := True;
             end if;
          end loop;
@@ -237,7 +261,6 @@ package body LLM_Batcher is
 
    task body Driver_T is
       Lanes, Rows, Poss, NLs, Seqs : Int_Arr;
-      H, Logs : Addr_Arr;
       N : Integer;
       Fwd_Count, Sum_B, Max_B : Integer := 0;
    begin
@@ -254,7 +277,7 @@ package body LLM_Batcher is
                Waited := Waited + 1;
             end loop;
          end;
-         Pool.Take (Lanes, Rows, Poss, NLs, Seqs, H, Logs, N);
+         Pool.Take (Lanes, Rows, Poss, NLs, Seqs, N);
          if Ada.Environment_Variables.Exists ("ASPIDA_BATCH_LOG") then
             Fwd_Count := Fwd_Count + 1; Sum_B := Sum_B + N;
             if N > Max_B then Max_B := N; end if;
@@ -273,35 +296,18 @@ package body LLM_Batcher is
          --  Failed flag so each caller aborts its own generation cleanly, and
          --  keep driving the next batch.
          begin
-            --  Assemble the batched inputs from each lane's snapshot.
+            --  Rows/positions staging (handles were copied by VALUE in Take —
+            --  the Driver never dereferences a handler task's memory).
             for I in 0 .. N - 1 loop
                CRows (I) := Interfaces.C.int (Rows (I));
                CPos (I)  := Interfaces.C.int (Poss (I));
-               declare
-                  Src : C_Int_Arr (0 .. NLs (I) - 1)
-                    with Import, Address => H (I);
-               begin
-                  CHandles (I * Cfg_NL .. I * Cfg_NL + NLs (I) - 1) := Src;
-               end;
             end loop;
             LLM_Qwen_GPU.Chain_Forward_Batch
               (N, CRows.all'Address, CPos.all'Address, CHandles.all'Address,
                Batch_Log.all'Address);
-            --  Scatter each lane's logit slice back to its caller's buffer —
-            --  but ONLY while the lane still belongs to the generation we
-            --  snapshotted. If its handler timed out and freed (or reused) the
-            --  lane, Logs (I) points at a buffer that generation no longer
-            --  owns; Live gates the write out.
-            for I in 0 .. N - 1 loop
-               if Pool.Live (Lanes (I), Seqs (I)) then
-                  declare
-                     Dst : F_Arr (0 .. Cfg_Vocab - 1)
-                       with Import, Address => Logs (I);
-                  begin
-                     Dst := Batch_Log (I * Cfg_Vocab .. I * Cfg_Vocab + Cfg_Vocab - 1);
-                  end;
-               end if;
-            end loop;
+            --  Delivery: Mark_Done records each live lane's batch slot; the
+            --  logits are copied by Wait_Done itself, inside the protected
+            --  action, where the caller's buffer is guaranteed alive.
             Pool.Mark_Done (Lanes, Seqs, N);
          exception
             when others =>
@@ -399,10 +405,10 @@ package body LLM_Batcher is
                    Handles, Logits : System.Address) is
       Failed : Boolean;
    begin
-      Pool.Post (Lane, Embed_Row, Pos, N_Layers, Handles, Logits);
+      Pool.Post (Lane, Embed_Row, Pos, N_Layers, Handles);
       if Step_Timeout > 0.0 then
          select
-            Pool.Wait_Done (Lane_Id (Lane)) (Failed);
+            Pool.Wait_Done (Lane_Id (Lane)) (Failed, Logits);
          or
             delay Step_Timeout;
             --  Stuck: drop this lane's pending step, bump its epoch so the
@@ -412,7 +418,7 @@ package body LLM_Batcher is
             raise Batch_Failed with "batched forward timed out (lane wedged)";
          end select;
       else
-         Pool.Wait_Done (Lane_Id (Lane)) (Failed);
+         Pool.Wait_Done (Lane_Id (Lane)) (Failed, Logits);
       end if;
       if Failed then
          raise Batch_Failed with "batched GPU forward failed";
