@@ -1262,6 +1262,15 @@ package body LLM_Qwen is
             Handles (I) := Interfaces.C.int (Hn);
          end;
       end loop;
+      --  CPU fallback path indexes the full host caches, which the fast
+      --  Init_State stubbed out on layers that DID get a device handle —
+      --  re-init those with Force_Host before any CPU Step runs.
+      if not Use_Chain then
+         for I in 1 .. M.N_Blocks loop
+            Cache (I) := LLM_Qwen_Blk.Init_State
+              (M.Blocks (I).all, Cap, Force_Host => True);
+         end loop;
+      end if;
       --  Claim a batch lane. Begin_Gen BLOCKS until one is free — falling back
       --  to the single path while the batcher is live would drive the shared
       --  resident chain state concurrently with the Driver (cross-generation

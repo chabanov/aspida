@@ -53,7 +53,9 @@ package LLM_FullAttn is
       GPU_Handle : Integer := -1;   -- resident device KV (Phase B2), -1 = CPU
    end record;
 
-   function Init_State (L : Full_Attn_Layer; Max_Len : Integer) return Attn_State;
+   function Init_State
+     (L : Full_Attn_Layer; Max_Len : Integer;
+      Force_Host : Boolean := False) return Attn_State;
 
    function Step (L : Full_Attn_Layer; St : in out Attn_State; X : LLM_Tensor.Tensor)
       return LLM_Tensor.Tensor;

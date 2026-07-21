@@ -9,6 +9,11 @@
 ---------------------------------------------------------------------
 
 with Ada.Containers.Indefinite_Ordered_Maps;
+with Ada.Containers.Indefinite_Hashed_Maps;
+with Ada.Strings.Hash;
+with Ada.Real_Time;
+with Ada.Text_IO;
+with Ada.Environment_Variables;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Strings.Fixed;
 with Ada.Unchecked_Deallocation;
@@ -17,8 +22,14 @@ package body LLM_Tokenizer is
 
    NUL : constant Character := Character'Val (0);
 
-   package Str_Int_Maps is new Ada.Containers.Indefinite_Ordered_Maps
-     (Key_Type => String, Element_Type => Integer);
+   package Str_Int_Maps is new Ada.Containers.Indefinite_Hashed_Maps
+     (Key_Type        => String,
+      Element_Type    => Integer,
+      Hash            => Ada.Strings.Hash,
+      Equivalent_Keys => "=");
+   Tok_Wall_On : constant Boolean :=
+     Ada.Environment_Variables.Exists ("ASPIDA_TOK_WALL");
+
    package Int_Str_Maps is new Ada.Containers.Indefinite_Ordered_Maps
      (Key_Type => Integer, Element_Type => String);
 
@@ -290,6 +301,21 @@ package body LLM_Tokenizer is
    --------------------------------------------------------------------
 
    function Encode (T : Tokenizer; Text : String) return Token_Array is
+      use type Ada.Real_Time.Time;
+      TW0 : constant Ada.Real_Time.Time := Ada.Real_Time.Clock;
+
+      function Finish (R : Token_Array) return Token_Array is
+      begin
+         if Tok_Wall_On and then Text'Length > 4000 then
+            Ada.Text_IO.Put_Line
+              (Ada.Text_IO.Standard_Error,
+               "[TOKWALL] len=" & Integer'Image (Text'Length)
+               & " toks=" & Integer'Image (R'Length)
+               & " ms=" & Duration'Image
+                   (Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TW0) * 1000.0));
+         end if;
+         return R;
+      end Finish;
    begin
       --  Cap input length first: even at O(N log N) a pathological input
       --  should be rejected loudly before the engine's context clamp runs
@@ -486,10 +512,14 @@ package body LLM_Tokenizer is
                        W (S (L).From .. S (L).To) & NUL
                        & W (S (R).From .. S (R).To);
                   begin
-                     if T.Merges.Contains (Key) then
-                        Push ((Rank => T.Merges.Element (Key), L => L,
-                               LT => S (L).To, RT => S (R).To));
-                     end if;
+                     declare
+                        Cu : constant Str_Int_Maps.Cursor := T.Merges.Find (Key);
+                     begin
+                        if Str_Int_Maps.Has_Element (Cu) then
+                           Push ((Rank => Str_Int_Maps.Element (Cu), L => L,
+                                  LT => S (L).To, RT => S (R).To));
+                        end if;
+                     end;
                   end;
                end Try_Push;
 
@@ -554,20 +584,28 @@ package body LLM_Tokenizer is
                         declare
                            P : constant String := W (S (I).From .. S (I).To);
                         begin
-                           if T.Vocab.Contains (P) then
-                              R2 (K) := T.Vocab.Element (P);
-                           elsif T.Unk_Id >= 0 then
+                           declare
+                              Cu : constant Str_Int_Maps.Cursor :=
+                                T.Vocab.Find (P);
+                           begin
+                              if Str_Int_Maps.Has_Element (Cu) then
+                                 R2 (K) := Str_Int_Maps.Element (Cu);
+                                 goto Looked_Up;
+                              end if;
+                           end;
+                           if T.Unk_Id >= 0 then
                               R2 (K) := T.Unk_Id;  -- the model's real UNK token
                            else
                               R2 (K) := 0;         -- last resort (no UNK)
                            end if;
+                           <<Looked_Up>>
                         end;
                         I := S (I).Nxt;
                      end loop;
                      Free (S);
                      Free (H);
                      Free (Lens);
-                     return R2;
+                     return Finish (R2);
                   end;
                end;
             exception

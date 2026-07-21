@@ -16,6 +16,7 @@
 #include "fattn_ggml.cuh"   // Phase B: prefill full-attn via llama.cpp fattn-mma (ggml link-and-call)
 #include "moe_ggml.cuh"
 #include "dnet_ggml.cuh"
+#include "proj_ggml.cuh"
 extern "C" void aspida_gpu_vision_inject_chunk(float*,int,int,int,void*);
      // MoE Phase B: prefill MoE via llama.cpp mul_mat_id (MMQ int8, ggml link-and-call)
 
@@ -2500,6 +2501,8 @@ static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
             //  tiles, 2.72x over the 16x16 wmma, bit-exact. Block-count gate:
             //  below ~512 blocks the wide tile starves the GPU (measured
             //  0.48x at qkv B=256) — those shapes stay on the paths below.
+            static int proj_ggml = getenv("ASPIDA_PROJ_GGML") ? 1 : 0;
+            if (proj_ggml && aspida_ggml_proj(dw, in, out, dx, dy, B, st)) return;
             dim3 grid(out / 64, (B + 63) / 64);
             k_q8_reg<4, 4><<<grid, 32, 0, st>>>(dw, dx, dy, in, out, B);
         } else if (out % 32 == 0 && B >= 32
@@ -3769,6 +3772,9 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                                          const int *handles, float *last_logits) {
     if (P < 1) return; if (P > PCH) P = PCH;
     (void) lane;   //  kept for ABI; the pool assigns the scratch set now
+    static int pwall = getenv("ASPIDA_PREFILL_WALL") ? 1 : 0;
+    struct timespec tw0, tw1, tw2;
+    if (pwall) clock_gettime(CLOCK_MONOTONIC, &tw0);
     int slot = pscr_acquire();
     if (slot < 0) { fprintf(stderr, "[PREFILL] scratch OOM — chunk aborted\n"); return; }
     PScr &S = g_ps[slot];
@@ -3956,11 +3962,16 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             acc_attn/P, acc_moe/P, (acc_attn+acc_moe)/P);
         cudaEventDestroy(pe0); cudaEventDestroy(pe1); cudaEventDestroy(pe2);
     }
+    if (pwall) { cudaStreamSynchronize(st); clock_gettime(CLOCK_MONOTONIC, &tw1); }
     // LM head on the LAST position only.
     const float *last_h = pHb + (size_t)(P - 1) * dim;
     k_norm1<<<1,256,0,st>>>((float *) last_h, g_ch_fnorm, pnxb, dim);
     launch_mv_st(g_ch_lm, g_ch_lm_k, dim, g_ch_vocab, pnxb, pdlog, st);
     cudaMemcpyAsync(last_logits, pdlog, (size_t)g_ch_vocab*4, cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
+    if (pwall) { clock_gettime(CLOCK_MONOTONIC, &tw2);
+        double ms_loop = (tw1.tv_sec-tw0.tv_sec)*1e3 + (tw1.tv_nsec-tw0.tv_nsec)/1e6;
+        double ms_head = (tw2.tv_sec-tw1.tv_sec)*1e3 + (tw2.tv_nsec-tw1.tv_nsec)/1e6;
+        fprintf(stderr, "[PWALL] P=%d loop=%.1fms head=%.1fms\n", P, ms_loop, ms_head); }
     pscr_release(slot);
 }

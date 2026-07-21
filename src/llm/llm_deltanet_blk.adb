@@ -235,13 +235,12 @@ package body LLM_DeltaNet_Blk is
       Bytes => Raw_Bytes (W),
       Kind  => Kind_Code (W));
 
-   function Init_State (L : DeltaNet_Layer) return DNet_State is
+   function Init_State
+     (L : DeltaNet_Layer; Force_Host : Boolean := False) return DNet_State
+   is
       Kernel : constant Integer := Shape (L.Conv_W) (2);
    begin
       return St : DNet_State do
-         St.S_All     := New_Tensor ([L.N_V_Heads * L.Key_Head_Dim,
-                                      L.Value_Head_Dim]);
-         St.Conv_Hist := New_Tensor ([Integer'Max (1, Kernel - 1), L.QKV_Out]);
          --  Phase B: keep the recurrent state AND conv window resident on the
          --  device, and run the whole layer there — but only when every
          --  projection is a format the resident kernels read.
@@ -253,6 +252,17 @@ package body LLM_DeltaNet_Blk is
             St.GPU_Handle := LLM_Qwen_GPU.Dnet_New
               (L.N_V_Heads, L.Key_Head_Dim, L.Value_Head_Dim,
                L.QKV_Out, Kernel);
+         end if;
+         --  Host state feeds only the CPU Step path (see llm_fullattn note):
+         --  stub it when the device state exists, full-size otherwise.
+         if St.GPU_Handle >= 0 and then not Force_Host then
+            St.S_All     := New_Tensor ([1, 1]);
+            St.Conv_Hist := New_Tensor ([1, 1]);
+         else
+            St.S_All     := New_Tensor ([L.N_V_Heads * L.Key_Head_Dim,
+                                         L.Value_Head_Dim]);
+            St.Conv_Hist := New_Tensor ([Integer'Max (1, Kernel - 1),
+                                         L.QKV_Out]);
          end if;
       end return;
    end Init_State;

@@ -255,13 +255,14 @@ package body LLM_FullAttn is
       return T;
    end Sections_Total;
 
-   function Init_State (L : Full_Attn_Layer; Max_Len : Integer) return Attn_State is
+   function Init_State
+     (L : Full_Attn_Layer; Max_Len : Integer;
+      Force_Host : Boolean := False) return Attn_State
+   is
       KV_Dim : constant Integer := L.N_KV_Heads * L.Head_Dim;
    begin
       return St : Attn_State do
-         St.K_Cache := New_Tensor ([Integer'Max (1, Max_Len), KV_Dim]);
-         St.V_Cache := New_Tensor ([Integer'Max (1, Max_Len), KV_Dim]);
-         St.Len     := 0;
+         St.Len := 0;
          --  Phase B2: resident device KV + whole-layer GPU step, when every
          --  projection is a format the resident kernels read.
          if LLM_Qwen_GPU.Fattn_Available
@@ -270,6 +271,18 @@ package body LLM_FullAttn is
          then
             St.GPU_Handle := LLM_Qwen_GPU.Fattn_New
               (Integer'Max (1, Max_Len), KV_Dim, L.N_Q_Heads);
+         end if;
+         --  The host K/V caches feed only the CPU Step path. On the resident
+         --  chain they are never touched, and allocating+zeroing them per
+         --  request cost ~hundreds of MB (measured ~400ms of every prefill) —
+         --  so allocate stubs when the device state exists. Callers that fall
+         --  back to the CPU path re-init with Force_Host => True.
+         if St.GPU_Handle >= 0 and then not Force_Host then
+            St.K_Cache := New_Tensor ([1, KV_Dim]);
+            St.V_Cache := New_Tensor ([1, KV_Dim]);
+         else
+            St.K_Cache := New_Tensor ([Integer'Max (1, Max_Len), KV_Dim]);
+            St.V_Cache := New_Tensor ([Integer'Max (1, Max_Len), KV_Dim]);
          end if;
       end return;
    end Init_State;

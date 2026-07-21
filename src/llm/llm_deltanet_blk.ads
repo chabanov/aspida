@@ -57,7 +57,9 @@ package LLM_DeltaNet_Blk is
       GPU_Handle : Integer := -1;      -- resident device S_All (Increment 2), or -1 = CPU
    end record;
 
-   function Init_State (L : DeltaNet_Layer) return DNet_State;
+   function Init_State
+     (L : DeltaNet_Layer; Force_Host : Boolean := False)
+      return DNet_State;
 
    function Step (L : DeltaNet_Layer; St : in out DNet_State; X : LLM_Tensor.Tensor)
       return LLM_Tensor.Tensor;

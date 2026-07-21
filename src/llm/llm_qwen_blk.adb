@@ -107,14 +107,17 @@ package body LLM_Qwen_Blk is
    -- Incremental decode
    --------------------------------------------------------------------
 
-   function Init_State (B : Qwen_Block; Max_Len : Integer) return Block_State is
+   function Init_State
+     (B : Qwen_Block; Max_Len : Integer;
+      Force_Host : Boolean := False) return Block_State
+   is
    begin
       return St : Block_State do
          St.Is_Full := B.Is_Full_Attn;
          if B.Is_Full_Attn then
-            St.Full_St := LLM_FullAttn.Init_State (B.Full, Max_Len);
+            St.Full_St := LLM_FullAttn.Init_State (B.Full, Max_Len, Force_Host);
          else
-            St.DNet_St := LLM_DeltaNet_Blk.Init_State (B.DNet);
+            St.DNet_St := LLM_DeltaNet_Blk.Init_State (B.DNet, Force_Host);
          end if;
       end return;
    end Init_State;
