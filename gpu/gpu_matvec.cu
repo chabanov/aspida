@@ -394,6 +394,19 @@ __global__ void k_q8_0_wb_T(const uint8_t *__restrict__ w, const float *__restri
 
 //  Shared weight VRAM cache: each distinct host weight pointer is uploaded
 //  once and reused by both matvec and matmul (same model weights).
+//  Sticky-CUDA-context health check. After the poisoning investigation
+//  (be17757): once any kernel faults, the context is dead and every later
+//  forward emits garbage until something calls a checked ggml sync. Fail
+//  FAST instead: log where the poison was first seen and abort — systemd
+//  restarts a clean engine in ~60s, versus minutes of silent garbage.
+static void ctx_check(const char *where, bool fatal) {
+    cudaError_t e = cudaGetLastError();   // sticky, non-blocking
+    if (e == cudaSuccess) return;
+    fprintf(stderr, "[CTXERR] %s: %s%s\n", where, cudaGetErrorString(e),
+            fatal ? " — aborting (fail-fast, systemd restarts clean)" : "");
+    if (fatal) abort();
+}
+
 struct WCacheEnt { uint8_t *dw; long bytes; };
 static std::unordered_map<const void *, WCacheEnt> g_wcache;
 static uint8_t *upload_weight(const void *w, long wbytes) {
@@ -915,6 +928,7 @@ extern "C" int aspida_gpu_dnet_new(int nv, int khd, int vhd, int qo, int kernel)
 extern "C" void aspida_gpu_dnet_free(int handle) {
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // async-pool churn vs ggml computes
     cudaDeviceSynchronize();   // in-flight lane/batcher work may still touch st.S/st.hist
+    ctx_check("dnet_free", false);
     if (handle < 0 || handle >= (int) g_dnet.size()) return;
     DnetState &st = g_dnet[handle];
     if (st.S)    { cudaFreeAsync(st.S, g_astream); st.S = nullptr; }
@@ -1252,6 +1266,7 @@ extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
 extern "C" void aspida_gpu_fattn_free(int handle) {
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // async-pool churn vs ggml computes
     cudaDeviceSynchronize();   // in-flight lane/batcher work may still touch st.K/st.V/st.scores
+    ctx_check("fattn_free", false);
     if (handle < 0 || handle >= (int) g_fattn.size()) return;
     FattnState &st = g_fattn[handle];
     if (st.K)      { cudaFreeAsync(st.K, g_astream); st.K = nullptr; }
@@ -2683,6 +2698,7 @@ static void chain_alloc_b(void) {
 extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int *pos,
                                                const int *handles, float *logits) {
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // whole-forward exclusion vs prefill
+    ctx_check("batch-entry", true);
     if (B < 1) return; if (B > BMAX) B = BMAX;
     chain_alloc_b();
     int dim=g_ch_dim, NL=(int)g_chain.size(); cudaStream_t st=gb_stream;
@@ -2830,6 +2846,7 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
         }
     }
     cudaStreamSynchronize(st);
+    ctx_check("batch-exit", true);
 }
 
 //===========================================================================
@@ -3853,6 +3870,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     struct timespec tw0, tw1, tw2;
     if (pwall) clock_gettime(CLOCK_MONOTONIC, &tw0);
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // whole-chunk exclusion vs decode batch
+    ctx_check("prefill-entry", true);
     //  Cumulative-state telemetry: request count, state/snapshot table sizes,
     //  free VRAM — the crash-after-~N-requests hunt (prints every 20 requests).
     {
@@ -4100,6 +4118,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     launch_mv_st(g_ch_lm, g_ch_lm_k, dim, g_ch_vocab, pnxb, pdlog, st);
     cudaMemcpyAsync(last_logits, pdlog, (size_t)g_ch_vocab*4, cudaMemcpyDeviceToHost, st);
     cudaStreamSynchronize(st);
+    ctx_check("prefill-exit", true);
     if (pwall) { clock_gettime(CLOCK_MONOTONIC, &tw2);
         double ms_loop = (tw1.tv_sec-tw0.tv_sec)*1e3 + (tw1.tv_nsec-tw0.tv_nsec)/1e6;
         double ms_head = (tw2.tv_sec-tw1.tv_sec)*1e3 + (tw2.tv_nsec-tw1.tv_nsec)/1e6;
