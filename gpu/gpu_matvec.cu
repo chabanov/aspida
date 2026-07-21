@@ -1385,10 +1385,12 @@ __global__ void k_fattn_prep(
     int nq, int nkv, int hd, int kvd, const int *__restrict__ posp,
     int rd, float base, float freq_scale, float m_scale,
     int yarn_on, float corr_lo, float corr_hi,
-    const float *__restrict__ ff, int use_ff, int interleaved, int sec_total) {
+    const float *__restrict__ ff, int use_ff, int interleaved, int sec_total,
+    int max_len) {
     extern __shared__ float sh[];
     float *nrm = sh;                       // [hd]
     int pos = *posp;
+    if (pos < 0 || pos >= max_len) return;   // C3: never write past this lane's KV cache
     int b = blockIdx.x, d = threadIdx.x;
     int half = rd / 2;
     bool is_q = b < nq;
@@ -1585,7 +1587,7 @@ extern "C" void aspida_gpu_fattn_step(
     k_fattn_prep<<<nq + nkv, hd, (size_t) hd * 4>>>(
         dqg, dkt, dvt, dqn, dkn, dqa, dga, st.K, st.V,
         nq, nkv, hd, kvd, d_pos1, rd, base, freq_scale, m_scale,
-        yarn_on, corr_lo, corr_hi, dff, use_ff, interleaved, sec_total);
+        yarn_on, corr_lo, corr_hi, dff, use_ff, interleaved, sec_total, st.max_len);
     k_fattn_attend<<<nq, 256>>>(dqa, dga, st.K, st.V, st.scores, datt,
                                 nq, nkv, hd, kvd, d_pos1, st.max_len);
     launch_mv_any(dow, o_k, att, dim, datt, dout);
@@ -2226,7 +2228,7 @@ static void chain_record(cudaStream_t st) {
             k_fattn_prep<<<L.nq + L.nkv, L.hd, (size_t) L.hd * 4, st>>>(
                 dqg, dkt, dvt, L.qn, L.kn, dqa, dga, fs.K, fs.V,
                 L.nq, L.nkv, L.hd, kvd, g_d_pos, L.rd, L.base, L.freq_scale, L.m_scale,
-                L.yarn_on, L.corr_lo, L.corr_hi, L.ffp, L.use_ff, L.interleaved, L.sec_total);
+                L.yarn_on, L.corr_lo, L.corr_hi, L.ffp, L.use_ff, L.interleaved, L.sec_total, fs.max_len);
             k_fattn_attend<<<L.nq, 256, 0, st>>>(dqa, dga, fs.K, fs.V, fs.scores, datt,
                                                  L.nq, L.nkv, L.hd, kvd, g_d_pos, fs.max_len);
             launch_mv_st(L.fow, L.fow_k, att, dim, datt, ao, st);
@@ -2271,8 +2273,11 @@ extern "C" void aspida_gpu_chain_end(void) {
 // failure under VRAM pressure, or an illegal access) must ABORT the generation
 // and release the inference lock, not leave a handler wedged holding the lock
 // while the GPU sits idle — the shape of the 2026-07-13 prod GPU-0% wedge.
+extern volatile int g_ggml_forward_failed;
 extern "C" int aspida_gpu_last_error(void) {
-    return (int) cudaGetLastError();
+    int e = (int) cudaGetLastError();
+    if (g_ggml_forward_failed) { g_ggml_forward_failed = 0; if (e == 0) e = 999; }  // ggml helper OOM/fail
+    return e;
 }
 
 // One decode step. First call of a generation captures the graph; the rest
@@ -2733,20 +2738,29 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
     //  race-free). k_dnet_recur_b then reads gb_Sptr[li*B + lane].
     static void *hSptr[BMAX * 64], *hHptr[BMAX * 64];
     static void *hfK[BMAX * 64], *hfV[BMAX * 64], *hfSc[BMAX * 64];
+    bool handle_bad = false;
     for (int li = 0; li < NL; ++li)
         if (!g_chain[li].is_fattn)
             for (int b = 0; b < B; ++b) {
-                DnetState ds = g_dnet[handles[b * NL + li]];
+                int h = handles[b * NL + li];
+                if (h < 0 || h >= (int) g_dnet.size()) { handle_bad = true; continue; }  // C4
+                DnetState ds = g_dnet[h];
                 hSptr[(size_t) li * B + b] = ds.S;
                 hHptr[(size_t) li * B + b] = ds.hist;
             }
         else
             for (int b = 0; b < B; ++b) {
-                FattnState fs = g_fattn[handles[b * NL + li]];
+                int h = handles[b * NL + li];
+                if (h < 0 || h >= (int) g_fattn.size()) { handle_bad = true; continue; }  // C4
+                FattnState fs = g_fattn[h];
                 hfK[(size_t) li * B + b]  = fs.K;
                 hfV[(size_t) li * B + b]  = fs.V;
                 hfSc[(size_t) li * B + b] = fs.scores;
             }
+    if (handle_bad) {
+        fprintf(stderr, "[BATCH] invalid handle in batch — aborting forward\n");
+        g_ggml_forward_failed = 1; return;
+    }
     cudaMemcpyAsync(gb_Sptr, hSptr, (size_t) NL * B * sizeof(void*),
                     cudaMemcpyHostToDevice, st);
     cudaMemcpyAsync(gb_histptr, hHptr, (size_t) NL * B * sizeof(void*),
@@ -2794,7 +2808,7 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
                     dqgb+(size_t)b*qgd, dktb+(size_t)b*kvd, dvtb+(size_t)b*kvd, L.qn, L.kn,
                     dqab+(size_t)b*att, dgab+(size_t)b*att, fs.K, fs.V,
                     L.nq,L.nkv,L.hd,kvd, gb_pos+b, L.rd,L.base,L.freq_scale,L.m_scale,
-                    L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total);
+                    L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total, fs.max_len);
             }
             cudaMemcpyAsync(gb_maxlen, hmaxlen, (size_t)B*4, cudaMemcpyHostToDevice, st);
             //  One batched attention launch over grid(nq, B) — byte-identical to
@@ -3155,12 +3169,14 @@ __global__ void k_fattn_prep_chunk(
     int nq, int nkv, int hd, int kvd, int pos_start,
     int rd, float base, float freq_scale, float m_scale,
     int yarn_on, float corr_lo, float corr_hi,
-    const float *__restrict__ ff, int use_ff, int interleaved, int sec_total, int P) {
+    const float *__restrict__ ff, int use_ff, int interleaved, int sec_total, int P,
+    int max_len) {
     extern __shared__ float sh[];
     float *nrm = sh;                       // [hd]
     int nbt = nq + nkv;
     int t = blockIdx.x / nbt, bb = blockIdx.x % nbt, d = threadIdx.x;
     int pos = pos_start + t;
+    if (pos < 0 || pos >= max_len) return;   // C3: never write past this lane's KV cache
     int qgd = nq * 2 * hd, att = nq * hd;
     const float *qg_t = qg + (size_t) t * qgd;
     const float *kt_t = kt + (size_t) t * kvd;
@@ -4066,7 +4082,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             k_fattn_prep_chunk<<<(size_t)(L.nq+L.nkv)*P, L.hd, (size_t)L.hd*4, st>>>(
                 pdqg, pdkt, pdvt, L.qn, L.kn, pdqa, pdga, fs.K, fs.V,
                 L.nq,L.nkv,L.hd,kvd, pos_start, L.rd,L.base,L.freq_scale,L.m_scale,
-                L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total, P);
+                L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total, P, fs.max_len);
             //  Phase B: prefill full-attention via llama.cpp fattn-mma
             //  (ncols2=8 GQA column-packing + cp_async pipelining), through the
             //  ggml public API. Measured ~6.5x the previous wmma3 kernel at
@@ -4077,8 +4093,9 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             //  did). The old wmma3/tile_gqa/attend_chunk kernels remain compiled
             //  but unused; roll back by redeploying the previous .so.
             //  See gpu/fattn_ggml.cuh for the layout mapping + repack.
-            aspida_ggml_fattn_prefill(pdqa, fs.K, fs.V, pdga, pdatt,
-                                      L.nq, L.nkv, L.hd, P, pos_start, st);
+            if (!aspida_ggml_fattn_prefill(pdqa, fs.K, fs.V, pdga, pdatt,
+                                      L.nq, L.nkv, L.hd, P, pos_start, st))
+                fprintf(stderr, "[FATTN] ggml prefill failed li=%d — generation will abort\n", li);
             launch_mv_b(L.fow, L.fow_k, att, dim, pdatt, paob, P, st);
         }
         k_axpy_b<<<((size_t)dim*P+255)/256,256,0,st>>>(pHb, paob, dim, P);

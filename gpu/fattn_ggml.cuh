@@ -70,7 +70,7 @@ static std::recursive_mutex g_ggml_mu;
 static bool gfa_rebuild(GgmlFA &s, int nq, int nkv, int hd, int P, int len) {
     if (!s.be) {
         s.be = ggml_backend_cuda_init(0);          // shares aspida's runtime-API
-        if (!s.be) { fprintf(stderr, "[ggmlFA] cuda_init failed\n"); return false; }
+        if (!s.be) { fprintf(stderr, "[ggmlFA] cuda_init failed\n"); s.P=s.len=-1; return false; }
         s.buft = ggml_backend_cuda_buffer_type(0); // primary context (device 0)
     }
     if (s.ctx) { ggml_free(s.ctx); s.ctx = nullptr; }
@@ -86,7 +86,11 @@ static bool gfa_rebuild(GgmlFA &s, int nq, int nkv, int hd, int P, int len) {
     s.gr = ggml_new_graph(s.ctx);
     ggml_build_forward_expand(s.gr, s.out);
     s.ga = ggml_gallocr_new(s.buft);
-    if (!ggml_gallocr_alloc_graph(s.ga, s.gr)) { fprintf(stderr, "[ggmlFA] alloc_graph failed\n"); return false; }
+    if (!ggml_gallocr_alloc_graph(s.ga, s.gr)) {
+        fprintf(stderr,"[ggmlFA] alloc_graph failed\n");
+        s.P = s.len = -1;   // C2: never let a later same-shape call skip rebuild with NULL ->data
+        return false;
+    }
     s.P = P; s.len = len; s.nq = nq; s.nkv = nkv; s.hd = hd;
     return true;
 }
@@ -96,7 +100,13 @@ static bool gfa_rebuild(GgmlFA &s, int nq, int nkv, int hd, int P, int len) {
 // prepped/rotated Q [t][h][d] (fp32); fsK/fsV the resident fp16 cache
 // [pos][nkv*hd]; gate the per-dim sigmoid gate [t][nq*hd]; out is [t][nq*hd].
 // Runs on the aspida stream `st` for ordering with the surrounding chain.
-static void aspida_ggml_fattn_prefill(
+//  Sticky flag: a ggml helper failed to produce output this forward. The Ada
+//  side ORs it into aspida_gpu_last_error so the generation ABORTS cleanly
+//  instead of feeding uninitialized attention through the residual stream
+//  (the silent-deterministic-garbage / "poisoning" class — cert finding C1).
+volatile int g_ggml_forward_failed = 0;
+
+static bool aspida_ggml_fattn_prefill(
         const float *q_all, const __half *fsK, const __half *fsV,
         const float *gate, float *out,
         int nq, int nkv, int hd, int P, int pos_start, cudaStream_t st) {
@@ -104,7 +114,11 @@ static void aspida_ggml_fattn_prefill(
     GgmlFA &s = g_gfa;
     int len = pos_start + P;
     if (s.P != P || s.len != len || s.nq != nq || s.nkv != nkv || s.hd != hd) {
-        if (!gfa_rebuild(s, nq, nkv, hd, P, len)) return;
+        if (!gfa_rebuild(s, nq, nkv, hd, P, len)) {
+            g_ggml_forward_failed = 1;
+            cudaMemsetAsync(out, 0, (size_t) P * nq * hd * sizeof(float), st);  // never leave `out` stale
+            return false;
+        }
     }
     // prep_chunk wrote fsK/fsV/q_all/gate on `st`; make them visible before the
     // repacks (which run on the default stream) read them.
@@ -121,4 +135,5 @@ static void aspida_ggml_fattn_prefill(
     cudaMemcpy(out, s.out->data, (size_t) P * nq * hd * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaDeviceSynchronize();   // D2D is async on the legacy stream — complete before unlock
     k_ggml_apply_gate<<<((size_t) P * nq * hd + bs - 1) / bs, bs, 0, st>>>(out, gate, P * nq * hd);
+    return true;
 }

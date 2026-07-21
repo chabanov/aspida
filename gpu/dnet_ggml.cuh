@@ -75,7 +75,7 @@ static bool ggdn_rebuild(GgmlGDN &S, int nkh, int nv, int khd, int vhd, int P) {
     S.gr = ggml_new_graph(S.ctx);
     ggml_build_forward_expand(S.gr, S.out);
     S.ga = ggml_gallocr_new(g_gfa.buft);
-    if (!ggml_gallocr_alloc_graph(S.ga, S.gr)) { fprintf(stderr,"[gdn] alloc failed\n"); return false; }
+    if (!ggml_gallocr_alloc_graph(S.ga, S.gr)) { fprintf(stderr,"[gdn] alloc failed\n"); S.P=-1; return false; }
     S.P=P; S.nkh=nkh; S.nv=nv; S.khd=khd; S.vhd=vhd;
     return true;
 }
