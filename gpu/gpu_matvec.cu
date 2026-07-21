@@ -2817,6 +2817,36 @@ __global__ void k_dnet_conv_chunk(const float *__restrict__ qkv, float *__restri
     }
 }
 
+//  Parallel prefill conv (P >= kernel): one thread per (token, channel) — the
+//  serial version above loops all P tokens per channel (~24 blocks, occupancy-
+//  starved). Bit-identical: same acc order (current tap first, then k=0..K-2).
+//  hist boundary for the first K-1 tokens comes from the previous chunk's hist;
+//  hist is refreshed once, after, by k_dnet_conv_hist.
+__global__ void k_dnet_conv_par(const float *__restrict__ qkv, const float *__restrict__ hist,
+                                const float *__restrict__ convw, float *__restrict__ cq,
+                                int qo, int kernel, int P) {
+    size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    int c = (int) (idx % qo);
+    int t = (int) (idx / qo);
+    if (t >= P) return;
+    const float *w = convw + (size_t) c * kernel;
+    float acc = qkv[(size_t) t * qo + c] * w[kernel - 1];   // current tap first (matches serial)
+    for (int j = 0; j < kernel - 1; ++j) {
+        int pos = t - (kernel - 1) + j;
+        float v = (pos >= 0) ? qkv[(size_t) pos * qo + c]
+                             : hist[(size_t) (t + j) * qo + c];   // pos<0 -> hist[t+j]
+        acc += v * w[j];
+    }
+    cq[(size_t) t * qo + c] = acc / (1.f + expf(-acc));
+}
+//  Refresh hist to the last kernel-1 input positions (P >= kernel-1).
+__global__ void k_dnet_conv_hist(const float *__restrict__ qkv, float *__restrict__ hist,
+                                 int qo, int kernel, int P) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x; if (c >= qo) return;
+    for (int m = 0; m < kernel - 1; ++m)
+        hist[(size_t) m * qo + c] = qkv[(size_t) (P - (kernel - 1) + m) * qo + c];
+}
+
 //===========================================================================
 //  Warp-parallel delta-net recurrence (ASPIDA_DNET_WARP) — same math as
 //  k_dnet_recur_chunk, restructured for occupancy + register-resident state.
@@ -3781,7 +3811,10 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 launch_mv_b(L.ga, L.ga_k, dim, L.v_dim, pnxb, pdz, P, st);
             }
             size_t shmem=(size_t)(4*L.khd+2*L.vhd)*4;
-            k_dnet_conv_chunk<<<(L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.conv, pdcq, L.qo, L.kernel, P);
+            if (P >= L.kernel - 1) {
+                k_dnet_conv_par<<<((size_t)P*L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.conv, pdcq, L.qo, L.kernel, P);
+                if (L.kernel >= 2) k_dnet_conv_hist<<<(L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.qo, L.kernel, P);
+            } else k_dnet_conv_chunk<<<(L.qo+255)/256,256,0,st>>>(pdqkv, ds.hist, L.conv, pdcq, L.qo, L.kernel, P);
             k_dnet_gates_b<<<((size_t)P*L.nv+255)/256,256,0,st>>>(pdar, pdbr, L.aw, L.dtw, pdg, pdb, L.nv, P);
             if (pprof) { cudaEventRecord(pe1, st); cudaEventSynchronize(pe1); float p=0; cudaEventElapsedTime(&p, pe0, pe1); acc_dproj += p; }
             //  Warp-parallel register-resident recurrence (~14x): DEFAULT after
