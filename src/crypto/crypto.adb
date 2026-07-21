@@ -3,6 +3,7 @@
 ---------------------------------------------------------------------
 
 with Interfaces; use Interfaces;
+with System.Machine_Code;
 
 package body Crypto with SPARK_Mode => On is
 
@@ -33,6 +34,11 @@ package body Crypto with SPARK_Mode => On is
       for I in A'Range loop
          A (I) := 0;
       end loop;
+      --  S2 (cert): guaranteed compiler/memory barrier so the zeroing stores
+      --  survive dead-store elimination even under -flto / forced inlining
+      --  (the fold-and-raise below is a runtime sanity check, not a guarantee).
+      System.Machine_Code.Asm
+        ("", Volatile => True, Clobber => "memory");
       --  Force the stores to be observable so the optimiser cannot elide the
       --  wipe of a buffer that is never read again. Fold the whole array (not
       --  just A'First) so every byte is read post-wipe; the branch is never

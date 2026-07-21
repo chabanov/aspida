@@ -11,6 +11,7 @@ with Ada.Strings;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Unchecked_Deallocation;
 with Ada.Exceptions;
+with Ada.Finalization;
 with LLM_GGUF;    use LLM_GGUF;
 with LLM_Dequant; use LLM_Dequant;
 with LLM_Tensor;  use LLM_Tensor;
@@ -1120,15 +1121,21 @@ package body LLM_Qwen is
          --  Freeing device state mutates shared GPU vectors — serialise it in
          --  batch-serve mode (same reason as allocation).
          if LLM_Batcher.Enabled then LLM_Batcher.Alloc_Lock; end if;
-         for I in Cache'Range loop
-            if Cache (I).Is_Full then
-               LLM_Qwen_GPU.Fattn_Free (Cache (I).Full_St.GPU_Handle);
-               Cache (I).Full_St.GPU_Handle := -1;
-            else
-               LLM_Qwen_GPU.Dnet_Free (Cache (I).DNet_St.GPU_Handle);
-               Cache (I).DNet_St.GPU_Handle := -1;
-            end if;
-         end loop;
+         begin
+            for I in Cache'Range loop
+               if Cache (I).Is_Full then
+                  LLM_Qwen_GPU.Fattn_Free (Cache (I).Full_St.GPU_Handle);
+                  Cache (I).Full_St.GPU_Handle := -1;
+               else
+                  LLM_Qwen_GPU.Dnet_Free (Cache (I).DNet_St.GPU_Handle);
+                  Cache (I).DNet_St.GPU_Handle := -1;
+               end if;
+            end loop;
+         exception
+            when others =>   -- A6: never leak Alloc_Lock on a teardown raise
+               if LLM_Batcher.Enabled then LLM_Batcher.Alloc_Unlock; end if;
+               raise;
+         end;
          if LLM_Batcher.Enabled then LLM_Batcher.Alloc_Unlock; end if;
       end Free_States;
 
@@ -1137,6 +1144,7 @@ package body LLM_Qwen is
       function Decode (Embed_Row : Integer) return Tensor is
          H  : Tensor := New_Tensor ([1, Dim]);
          TS : Ada.Real_Time.Time;
+         Held_Step : Boolean := False;   -- A5: only Release the step lock we took
       begin
          --  Batched path: submit the step to the shared Driver (no step lock —
          --  the Driver is the sole GPU forward caller and serialises internally).
@@ -1156,6 +1164,7 @@ package body LLM_Qwen is
             end;
          end if;
          LLM_Step_Lock.Acquire;
+         Held_Step := True;
          if Use_Chain then
             declare
                R : constant Tensor := New_Tensor ([1, M.Vocab_Sz]);
@@ -1168,7 +1177,7 @@ package body LLM_Qwen is
                  (Embed_Row - 1, Chain_Pos, Handles (1)'Address,
                   Data_Address (R));
                Chain_Pos := Chain_Pos + 1;
-               LLM_Step_Lock.Release;
+               LLM_Step_Lock.Release; Held_Step := False;
                return R;
             end;
          end if;
@@ -1206,12 +1215,12 @@ package body LLM_Qwen is
                Prof2_Head := Prof2_Head + Ada.Real_Time.To_Duration (Ada.Real_Time.Clock - TS);
                Prof2_Tick;
             end if;
-            LLM_Step_Lock.Release;
+            LLM_Step_Lock.Release; Held_Step := False;
             return R;
          end;
       exception
          when others =>
-            LLM_Step_Lock.Release;
+            if Held_Step then LLM_Step_Lock.Release; end if;
             raise;
       end Decode;
 
@@ -1767,6 +1776,39 @@ package body LLM_Qwen is
    --  Structured chat internal: build the prompt, generate raw pieces,
    --  drive the FSM parser, and return the assembled Chat_Result. Used by
    --  both the streaming (with Chat_Sink) and non-streaming variants.
+   --  A4 (cert): vision state (Vis_Vtok/Ntok/Active + the single C-side
+   --  Set_Vision slot) is package-global, shared across handler tasks. Two
+   --  concurrent image requests would race: task B's Prep_Vision (Clear_Vision
+   --  + overwrite the globals) during task A's Setup_Vision->prefill window ->
+   --  A prefills with B's visual tokens. Serialize the vision span per request
+   --  with a discriminated RAII holder: text requests pass Active => False and
+   --  never touch the gate, so the hot path is unaffected; concurrent IMAGE
+   --  requests serialize (Finalize releases on every exit, incl. exception).
+   protected Vision_Serial is
+      entry Acquire;
+      procedure Release;
+   private
+      Busy : Boolean := False;
+   end Vision_Serial;
+
+   protected body Vision_Serial is
+      entry Acquire when not Busy is begin Busy := True; end Acquire;
+      procedure Release is begin Busy := False; end Release;
+   end Vision_Serial;
+
+   type Vision_Hold (Active : Boolean) is
+     new Ada.Finalization.Limited_Controlled with null record;
+   overriding procedure Initialize (H : in out Vision_Hold);
+   overriding procedure Finalize   (H : in out Vision_Hold);
+   overriding procedure Initialize (H : in out Vision_Hold) is
+   begin
+      if H.Active then Vision_Serial.Acquire; end if;
+   end Initialize;
+   overriding procedure Finalize (H : in out Vision_Hold) is
+   begin
+      if H.Active then Vision_Serial.Release; end if;
+   end Finalize;
+
    --  Native Ornith vision (one image/request). Prep_Vision runs the ViT and
    --  marks the image message with its visual-token count; Setup_Vision finds
    --  the <|image_pad|> rows in the built prompt and hands the visual tokens to
@@ -1993,6 +2035,11 @@ package body LLM_Qwen is
          --  assistant\n) — a malformed prompt that made the model hallucinate and
          --  loop. Ollama treats a trailing assistant message as a prefill; match it.
          --  Prefix over messages before any trailing assistant prefill.
+         Has_Image : constant Boolean :=
+           (for some Msg of Conversation =>
+              Msg.Image /= Ada.Strings.Unbounded.Null_Unbounded_String);
+         Vis_Guard : Vision_Hold (Active => Has_Image);   -- A4: serialize image reqs
+         pragma Unreferenced (Vis_Guard);
          Conv : constant Message_Array := Prep_Vision (Conversation);
          Prefix : constant LLM_Tokenizer.Token_Array :=
            (if Last_Is_Asst then
