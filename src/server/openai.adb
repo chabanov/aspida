@@ -31,9 +31,38 @@ package body OpenAI is
             declare
                Mi : constant JSON.Value_Ref := JSON.Item (M, I);
             begin
-               R.Messages (I) :=
-                 (Role => Role_Of (JSON.As_String (JSON.Get (Mi, "role"), "user")),
-                  Text => To_Unbounded_String (JSON.As_String (JSON.Get (Mi, "content"))));
+               --  content is either a plain string or an OpenAI content array
+               --  (text parts + image_url parts). Native Ornith vision: pull the
+               --  first image's data-URI/URL out for the engine's ViT path.
+               declare
+                  Content_V : constant JSON.Value_Ref := JSON.Get (Mi, "content");
+                  Txt : Unbounded_String := Null_Unbounded_String;
+                  Img : Unbounded_String := Null_Unbounded_String;
+               begin
+                  if JSON.Is_Array (Content_V) then
+                     for K in 1 .. JSON.Length (Content_V) loop
+                        declare
+                           It : constant JSON.Value_Ref := JSON.Item (Content_V, K);
+                           IU : constant JSON.Value_Ref := JSON.Get (It, "image_url");
+                        begin
+                           if JSON.Exists (JSON.Get (It, "text")) then
+                              Txt := Txt & To_Unbounded_String
+                                (JSON.As_String (JSON.Get (It, "text")));
+                           elsif JSON.Exists (IU) then
+                              Img := To_Unbounded_String
+                                (JSON.As_String (JSON.Get (IU, "url")));
+                           end if;
+                        end;
+                     end loop;
+                  else
+                     Txt := To_Unbounded_String (JSON.As_String (Content_V));
+                  end if;
+                  R.Messages (I) :=
+                    (Role  => Role_Of (JSON.As_String (JSON.Get (Mi, "role"), "user")),
+                     Text  => Txt,
+                     Image => Img,
+                     Img_Ntok => 0);
+               end;
             end;
          end loop;
          R.Model      := To_Unbounded_String (JSON.As_String (JSON.Get (V, "model"), "aspida"));

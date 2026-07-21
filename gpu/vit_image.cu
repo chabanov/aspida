@@ -19,7 +19,7 @@ static void resize_rgb(const unsigned char*src,int H,int W,std::vector<float>&ds
 // smart_resize: multiples of factor=32, within [min_px,max_px]
 static void smart_resize(int H,int W,int&oh,int&ow){
   const int F=32; const double MINP=256*256, MAXP=4096*4096;
-  auto rnd=[&](int v){int r=(int)std::lround((double)v/F)*F; return r<F?F:r;};
+  auto rnd=[&](int v){int r=(int)std::nearbyint((double)v/F)*F; return r<F?F:r;};
   oh=rnd(H); ow=rnd(W); double px=(double)oh*ow;
   if(px>MAXP){double s=std::sqrt(MAXP/((double)H*W)); oh=(int)std::floor(H*s/F)*F; ow=(int)std::floor(W*s/F)*F;}
   else if(px<MINP){double s=std::sqrt(MINP/((double)H*W)); oh=(int)std::ceil(H*s/F)*F; ow=(int)std::ceil(W*s/F)*F;}
@@ -42,4 +42,16 @@ extern "C" int aspida_vit_from_image(const unsigned char*data,int n,float*out_to
   }
   aspida_vit(pv.data(),gh,gw,out_tokens);
   *out_gh=gh; *out_gw=gw; return S/4;
+}
+
+// base64 (optionally a data: URI) -> visual tokens. Convenience wrapper for Ada.
+static int b64val(char c){ if(c>=65&&c<=90)return c-65; if(c>=97&&c<=122)return c-71; if(c>=48&&c<=57)return c+4; if(c==43)return 62; if(c==47)return 63; return -1; }
+extern "C" int aspida_vit_from_b64(const char*b64,float*out_tokens,int*out_gh,int*out_gw){
+  const char COMMA=44, EQ=61, NL=10, CR=13, SP=32;
+  const char*p=b64; const char*comma=strchr(b64,COMMA); if(strncmp(b64,"data:",5)==0 && comma) p=comma+1;
+  std::vector<unsigned char> raw; raw.reserve(strlen(p)*3/4); int acc=0,bits=0;
+  for(;*p;++p){ if(*p==EQ||*p==NL||*p==CR||*p==SP)continue; int v=b64val(*p); if(v<0)continue;
+    acc=(acc<<6)|v; bits+=6; if(bits>=8){bits-=8; raw.push_back((unsigned char)((acc>>bits)&0xFF));} }
+  if(raw.empty())return -1;
+  return aspida_vit_from_image(raw.data(),(int)raw.size(),out_tokens,out_gh,out_gw);
 }

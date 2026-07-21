@@ -155,7 +155,7 @@ procedure OpenAI_Proxy is
                            M_Len, P_Len, B_Len : out Natural; Err : out Natural) is
       Buf  : Stream_Element_Array (1 .. 65536);
       Last : Stream_Element_Offset;
-      Data : String (1 .. 1_048_576);
+      Data : String (1 .. 12_582_912);
       Len  : Natural := 0;
       Hdr_End  : Natural := 0;
       CLen     : Natural := 0;
@@ -356,7 +356,7 @@ procedure OpenAI_Proxy is
       Ch     : Secure_Channel.Channel;
       Method : String (1 .. 16);
       Path   : String (1 .. 1024);
-      RBody  : String (1 .. 1_048_576);
+      RBody  : String (1 .. 12_582_912);
       ML, PL, BL, Err : Natural;
    begin
       Read_Request (Client, Method, Path, RBody, ML, PL, BL, Err);
@@ -604,7 +604,7 @@ procedure OpenAI_Proxy is
    --  Worker pool. Each worker serves one client at a time on its own channel,
    --  so a slow generation or a stuck client on one worker never blocks the
    --  others. Big stack: Serve holds two 1 MB request buffers.
-   task type Worker with Storage_Size => 16 * 1024 * 1024;
+   task type Worker with Storage_Size => 48 * 1024 * 1024;
    task body Worker is
       Client : Socket_Type;
    begin

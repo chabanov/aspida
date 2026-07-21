@@ -18,7 +18,7 @@ package body Secure_Channel is
      "aspida-secure-channel/1 X25519-ChaCha20Poly1305-HKDF-SHA256";
    Info     : constant String := "keys";
 
-   Max_Frame : constant := 1_048_576;   -- 1 MiB cap (anti-DoS)
+   Max_Frame : constant := 16_777_216;  -- 16 MiB cap (anti-DoS); proxy body-limit is the effective ceiling
 
    Zero32 : constant Key32 := [others => 0];
 

@@ -121,6 +121,9 @@ package LLM_Qwen is
    type Message is record
       Role : Role_Kind;
       Text : Ada.Strings.Unbounded.Unbounded_String;
+      Image : Ada.Strings.Unbounded.Unbounded_String :=
+        Ada.Strings.Unbounded.Null_Unbounded_String;
+      Img_Ntok : Natural := 0;
    end record;
    type Message_Array is array (Positive range <>) of Message;
 

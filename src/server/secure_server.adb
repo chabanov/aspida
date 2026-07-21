@@ -709,7 +709,7 @@ procedure Secure_Server is
                           OpenAI.Error_Response ("messages required"));
                      else
                         if First_Idx = 2 then
-                           Conv (1) := (LLM_Qwen.Role_System, Rq.Tools_Sysmsg);
+                           Conv (1) := (LLM_Qwen.Role_System, Rq.Tools_Sysmsg, Null_Unbounded_String, 0);
                         end if;
                         Conv (First_Idx .. N_Msg) := Rq.Messages (1 .. Rq.N);
                         --  Never trust client params: clamp.
@@ -850,12 +850,12 @@ procedure Secure_Server is
             begin
                for I in 1 .. N loop
                   Conv (2 * I - 1) := (LLM_Qwen.Role_User,
-                    To_Unbounded_String (Session_Store.User_Of (Store, I)));
+                    To_Unbounded_String (Session_Store.User_Of (Store, I)), Null_Unbounded_String, 0);
                   Conv (2 * I) := (LLM_Qwen.Role_Assistant,
-                    To_Unbounded_String (Session_Store.Assistant_Of (Store, I)));
+                    To_Unbounded_String (Session_Store.Assistant_Of (Store, I)), Null_Unbounded_String, 0);
                end loop;
                Conv (2 * N + 1) :=
-                 (LLM_Qwen.Role_User, To_Unbounded_String (Prompt));
+                 (LLM_Qwen.Role_User, To_Unbounded_String (Prompt), Null_Unbounded_String, 0);
 
                --  Only one generation runs at a time across all clients.
                Infer_Lock.Acquire; Locked := True;

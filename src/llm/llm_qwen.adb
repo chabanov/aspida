@@ -1681,6 +1681,16 @@ package body LLM_Qwen is
       LF : constant String := [1 => ASCII.LF];
       use type LLM_Tokenizer.Token_Array;
    begin
+      if Msg.Img_Ntok > 0 then
+         return One (M.Im_Start_Id)
+           & LLM_Tokenizer.Encode (M.Tok, Role_Str (Msg.Role) & LF)
+           & One (248053)
+           & LLM_Tokenizer.Token_Array'(1 .. Msg.Img_Ntok => 248056)
+           & One (248054)
+           & Encode_Chat (M, To_String (Msg.Text))
+           & One (M.Im_End_Id)
+           & LLM_Tokenizer.Encode (M.Tok, LF);
+      end if;
       return One (M.Im_Start_Id)
         & LLM_Tokenizer.Encode (M.Tok, Role_Str (Msg.Role) & LF)
         & Encode_Chat (M, To_String (Msg.Text))
@@ -1706,6 +1716,58 @@ package body LLM_Qwen is
    --  Structured chat internal: build the prompt, generate raw pieces,
    --  drive the FSM parser, and return the assembled Chat_Result. Used by
    --  both the streaming (with Chat_Sink) and non-streaming variants.
+   --  Native Ornith vision (one image/request). Prep_Vision runs the ViT and
+   --  marks the image message with its visual-token count; Setup_Vision finds
+   --  the <|image_pad|> rows in the built prompt and hands the visual tokens to
+   --  the GPU for prefill injection. Guarded: no image => no-op, chat bit-exact.
+   Vis_Max_Tok : constant := 8192;
+   Vis_Vtok    : array (0 .. Vis_Max_Tok * 2048 - 1) of Interfaces.C.C_float;
+   Vis_Ntok    : Natural := 0;
+   Vis_Active  : Boolean := False;
+
+   function Prep_Vision (Conv_In : Message_Array) return Message_Array is
+      Result : Message_Array := Conv_In;
+      GH, GW : aliased Integer := 0;
+   begin
+      Vis_Ntok := 0; Vis_Active := False;
+      --  Clear any stale C-side vision state so it can never leak into this
+      --  request's prefill (prior request's tokens, an aborted decode, or the
+      --  vision warm-up). Image requests re-arm it via Setup_Vision below.
+      LLM_Qwen_GPU.Clear_Vision;
+      if not LLM_Qwen_GPU.Vision_Available then return Result; end if;
+      for I in Result'Range loop
+         if Result (I).Image /= Ada.Strings.Unbounded.Null_Unbounded_String then
+            declare
+               N : constant Integer := LLM_Qwen_GPU.Vit_From_B64
+                 (To_String (Result (I).Image), Vis_Vtok'Address, GH'Access, GW'Access);
+            begin
+               if N > 0 and then N <= Vis_Max_Tok then
+                  Result (I).Img_Ntok := N; Vis_Ntok := N; Vis_Active := True;
+               end if;
+            end;
+            exit;
+         end if;
+      end loop;
+      return Result;
+   end Prep_Vision;
+
+   function Setup_Vision (Ids : LLM_Tokenizer.Token_Array) return Boolean is
+      Positions : array (1 .. Natural'Max (Vis_Ntok, 1)) of Interfaces.C.int;
+      K : Natural := 0;
+   begin
+      if not Vis_Active or else Vis_Ntok = 0 then return False; end if;
+      for I in Ids'Range loop
+         if Ids (I) = 248056 then
+            K := K + 1;
+            if K <= Vis_Ntok then Positions (K) := Interfaces.C.int (I - Ids'First); end if;
+         end if;
+      end loop;
+      if K = Vis_Ntok then
+         LLM_Qwen_GPU.Set_Vision (Vis_Ntok, Positions'Address, Vis_Vtok'Address);
+      end if;
+      return True;
+   end Setup_Vision;
+
    function Chat_Raw
      (M : Qwen_Model; Conversation : Message_Array;
       Max_New_Tokens : Integer;
@@ -1880,13 +1942,12 @@ package body LLM_Qwen is
          --  assistant\n) — a malformed prompt that made the model hallucinate and
          --  loop. Ollama treats a trailing assistant message as a prefill; match it.
          --  Prefix over messages before any trailing assistant prefill.
+         Conv : constant Message_Array := Prep_Vision (Conversation);
          Prefix : constant LLM_Tokenizer.Token_Array :=
            (if Last_Is_Asst then
-              Conv_Ids (M, Conversation
-                          (Conversation'First .. Conversation'Last - 1),
-                        Conversation'First)
+              Conv_Ids (M, Conv (Conv'First .. Conv'Last - 1), Conv'First)
             else
-              Conv_Ids (M, Conversation, Conversation'First));
+              Conv_Ids (M, Conv, Conv'First));
 
          --  Prefix KV-cache boundary: the leading run of Role_System messages
          --  (the agent's constant system prompt + synthesized tools block).
@@ -1991,6 +2052,8 @@ package body LLM_Qwen is
          --  GPU state and re-raises, and generation stops within one token.
          Bridge : aliased Parser_Bridge :=
            (Token_Sink with Psr => P'Access, Tgt => SinkRef);
+         Vis_Setup : constant Boolean := Setup_Vision (Ids);
+         pragma Unreferenced (Vis_Setup);
          Raw : constant String :=
            Decode_Tokens (M, Ids, Max_New_Tokens, M.Im_End_Id, M.Eos_Id,
                           Bridge'Access, Params_Eff, Stats,
@@ -1999,6 +2062,7 @@ package body LLM_Qwen is
                           Reason_Seeded => Think_Open);
          pragma Unreferenced (Raw);  -- already fed to the parser live above
       begin
+         LLM_Qwen_GPU.Clear_Vision;
          LLM_Chat_Parser.Finalize (P, SinkRef);
          declare
             NC : constant Natural := LLM_Chat_Parser.N_Tool_Calls (P);

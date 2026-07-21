@@ -1,8 +1,8 @@
 ---------------------------------------------------------------------
 -- LLM_Qwen_GPU — resident-GPU decode blocks for the Qwen/MoE backend.
 --
--- This is the "resident forward" path: instead of offloading one matvec at a
--- time (LLM_GPU.MatVec, which round-trips
+-- This is the "resident forward" path (see GPU_RESIDENT_FORWARD.md):
+-- instead of offloading one matvec at a time (LLM_GPU.MatVec, which round-trips
 -- the activation host<->device on every weight), a whole decode block runs on
 -- the device with the hidden state kept resident, so per token only the input
 -- goes in and the result comes out once.
@@ -234,6 +234,11 @@ package LLM_Qwen_GPU is
      (B : Integer; Rows, Pos, Handles, Logits : System.Address);
 
    --  True iff the resident shim exports the chunked-prefill entry point.
+   function Vision_Available return Boolean;
+   function Vit_From_B64
+     (B64 : String; Tokens : System.Address; GH, GW : access Integer) return Integer;
+   procedure Set_Vision (Npos : Integer; Positions, Vtok : System.Address);
+   procedure Clear_Vision;
    function Chain_Prefill_Available return Boolean;
 
    --  Chunked PREFILL: advance ONE generation's resident state over P

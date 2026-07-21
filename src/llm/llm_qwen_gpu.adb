@@ -176,6 +176,18 @@ package body LLM_Qwen_GPU is
      (Lane, P : int; Rows : System.Address; Pos_Start : int;
       Handles, Last_Logits : System.Address) with Convention => C;
    function To_CPre is new Ada.Unchecked_Conversion (System.Address, Chain_Prefill_Fn);
+   type Vit_B64_Fn is access function
+     (B64 : Interfaces.C.Strings.chars_ptr; Tokens, GH, GW : System.Address)
+      return int with Convention => C;
+   function To_VitB64 is new Ada.Unchecked_Conversion (System.Address, Vit_B64_Fn);
+   type Set_Vision_Fn is access procedure (Npos : int; Positions, Vtok : System.Address)
+     with Convention => C;
+   function To_SetVis is new Ada.Unchecked_Conversion (System.Address, Set_Vision_Fn);
+   type Clear_Vision_Fn is access procedure with Convention => C;
+   function To_ClrVis is new Ada.Unchecked_Conversion (System.Address, Clear_Vision_Fn);
+   VitB64_Fn  : Vit_B64_Fn     := null;
+   SetVis_Fn  : Set_Vision_Fn  := null;
+   ClrVis_Fn  : Clear_Vision_Fn := null;
 
    --  Prefix-cache snapshot/restore (phase 2). int f(handle, slot) for the
    --  two-arg forms (dnet snapshot/restore, fattn restore); int f(handle,
@@ -329,6 +341,12 @@ package body LLM_Qwen_GPU is
                if A /= System.Null_Address then CErr_Fn := To_Int (A); end if;
                Look ("aspida_gpu_chain_prefill", A);
                if A /= System.Null_Address then CPre_Fn := To_CPre (A); end if;
+               Look ("aspida_vit_from_b64", A);
+               if A /= System.Null_Address then VitB64_Fn := To_VitB64 (A); end if;
+               Look ("aspida_gpu_set_vision", A);
+               if A /= System.Null_Address then SetVis_Fn := To_SetVis (A); end if;
+               Look ("aspida_gpu_clear_vision", A);
+               if A /= System.Null_Address then ClrVis_Fn := To_ClrVis (A); end if;
                Look ("aspida_gpu_dnet_snapshot", A);
                if A /= System.Null_Address then DSnap_Fn := To_Snap2 (A); end if;
                Look ("aspida_gpu_dnet_restore", A);
@@ -690,6 +708,30 @@ package body LLM_Qwen_GPU is
       end if;
       return CPre_Fn /= null;
    end Chain_Prefill_Available;
+
+   function Vision_Available return Boolean is (VitB64_Fn /= null and then SetVis_Fn /= null);
+
+   function Vit_From_B64
+     (B64 : String; Tokens : System.Address; GH, GW : access Integer) return Integer
+   is
+      C_Str : Interfaces.C.Strings.chars_ptr := Interfaces.C.Strings.New_String (B64);
+      N     : int;
+   begin
+      N := VitB64_Fn (C_Str, Tokens, GH.all'Address, GW.all'Address);
+      Interfaces.C.Strings.Free (C_Str);
+      Check_GPU;
+      return Integer (N);
+   end Vit_From_B64;
+
+   procedure Set_Vision (Npos : Integer; Positions, Vtok : System.Address) is
+   begin
+      SetVis_Fn (int (Npos), Positions, Vtok); Check_GPU;
+   end Set_Vision;
+
+   procedure Clear_Vision is
+   begin
+      if ClrVis_Fn /= null then ClrVis_Fn.all; end if;
+   end Clear_Vision;
 
    procedure Chain_Prefill
      (Lane, P : Integer; Rows : System.Address; Pos_Start : Integer;
