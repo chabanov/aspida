@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <unistd.h>
 #include "fattn_ggml.cuh"   // Phase B: prefill full-attn via llama.cpp fattn-mma (ggml link-and-call)
 #include "moe_ggml.cuh"
 #include "dnet_ggml.cuh"
@@ -3912,6 +3913,23 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 for (size_t q = 0; q < n; ++q) { h ^= b[q]; h *= 1099511628211ULL; }
                 return h;
             };
+            //  Shape-cache sanity: cached shape fields must match the live
+            //  ggml tensor dims — a mismatch means a stuck/stale graph cache
+            //  (computes garbage deterministically for that shape).
+            {
+                const char *g1 = "ok", *g2 = "ok";
+                if (g_gfa.ctx) {
+                    if (!g_gfa.q || !g_gfa.k || !g_gfa.out
+                        || g_gfa.q->ne[0] != g_gfa.hd || g_gfa.q->ne[1] != g_gfa.P
+                        || g_gfa.k->ne[1] != g_gfa.len) g1 = "BAD";
+                }
+                if (g_ggdn.ctx) {
+                    if (!g_ggdn.q || !g_ggdn.s
+                        || g_ggdn.q->ne[0] != g_ggdn.khd || g_ggdn.q->ne[2] != g_ggdn.P) g2 = "BAD";
+                }
+                fprintf(stderr, "[GCHK] gfa=%s(P=%d len=%d) gdn=%s(P=%d)\n",
+                        g1, g_gfa.P, g_gfa.len, g2, g_ggdn.P);
+            }
             fprintf(stderr, "[HSUM] chain(%zu)=%016llx ps=%016llx\n",
                     g_chain.size(),
                     fnv(g_chain.data(), g_chain.size() * sizeof(ChainLayer)),
@@ -3946,8 +3964,13 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
     cudaMemcpyAsync(p_rows, rows, (size_t)P*4, cudaMemcpyHostToDevice, st);
     k_embed_b<<<((size_t)dim*P+255)/256,256,0,st>>>(g_ch_embed, p_rows, pHb, dim, P);
     aspida_gpu_vision_inject_chunk(pHb, pos_start, P, dim, st);
+    int phb_on = (P < 64) && (access("/tmp/aspida_phb", F_OK) == 0);
     for (int li=0; li<NL; ++li) {
         ChainLayer &L=g_chain[li];
+        if (phb_on) { cudaStreamSynchronize(st); int n=dim*P;
+            float *hb=(float*)malloc((size_t)n*4); cudaMemcpy(hb,pHb,(size_t)n*4,cudaMemcpyDeviceToHost);
+            double ss=0; for(int q=0;q<n;q++) ss+=(double)hb[q]*hb[q];
+            fprintf(stderr,"[PHB] li=%d fattn=%d P=%d rms=%.6f\n", li, L.is_fattn, P, sqrt(ss/n)); free(hb); }
         if (pprof) cudaEventRecord(pe0, st);
         k_norm1_b<<<P,256,0,st>>>(pHb, L.attn_norm, pnxb, dim, P);
         if (!L.is_fattn) {
