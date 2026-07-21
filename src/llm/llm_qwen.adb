@@ -1346,6 +1346,13 @@ package body LLM_Qwen is
             Hit_Idx     : Natural := 0;
             Snap_Key    : Interfaces.Unsigned_64 := 0;
             Need_Snap   : Boolean := False;
+            --  A2 (cert): a client stream abort raises Socket_Error from
+            --  Sink.Tick INSIDE the prefill loop, between a pin (Lookup hit /
+            --  Reserve) and its Release. Without exception-safe release the
+            --  slot stays Pins>0/Valid=false forever -> prefix cache dies +
+            --  ~290MB VRAM stranded per abort. Track pins, release on unwind.
+            Hit_Pinned  : Boolean := False;
+            Res_Pinned  : Boolean := False;
          begin
             Last_Logits := New_Tensor ([1, M.Vocab_Sz]);
 
@@ -1370,6 +1377,7 @@ package body LLM_Qwen is
                     (Prefix_Hash (Prompt_Ids, Snap_Len), Snap_Len, Hit, Hit_Idx, RSlots);
                   if Hit then Restore_Len := Snap_Len; end if;
                end if;
+               Hit_Pinned := Hit;   -- Lookup pins only on hit
 
                --  Snapshot the full-history boundary unless it is already cached
                --  (a full hit at Snap_Len). Reserve a distinct slot set to write.
@@ -1377,7 +1385,7 @@ package body LLM_Qwen is
                if Need_Snap then
                   Snap_Key := Prefix_Hash (Prompt_Ids, Snap_Len);
                   Prefix_Reg.Reserve (Snap_Key, Snap_Len, Res_Idx, SSlots);
-                  if Res_Idx = 0 then Need_Snap := False; end if;
+                  if Res_Idx = 0 then Need_Snap := False; else Res_Pinned := True; end if;
                end if;
             end if;
 
@@ -1401,6 +1409,7 @@ package body LLM_Qwen is
                Chain_Pos := Restore_Len;
                Done := Restore_Len;
                Prefix_Reg.Release (Hit_Idx);  -- restores done; unpin source
+               Hit_Pinned := False;
                if Prefix_Log_On then
                   Ada.Text_IO.Put_Line
                     (Ada.Text_IO.Standard_Error,
@@ -1463,6 +1472,7 @@ package body LLM_Qwen is
                         Prefix_Reg.Commit (Res_Idx, Snap_Key, Snap_Len, Actual);
                      end if;
                      Prefix_Reg.Release (Res_Idx);  -- snapshot done; unpin
+                     Res_Pinned := False;
                      Need_Snap := False;
                      if Prefix_Log_On then
                         Ada.Text_IO.Put_Line
@@ -1474,6 +1484,12 @@ package body LLM_Qwen is
                   end;
                end if;
             end loop;
+         exception
+            when others =>
+               --  Exception-safe pin release (A2): never leak a prefix pin.
+               if Res_Pinned then Prefix_Reg.Release (Res_Idx); Res_Pinned := False; end if;
+               if Hit_Pinned then Prefix_Reg.Release (Hit_Idx); Hit_Pinned := False; end if;
+               raise;
          end;
       else
          for I in Prompt_Ids'Range loop

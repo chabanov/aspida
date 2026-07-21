@@ -28,7 +28,13 @@ package body LLM_Batcher is
 
    CRows, CPos : C_Int_Ptr;   -- [Max_Lanes]
    CHandles    : C_Int_Ptr;   -- [Max_Lanes * NL]
-   Batch_Log   : F_Ptr;       -- [Max_Lanes * Vocab]
+   Batch_Log   : F_Ptr;       -- [Max_Lanes * Vocab] (compacted batch order)
+   --  A1 (cert): per-LANE logit store. Batch_Log is indexed by compacted batch
+   --  position and is overwritten by the NEXT forward; a handler not yet queued
+   --  on Wait_Done when Mark_Done runs would read another request's slice. Copy
+   --  each covered lane's slice into its own stable slot inside Mark_Done (a
+   --  protected action that runs after the forward, before the next Take).
+   Lane_Logits : F_Ptr;       -- [Max_Lanes * Vocab] (keyed by lane id)
 
    Max_NL : constant := 64;
    type H_Copy_Arr is array (0 .. Max_NL - 1) of Interfaces.C.int;
@@ -46,10 +52,6 @@ package body LLM_Batcher is
       --  access crashes and cross-lane state corruption). Values can't dangle.
       HV       : H_Copy_Arr := [others => 0];
       NL       : Integer := 0;
-      --  Batch slot of the last forward covering this lane (-1 = none):
-      --  Wait_Done copies the logits slice itself, inside the protected
-      --  action, where the caller's buffer is guaranteed alive.
-      BIdx     : Integer := -1;
       --  Generation epoch. Bumped on every Claim (and on Abandon). A batch's
       --  Take snapshots each lane's Seq; Mark_Done / the scatter only touch a
       --  lane whose Seq still matches — so a step whose handler already timed
@@ -134,7 +136,6 @@ package body LLM_Batcher is
          for K in 0 .. S (Id).NL - 1 loop
             S (Id).HV (K) := Src (K);
          end loop;
-         S (Id).BIdx := -1;
          S (Id).Ready := False; S (Id).Pending := True;
          Pending_Count := Pending_Count + 1;
       end Post;
@@ -151,15 +152,14 @@ package body LLM_Batcher is
          --  unwound — its buffer is alive. (The Driver previously scattered
          --  into caller buffers from its own task: a use-after-free when a
          --  handler aborted between the Live check and the write.)
-         if not Failed and then S (L).BIdx >= 0 then
+         if not Failed then
             declare
-               Dst : F_Arr (0 .. Cfg_Vocab - 1) with Import, Address => Log;
-               Base : constant Natural := S (L).BIdx * Cfg_Vocab;
+               Dst  : F_Arr (0 .. Cfg_Vocab - 1) with Import, Address => Log;
+               Base : constant Natural := Natural (L) * Cfg_Vocab;
             begin
-               Dst := Batch_Log (Base .. Base + Cfg_Vocab - 1);
+               Dst := Lane_Logits (Base .. Base + Cfg_Vocab - 1);
             end;
          end if;
-         S (L).BIdx := -1;
       end Wait_Done;
 
       --  The Driver waits here for the first pending lane, then (after a short
@@ -204,7 +204,14 @@ package body LLM_Batcher is
             --  Skip a lane whose handler timed out and freed/reused it (epoch
             --  changed) — waking it would hand the wrong generation these logits.
             if S (Lane_Id (Lanes (I))).Seq = Seqs (I) then
-               S (Lane_Id (Lanes (I))).BIdx  := I;
+               declare
+                  L    : constant Natural := Lanes (I);
+                  BSrc : constant Natural := I * Cfg_Vocab;
+                  LDst : constant Natural := L * Cfg_Vocab;
+               begin
+                  Lane_Logits (LDst .. LDst + Cfg_Vocab - 1) :=
+                    Batch_Log (BSrc .. BSrc + Cfg_Vocab - 1);
+               end;
                S (Lane_Id (Lanes (I))).Ready := True;
             end if;
          end loop;
@@ -362,6 +369,7 @@ package body LLM_Batcher is
       CPos     := new C_Int_Arr (0 .. Max_Lanes - 1);
       CHandles := new C_Int_Arr (0 .. Max_Lanes * N_Layers - 1);
       Batch_Log := new F_Arr (0 .. Max_Lanes * Vocab - 1);
+      Lane_Logits := new F_Arr (0 .. Max_Lanes * Vocab - 1);
       --  Publish the buffers BEFORE activating the Driver: it dereferences
       --  them as soon as it has a batch, and it no longer waits on Configured.
       Configured := True;
