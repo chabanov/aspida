@@ -1486,7 +1486,8 @@ __global__ void k_fattn_attend_b(
     const float *__restrict__ q_all_b, const float *__restrict__ g_all_b,
     const __half *const *__restrict__ K_arr, const __half *const *__restrict__ V_arr,
     float *const *__restrict__ Sc_arr, float *__restrict__ attn_b,
-    int nq, int nkv, int hd, int kvd, const int *__restrict__ posp, int max_len, int att) {
+    int nq, int nkv, int hd, int kvd, const int *__restrict__ posp,
+    const int *__restrict__ max_len_p, int att) {
     int b = blockIdx.y;
     const __half *Kc = K_arr[b];
     const __half *Vc = V_arr[b];
@@ -1494,7 +1495,14 @@ __global__ void k_fattn_attend_b(
     const float *q_all = q_all_b + (size_t) b * att;
     const float *g_all = g_all_b + (size_t) b * att;
     float *attn = attn_b + (size_t) b * att;
+    //  scores stride is PER-LANE: fs.scores is allocated nq*fs.max_len, and
+    //  max_len = Cap = prompt_len + max_new differs per request. Using one
+    //  batch-wide max_len makes a short-context lane index its (smaller)
+    //  scores buffer with a longer lane's stride -> OOB -> hidden explodes at
+    //  the first full-attn layer -> logits collapse to token 0 ("!").
+    int max_len = max_len_p[b];
     int len = posp[b] + 1;
+    if (len > max_len) len = max_len;   // never read/write past this lane's cache
     int h = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
     int rep = nq / nkv, kvh = h / rep;
     int q_off = h * hd, kv_off = kvh * hd;
@@ -2659,7 +2667,7 @@ static float *Hb=nullptr,*nxb=nullptr,*aob=nullptr,*dlogb=nullptr,*dqkvb=nullptr
              *dbb=nullptr,*dorb=nullptr,*dqgb=nullptr,*dktb=nullptr,*dvtb=nullptr,
              *dqab=nullptr,*dgab=nullptr,*dattb=nullptr,*drlb=nullptr,*dhbb=nullptr;
 static MoeRoute *drouteb=nullptr;
-static int *gb_rows=nullptr,*gb_pos=nullptr;
+static int *gb_rows=nullptr,*gb_pos=nullptr,*gb_maxlen=nullptr;
 static void **gb_Sptr=nullptr;    // device table of B per-lane delta-net S pointers
 static void **gb_histptr=nullptr; // device table of B per-lane conv hist pointers
 static void **gb_fK=nullptr;      // [NL*B] per-lane full-attn K-cache pointers
@@ -2684,7 +2692,7 @@ static void chain_alloc_b(void) {
     if (g_mx_nexp) cudaMalloc(&drlb, Bd*g_mx_nexp*4);
     if (g_mx_hbuf) cudaMalloc(&dhbb, Bd*g_mx_hbuf*4);
     cudaMalloc(&drouteb, Bd*sizeof(MoeRoute));
-    cudaMalloc(&gb_rows, Bd*4); cudaMalloc(&gb_pos, Bd*4);
+    cudaMalloc(&gb_rows, Bd*4); cudaMalloc(&gb_pos, Bd*4); cudaMalloc(&gb_maxlen, Bd*4);
     cudaMalloc(&gb_Sptr, (size_t) g_chain.size() * Bd * sizeof(void*));
     cudaMalloc(&gb_histptr, (size_t) g_chain.size() * Bd * sizeof(void*));
     cudaMalloc(&gb_fK, (size_t) g_chain.size() * Bd * sizeof(void*));
@@ -2778,16 +2786,17 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
             launch_mv_b(L.qw, L.qw_k, dim, qgd, nxb, dqgb, B, st);
             launch_mv_b(L.kw, L.kw_k, dim, kvd, nxb, dktb, B, st);
             launch_mv_b(L.vw, L.vw_k, dim, kvd, nxb, dvtb, B, st);
-            int fmaxlen = 0;
+            static int hmaxlen[BMAX];
             for (int b=0;b<B;++b) {
                 FattnState fs=g_fattn[handles[b*NL+li]];
-                fmaxlen = fs.max_len;   // uniform across lanes (model config)
+                hmaxlen[b] = fs.max_len;   // PER-LANE: Cap = prompt+max_new, differs
                 k_fattn_prep<<<L.nq+L.nkv,L.hd,(size_t)L.hd*4,st>>>(
                     dqgb+(size_t)b*qgd, dktb+(size_t)b*kvd, dvtb+(size_t)b*kvd, L.qn, L.kn,
                     dqab+(size_t)b*att, dgab+(size_t)b*att, fs.K, fs.V,
                     L.nq,L.nkv,L.hd,kvd, gb_pos+b, L.rd,L.base,L.freq_scale,L.m_scale,
                     L.yarn_on,L.corr_lo,L.corr_hi, L.ffp,L.use_ff,L.interleaved,L.sec_total);
             }
+            cudaMemcpyAsync(gb_maxlen, hmaxlen, (size_t)B*4, cudaMemcpyHostToDevice, st);
             //  One batched attention launch over grid(nq, B) — byte-identical to
             //  the B serial k_fattn_attend calls, but nq*B blocks fill the GPU.
             k_fattn_attend_b<<<dim3(L.nq, B), 256, 0, st>>>(
@@ -2795,10 +2804,26 @@ extern "C" void aspida_gpu_chain_forward_batch(int B, const int *rows, const int
                 (const __half *const *)(gb_fK  + (size_t) li * B),
                 (const __half *const *)(gb_fV  + (size_t) li * B),
                 (float *const *)      (gb_fSc + (size_t) li * B),
-                dattb, L.nq, L.nkv, L.hd, kvd, gb_pos, fmaxlen, att);
+                dattb, L.nq, L.nkv, L.hd, kvd, gb_pos, gb_maxlen, att);
             launch_mv_b(L.fow, L.fow_k, att, dim, dattb, aob, B, st);
         }
         k_axpy_b<<<((size_t)dim*B+255)/256,256,0,st>>>(Hb, aob, dim, B);
+        if (lprobe_pre) {
+            static int expl_layer[BMAX];
+            if (li == 0) for (int b=0;b<B;++b) expl_layer[b] = -1;
+            cudaStreamSynchronize(st);
+            float *hb=(float*)malloc((size_t)B*dim*4);
+            cudaMemcpy(hb, Hb, (size_t)B*dim*4, cudaMemcpyDeviceToHost);
+            for (int b=0;b<B;++b) {
+                double mx=0; for (int q=0;q<dim;++q){ float v=fabsf(hb[(size_t)b*dim+q]); if(v>mx)mx=v; }
+                if (mx > 1e5 && expl_layer[b] < 0) {
+                    expl_layer[b] = li;
+                    fprintf(stderr, "[EXPLODE] B=%d lane=%d row=%d pos=%d FIRST-BIG at li=%d fattn=%d max=%.3g\n",
+                            B, b, rows[b], pos[b], li, L.is_fattn, mx);
+                }
+            }
+            free(hb);
+        }
         DSEG(l_attn);
         if (L.has_moe) {
             k_norm1_b<<<B,256,0,st>>>(Hb, L.post_norm, nxb, dim, B);
