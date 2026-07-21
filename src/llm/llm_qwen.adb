@@ -909,7 +909,9 @@ package body LLM_Qwen is
    --  server's Infer_Lock, but the protected object keeps it safe regardless.
    protected Prefix_Reg is
       procedure Lookup (Key : Interfaces.Unsigned_64; N : Natural;
-                        Found : out Boolean; Slots : out Slot_Storage);
+                        Found : out Boolean; Idx : out Natural;
+                        Slots : out Slot_Storage);
+      procedure Release (Idx : Natural);
       procedure Reserve (Key : Interfaces.Unsigned_64; N : Natural;
                          Idx : out Natural; Target : out Slot_Storage);
       procedure Commit (Idx : Natural; Key : Interfaces.Unsigned_64;
@@ -920,35 +922,55 @@ package body LLM_Qwen is
       Valid  : Bool_Array := [others => False];
       Snaps  : Snap_Array := [others => Empty_Slots];
       Round  : Natural := 0;  -- round-robin eviction cursor
+      Pins   : Len_Array := [others => 0];  -- in-flight restore/snapshot refs
    end Prefix_Reg;
 
    protected body Prefix_Reg is
       procedure Lookup (Key : Interfaces.Unsigned_64; N : Natural;
-                        Found : out Boolean; Slots : out Slot_Storage) is
+                        Found : out Boolean; Idx : out Natural;
+                        Slots : out Slot_Storage) is
       begin
-         Found := False; Slots := Empty_Slots;
+         Found := False; Idx := 0; Slots := Empty_Slots;
          for I in Keys'Range loop
             if Valid (I) and then Keys (I) = Key and then Lens (I) = N then
-               Found := True; Slots := Snaps (I); return;
+               Found := True; Idx := I; Slots := Snaps (I);
+               Pins (I) := Pins (I) + 1;  -- pin until the caller Releases
+               return;
             end if;
          end loop;
       end Lookup;
 
+      procedure Release (Idx : Natural) is
+      begin
+         if Idx in Keys'Range and then Pins (Idx) > 0 then
+            Pins (Idx) := Pins (Idx) - 1;
+         end if;
+      end Release;
+
       procedure Reserve (Key : Interfaces.Unsigned_64; N : Natural;
                          Idx : out Natural; Target : out Slot_Storage) is
       begin
-         --  Reuse an existing entry for this exact key if present.
+         --  Reuse this exact key's entry if present AND not in flight.
          for I in Keys'Range loop
-            if Keys (I) = Key and then Lens (I) = N then
-               Idx := I; Target := Snaps (I); return;
+            if Keys (I) = Key and then Lens (I) = N and then Pins (I) = 0 then
+               Idx := I; Target := Snaps (I); Valid (I) := False;
+               Pins (I) := Pins (I) + 1;   -- pin until Commit/Release
+               return;
             end if;
          end loop;
-         Round := (Round mod Max_Prefix_Entries) + 1;
-         Idx := Round;
-         --  Recycle the evicted entry's CUDA slots (snapshot overwrites them);
-         --  fresh slots (-1) are allocated by the CUDA side on first use.
-         Target := Snaps (Idx);
-         Valid (Idx) := False;   -- invalid until Commit
+         --  Round-robin to an UNPINNED slot: never recycle CUDA slots a
+         --  concurrent lane is mid-restore from (that was a use-after-free
+         --  -> illegal memory access under the batcher).
+         for K in 1 .. Max_Prefix_Entries loop
+            Round := (Round mod Max_Prefix_Entries) + 1;
+            if Pins (Round) = 0 then
+               Idx := Round; Target := Snaps (Idx); Valid (Idx) := False;
+               Pins (Idx) := Pins (Idx) + 1;
+               return;
+            end if;
+         end loop;
+         --  Every slot in flight (rare): skip snapshotting this turn.
+         Idx := 0; Target := Empty_Slots;
       end Reserve;
 
       procedure Commit (Idx : Natural; Key : Interfaces.Unsigned_64;
@@ -1312,6 +1334,7 @@ package body LLM_Qwen is
             RSlots      : Slot_Storage := Empty_Slots;   -- restore FROM
             SSlots      : Slot_Storage := Empty_Slots;   -- snapshot INTO
             Res_Idx     : Natural := 0;
+            Hit_Idx     : Natural := 0;
             Snap_Key    : Interfaces.Unsigned_64 := 0;
             Need_Snap   : Boolean := False;
          begin
@@ -1328,14 +1351,14 @@ package body LLM_Qwen is
                      begin
                         if B > 0 and then B < Total then
                            Prefix_Reg.Lookup
-                             (Prefix_Hash (Prompt_Ids, B), B, Hit, RSlots);
+                             (Prefix_Hash (Prompt_Ids, B), B, Hit, Hit_Idx, RSlots);
                            if Hit then Restore_Len := B; exit; end if;
                         end if;
                      end;
                   end loop;
                else
                   Prefix_Reg.Lookup
-                    (Prefix_Hash (Prompt_Ids, Snap_Len), Snap_Len, Hit, RSlots);
+                    (Prefix_Hash (Prompt_Ids, Snap_Len), Snap_Len, Hit, Hit_Idx, RSlots);
                   if Hit then Restore_Len := Snap_Len; end if;
                end if;
 
@@ -1345,6 +1368,7 @@ package body LLM_Qwen is
                if Need_Snap then
                   Snap_Key := Prefix_Hash (Prompt_Ids, Snap_Len);
                   Prefix_Reg.Reserve (Snap_Key, Snap_Len, Res_Idx, SSlots);
+                  if Res_Idx = 0 then Need_Snap := False; end if;
                end if;
             end if;
 
@@ -1367,6 +1391,7 @@ package body LLM_Qwen is
                end loop;
                Chain_Pos := Restore_Len;
                Done := Restore_Len;
+               Prefix_Reg.Release (Hit_Idx);  -- restores done; unpin source
                if Prefix_Log_On then
                   Ada.Text_IO.Put_Line
                     (Ada.Text_IO.Standard_Error,
@@ -1428,6 +1453,7 @@ package body LLM_Qwen is
                      if All_Ok then
                         Prefix_Reg.Commit (Res_Idx, Snap_Key, Snap_Len, Actual);
                      end if;
+                     Prefix_Reg.Release (Res_Idx);  -- snapshot done; unpin
                      Need_Snap := False;
                      if Prefix_Log_On then
                         Ada.Text_IO.Put_Line
