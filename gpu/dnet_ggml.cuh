@@ -96,6 +96,7 @@ static bool aspida_ggml_dnet_prefill(
     k_gdn_copy<<<((size_t)P*nv+bs-1)/bs,bs>>>(beta, (float*)S.b->data, (size_t)P*nv);
     k_gdn_st_in<<<((size_t)vhd*vhd*nv+bs-1)/bs,bs>>>(stateS, (float*)S.s->data, vhd, nv);
     ggml_backend_graph_compute(g_gfa.be, S.gr);
+    cudaDeviceSynchronize();   // ggml output ready before the st-stream copies (race fix)
     // out = [vhd, nv, P] (== aspida osh [t][h*vhd+v]); new state = [vhd,vhd,nv] after
     const float *go = (const float *) S.out->data;
     size_t attn_elems = (size_t) vhd * nv * P;
