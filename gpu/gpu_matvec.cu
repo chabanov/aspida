@@ -2451,6 +2451,32 @@ __global__ void k_q8_reg(const uint8_t *__restrict__ w, const float *__restrict_
     }
 }
 
+//  Tiled fp32 GEMM: y[B,out] = x[B,in] * W[out,in]^T. 16x16 output tile per
+//  block; shared-mem staging of W and x. Ascending-k dot order == k_dense_mv
+//  (bit-exact). High occupancy (out/16 * B/16 blocks) vs the B/32 sub-batched
+//  warp kernel it replaces for large-B (prefill) fp32 projections.
+__global__ void k_dense_gemm_b(const float *__restrict__ W, const float *__restrict__ X,
+                               float *__restrict__ Y, int in, int out, int B) {
+    __shared__ float Ws[16][16];
+    __shared__ float Xs[16][16];
+    int row = blockIdx.y * 16 + threadIdx.y;   // output (weight) row
+    int tok = blockIdx.x * 16 + threadIdx.x;   // token (batch) column
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < in; k0 += 16) {
+        int kw = k0 + threadIdx.x;   // W col for this thread's load
+        int kx = k0 + threadIdx.y;   // X col for this thread's load
+        Ws[threadIdx.y][threadIdx.x] =
+            (row < out && kw < in) ? W[(size_t) row * in + kw] : 0.0f;
+        Xs[threadIdx.y][threadIdx.x] =
+            (tok < B && kx < in) ? X[(size_t) tok * in + kx] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) acc += Ws[threadIdx.y][k] * Xs[k][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < out && tok < B) Y[(size_t) tok * out + row] = acc;
+}
+
 static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
                                const float *dx, float *dy, int B, cudaStream_t st) {
     const int TPB = 256, WPB = TPB / 32; int blocks = (out + WPB - 1) / WPB;
@@ -2512,6 +2538,22 @@ static inline void launch_mv_b(const uint8_t *dw, int kind, int in, int out,
                 default: k_q8_0_wb<<<blocks, TPB, 0, st>>>(dw, dx, dy, in, out, B); break;
             }
         }
+        return;
+    }
+    //  fp32 dense (kind == -1) at large B (prefill, e.g. the F32 MoE router
+    //  [2048x256] in every layer): the acc[MAXB] warp kernel below re-reads the
+    //  whole weight once per MAXB-token sub-batch (B/32 launches), which made
+    //  this ONE projection ~47% of prefill GPU time. cuBLAS SGEMM reads the
+    //  weight once for all B — same as llama.cpp. y[B,out]=x[B,in]*W[out,in]^T
+    //  -> col-major: C[out,B] = op_T(W as [in,out]) * X[in,B].
+    if (kind < 0 && B >= 64) {
+        //  fp32 dense at large B (the F32 MoE router [2048x256] in every layer):
+        //  a tiled shared-memory GEMM instead of B/32 re-reads of the weight by
+        //  the acc[MAXB] warp kernel. Ascending-k accumulation == bit-identical
+        //  to k_dense_mv. C[out,B]: block computes a 16x16 tile.
+        dim3 blk(16, 16);
+        dim3 grd((B + 15) / 16, (out + 15) / 16);
+        k_dense_gemm_b<<<grd, blk, 0, st>>>((const float *) dw, dx, dy, in, out, B);
         return;
     }
     //  Other quant kinds keep the warp-per-row kernels, whose acc[MAXB] caps the
