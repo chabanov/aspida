@@ -1,0 +1,13 @@
+[Unit]
+Description=Prime aspida CUDA-graph + vision weights before real traffic
+After=aspida-proxy.service aspida-hura.service
+Requires=aspida-hura.service
+PartOf=aspida-hura.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'for i in $(seq 1 90); do curl -sf -m 30 http://127.0.0.1:8099/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"hura:latest\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":4}" -o /dev/null && break; sleep 2; done; curl -sf -m 60 http://127.0.0.1:8099/v1/chat/completions -H "Content-Type: application/json" -d @/root/warmup_img.json -o /dev/null && echo "aspida warmup (text+vision) OK" || echo "vision warmup skipped"; exit 0'
+
+[Install]
+WantedBy=multi-user.target
