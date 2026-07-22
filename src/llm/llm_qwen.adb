@@ -23,6 +23,7 @@ with System;
 with Interfaces.C;
 with LLM_Step_Lock;
 with LLM_Batcher;
+with GPU_Lock;
 with LLM_RMSNorm;
 with LLM_FullAttn;
 with LLM_DeltaNet_Blk;
@@ -1107,6 +1108,9 @@ package body LLM_Qwen is
       --  of running a serialised single-request forward.
       Batch_Mode : Boolean := False;
       My_Lane    : Integer := -1;
+      --  Cross-process GPU lock: held (shared) for this whole generation so
+      --  the image daemon (exclusive) never runs CUDA concurrently with it.
+      GH         : GPU_Lock.Handle;
       Handles   : array (1 .. M.N_Blocks) of Interfaces.C.int :=
         [others => Interfaces.C.int (Integer'(-1))];
 
@@ -1137,6 +1141,8 @@ package body LLM_Qwen is
                raise;
          end;
          if LLM_Batcher.Enabled then LLM_Batcher.Alloc_Unlock; end if;
+         --  Release the cross-process GPU lock last: image gen may now run.
+         GPU_Lock.Release (GH);
       end Free_States;
 
       --  One forward step under the shared step lock, released between steps
@@ -1240,6 +1246,13 @@ package body LLM_Qwen is
          end if;
          return "";
       end if;
+
+      --  Take the shared GPU lock BEFORE the first device work (below) and hold
+      --  it for the whole generation (released in Free_States). Concurrent LLM
+      --  generations all hold it shared; the image daemon's exclusive lock
+      --  waits for them to drain — so LLM and image CUDA never overlap (that
+      --  overlap crashed the LLM with a cross-context illegal memory access).
+      GPU_Lock.Acquire_Shared (GH);
 
       --  Device-state allocation (Dnet_New/Fattn_New push to shared GPU vectors)
       --  is serialised in batch-serve mode, where several handler tasks set up

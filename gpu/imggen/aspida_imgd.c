@@ -25,6 +25,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/file.h>   // flock
+#include <fcntl.h>      // open
 
 // libaspida_imggen.so C API (the same wrapper the in-process build used).
 extern int aspida_img_init(const char* dit, const char* vae,
@@ -93,7 +95,14 @@ static void handle(int cfd) {
         read_exact(cfd, ref, (size_t)rlen) == 0 &&
         read_exact(cfd, out, (size_t)olen) == 0) {
         const char* refp = (rlen > 0) ? ref : "";
+        // Cross-process GPU lock: take it EXCLUSIVE so no LLM generation runs
+        // CUDA while we do. flock waits for all shared (LLM) holders to drain
+        // and blocks new ones until we release — LLM and image never overlap
+        // on the GPU (concurrent overlap crashed the LLM engine).
+        int glk = open("/tmp/aspida_gpu.lock", O_CREAT | O_RDWR, 0644);
+        if (glk >= 0) { if (flock(glk, LOCK_EX) != 0) { /* proceed */ } }
         rc = aspida_img_generate(prompt, refp, W, H, steps, 2.5f, seed, out);
+        if (glk >= 0) { flock(glk, LOCK_UN); close(glk); }
     }
 
     char reply[64];
