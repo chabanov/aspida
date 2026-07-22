@@ -44,6 +44,8 @@ with LLM_Catalog;
 with LLM_Sampler;
 with OpenAI;
 with JSON;
+with LLM_ImgGen;
+with Ada.Strings.Fixed;
 
 procedure Secure_Server is
 
@@ -678,6 +680,49 @@ procedure Secure_Server is
                         Send_Tagged (Protocol.Tag_Resp, OpenAI.Select_Result
                           (True, False, "selected; restart the server to apply"));
                      end if;
+                  end if;
+               end;
+
+            elsif Tag = Protocol.Tag_Image then
+               --  Native image gen/edit. Body: {"prompt","size"?,"image"?}.
+               declare
+                  Req     : constant JSON.Value_Ref := JSON.Parse (Prompt);
+                  IPrompt : constant String := JSON.As_String (JSON.Get (Req, "prompt"));
+                  Size    : constant String := JSON.As_String (JSON.Get (Req, "size"), "1024x1024");
+                  Img_V   : constant JSON.Value_Ref := JSON.Get (Req, "image");
+                  X       : constant Natural := Ada.Strings.Fixed.Index (Size, "x");
+                  W, H    : Integer := 1024;
+                  Ref     : Unbounded_String := Null_Unbounded_String;
+                  Outp    : constant String := "/tmp/aspida_img_out.png";
+               begin
+                  if X > 0 then
+                     begin
+                        W := Integer'Value (Size (Size'First .. X - 1));
+                        H := Integer'Value (Size (X + 1 .. Size'Last));
+                     exception when others => W := 1024; H := 1024; end;
+                  end if;
+                  if JSON.Exists (Img_V) then
+                     Ref := To_Unbounded_String
+                       (LLM_ImgGen.Decode_B64_To_Temp (JSON.As_String (Img_V)));
+                  end if;
+                  if IPrompt = "" then
+                     Send_Tagged (Protocol.Tag_Resp,
+                       OpenAI.Error_Response ("prompt is required"));
+                  elsif not LLM_ImgGen.Available then
+                     Send_Tagged (Protocol.Tag_Resp,
+                       OpenAI.Error_Response ("image model not installed"));
+                  elsif LLM_ImgGen.Generate
+                          (Prompt   => IPrompt,
+                           Ref_Path => To_String (Ref),
+                           Width    => W, Height => H,
+                           Out_Path => Outp)
+                  then
+                     Send_Tagged (Protocol.Tag_Resp,
+                       "{""created"":0,""data"":[{""b64_json"":"""
+                       & LLM_ImgGen.Encode_File_B64 (Outp) & """}]}");
+                  else
+                     Send_Tagged (Protocol.Tag_Resp,
+                       OpenAI.Error_Response ("image generation failed"));
                   end if;
                end;
 

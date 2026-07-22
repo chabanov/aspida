@@ -155,7 +155,7 @@ procedure OpenAI_Proxy is
                            M_Len, P_Len, B_Len : out Natural; Err : out Natural) is
       Buf  : Stream_Element_Array (1 .. 65536);
       Last : Stream_Element_Offset;
-      Data : String (1 .. 12_582_912);
+      Data : String (1 .. 1_048_576);
       Len  : Natural := 0;
       Hdr_End  : Natural := 0;
       CLen     : Natural := 0;
@@ -356,7 +356,7 @@ procedure OpenAI_Proxy is
       Ch     : Secure_Channel.Channel;
       Method : String (1 .. 16);
       Path   : String (1 .. 1024);
-      RBody  : String (1 .. 12_582_912);
+      RBody  : String (1 .. 1_048_576);
       ML, PL, BL, Err : Natural;
    begin
       Read_Request (Client, Method, Path, RBody, ML, PL, BL, Err);
@@ -575,6 +575,14 @@ procedure OpenAI_Proxy is
                   Write_JSON (Client, "200 OK", Body_Of (Rec));
                end;
 
+            elsif Ada.Strings.Fixed.Index (Pth, "/images") > 0 then
+               Secure_Channel.Send_Message (Ch, CT'Access, Frame (Protocol.Tag_Image, Bdy));
+               declare
+                  Rec : constant Crypto.Byte_Array := Secure_Channel.Recv_Message (Ch, CT'Access);
+               begin
+                  Write_JSON (Client, "200 OK", Body_Of (Rec));
+               end;
+
             else
                Write_JSON (Client, "404 Not Found",
                  OpenAI.Error_Response ("unknown route: " & Pth));
@@ -604,7 +612,7 @@ procedure OpenAI_Proxy is
    --  Worker pool. Each worker serves one client at a time on its own channel,
    --  so a slow generation or a stuck client on one worker never blocks the
    --  others. Big stack: Serve holds two 1 MB request buffers.
-   task type Worker with Storage_Size => 48 * 1024 * 1024;
+   task type Worker with Storage_Size => 16 * 1024 * 1024;
    task body Worker is
       Client : Socket_Type;
    begin

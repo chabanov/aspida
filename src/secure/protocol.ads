@@ -38,6 +38,7 @@ package Protocol is
    --  choice, and replies Tag_Resp with a JSON {ok, reload, message}. When a
    --  supervisor is present (ASPIDA_AUTORELOAD) the server then reloads.
    Tag_Select  : constant Crypto.U8 := Character'Pos ('M');  -- C->S: select active model
+   Tag_Image   : constant Crypto.U8 := Character'Pos ('i');  -- C->S: /v1/images JSON body
    --  Streaming chat reuses Tag_Token (each piece = a chat.completion.chunk
    --  delta) terminated by Tag_Done.
 

@@ -47,7 +47,10 @@ abstract project Shared is
            ("-L" & external ("SDKROOT", "") & "/usr/lib",
             "-Wl,-syslibroot," & external ("SDKROOT", ""));
       when "linux" =>
-         Linker_Switches := ();
+         Linker_Switches :=
+           ("-L/opt/imggen-native", "-laspida_imggen",
+            "-Wl,-rpath,/opt/imggen-native",
+            "-L/usr/local/cuda/lib64", "-Wl,-rpath,/usr/local/cuda/lib64");
    end case;
 
 end Shared;
