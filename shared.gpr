@@ -47,10 +47,11 @@ abstract project Shared is
            ("-L" & external ("SDKROOT", "") & "/usr/lib",
             "-Wl,-syslibroot," & external ("SDKROOT", ""));
       when "linux" =>
-         Linker_Switches :=
-           ("-L/opt/imggen-native", "-laspida_imggen",
-            "-Wl,-rpath,/opt/imggen-native",
-            "-L/usr/local/cuda/lib64", "-Wl,-rpath,/usr/local/cuda/lib64");
+         --  No extra link flags: the LLM GPU library is dlopen'd at runtime
+         --  (ASPIDA_GPU_LIB) and stable-diffusion.cpp now lives ONLY in the
+         --  out-of-process aspida-imgd (built separately), so the engine
+         --  binaries link neither CUDA nor libaspida_imggen.
+         Linker_Switches := ();
    end case;
 
 end Shared;

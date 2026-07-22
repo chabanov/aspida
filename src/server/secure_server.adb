@@ -45,6 +45,7 @@ with LLM_Sampler;
 with OpenAI;
 with JSON;
 with LLM_ImgGen;
+with Img_Daemon;
 with Ada.Strings.Fixed;
 
 procedure Secure_Server is
@@ -716,7 +717,7 @@ procedure Secure_Server is
                   elsif not LLM_ImgGen.Available then
                      Send_Tagged (Protocol.Tag_Resp,
                        OpenAI.Error_Response ("image model not installed"));
-                  elsif LLM_ImgGen.Generate
+                  elsif Img_Daemon.Generate       --  isolated process, own CUDA ctx
                           (Prompt   => IPrompt,
                            Ref_Path => To_String (Ref),
                            Width    => W, Height => H,

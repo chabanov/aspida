@@ -1,0 +1,23 @@
+[Unit]
+# Isolated image-generation daemon: Qwen-Image-Edit-2511 via
+# stable-diffusion.cpp, in its OWN process (own CUDA context). secure_server
+# forwards /v1/images requests here over 127.0.0.1:ASPIDA_IMGD_PORT, so
+# sd.cpp's ggml-CUDA backend can never interpose on the LLM engine's ggml
+# backend — the in-process dual-backend crash/wedge is structurally impossible.
+Description=Aspida image daemon (Qwen-Image-Edit-2511, isolated CUDA context)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/imggen-native
+Environment=LD_LIBRARY_PATH=/opt/imggen-native:/usr/local/cuda/lib64
+Environment=ASPIDA_IMGD_PORT=8790
+# Model paths default to /opt/sdmodels/... inside the daemon; override with
+# ASPIDA_IMG_DIT / ASPIDA_IMG_VAE / ASPIDA_IMG_LLM / ASPIDA_IMG_MMPROJ here.
+ExecStart=/opt/imggen-native/aspida_imgd
+# A crash here NEVER touches the LLM engine; just bring the daemon back.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,24 +1,15 @@
-with Interfaces.C; use Interfaces.C;
-with Interfaces.C.Strings; use Interfaces.C.Strings;
 with Ada.Environment_Variables;
 with Ada.Directories;
 with Ada.Streams.Stream_IO; use Ada.Streams.Stream_IO;
-with Ada.Streams; use Ada.Streams;
-with Ada.Strings; use Ada.Strings;
-with Ada.Strings.Fixed; use Ada.Strings.Fixed;
+with Ada.Streams;           use Ada.Streams;
+with Ada.Strings;           use Ada.Strings;
+with Ada.Strings.Fixed;     use Ada.Strings.Fixed;
 
 package body LLM_ImgGen is
 
-   --  ---- C API of libaspida_imggen.so (linked at build time) --------------
-   function C_Init (Dit, Vae, Llm, Mmproj : chars_ptr) return int
-     with Import, Convention => C, External_Name => "aspida_img_init";
-   function C_Generate
-     (Prompt, Ref_Path : chars_ptr;
-      W, H, Steps : int; Cfg : C_float; Seed : Long_Long_Integer;
-      Out_Path : chars_ptr) return int
-     with Import, Convention => C, External_Name => "aspida_img_generate";
-
    --  ---- model paths (env overrides, /opt/sdmodels defaults) --------------
+   --  These MUST match aspida_imgd's defaults; the daemon owns the actual
+   --  load, we only check presence here to answer "not installed" cheaply.
    function Env (Name, Default : String) return String is
      (if Ada.Environment_Variables.Exists (Name)
       then Ada.Environment_Variables.Value (Name) else Default);
@@ -30,23 +21,6 @@ package body LLM_ImgGen is
           "/opt/sdmodels/vae/split_files/vae/qwen_image_vae.safetensors");
    Llm_Path : constant String :=
      Env ("ASPIDA_IMG_LLM", "/opt/sdmodels/llm/Qwen2.5-VL-7B-Instruct.Q8_0.gguf");
-   Mmproj_Path : constant String :=
-     Env ("ASPIDA_IMG_MMPROJ",
-          "/opt/sdmodels/llm/Qwen2.5-VL-7B-Instruct.mmproj-Q8_0.gguf");
-
-   --  ---- lazy, serialised init -------------------------------------------
-   protected Init_Lock is
-      entry Acquire;
-      procedure Release;
-   private
-      Busy : Boolean := False;
-   end Init_Lock;
-   protected body Init_Lock is
-      entry Acquire when not Busy is begin Busy := True; end Acquire;
-      procedure Release is begin Busy := False; end Release;
-   end Init_Lock;
-
-   Loaded : Boolean := False with Volatile;
 
    function Available return Boolean is
    begin
@@ -54,60 +28,6 @@ package body LLM_ImgGen is
         and then Ada.Directories.Exists (Vae_Path)
         and then Ada.Directories.Exists (Llm_Path);
    end Available;
-
-   --  Must be called with Init_Lock held.
-   function Ensure_Loaded_Locked return Boolean is
-   begin
-      if Loaded then return True; end if;
-      if not Available then return False; end if;
-      declare
-         D : chars_ptr := New_String (Dit_Path);
-         V : chars_ptr := New_String (Vae_Path);
-         L : chars_ptr := New_String (Llm_Path);
-         M : chars_ptr := New_String (Mmproj_Path);
-         Rc : constant int := C_Init (D, V, L, M);
-      begin
-         Free (D); Free (V); Free (L); Free (M);
-         Loaded := (Rc = 0);
-      end;
-      return Loaded;
-   end Ensure_Loaded_Locked;
-
-   function Generate
-     (Prompt   : String;
-      Ref_Path : String := "";
-      Width    : Integer := 1024;
-      Height   : Integer := 1024;
-      Steps    : Integer := 20;
-      Cfg      : Float   := 2.5;
-      Seed     : Long_Long_Integer := -1;
-      Out_Path : String)
-      return Boolean
-   is
-      Result : Boolean := False;
-   begin
-      Init_Lock.Acquire;
-      begin
-         if Ensure_Loaded_Locked then
-            declare
-               P  : chars_ptr := New_String (Prompt);
-               R  : chars_ptr := New_String (Ref_Path);   --  "" => t2i
-               O  : chars_ptr := New_String (Out_Path);
-               Rc : int;
-            begin
-               Rc := C_Generate
-                 (P, R, int (Width), int (Height), int (Steps),
-                  C_float (Cfg), Seed, O);
-               Free (P); Free (R); Free (O);
-               Result := (Rc = 0);
-            end;
-         end if;
-      exception
-         when others => Init_Lock.Release; raise;
-      end;
-      Init_Lock.Release;
-      return Result;
-   end Generate;
 
    --  ---- base64 ----------------------------------------------------------
    Alpha : constant String :=
