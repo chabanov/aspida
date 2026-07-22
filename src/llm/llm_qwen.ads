@@ -52,6 +52,15 @@ package LLM_Qwen is
    procedure Emit (Sink : in out Token_Sink; Piece : String) is abstract;
    procedure Tick (Sink : in out Token_Sink) is null;
 
+   --  A streaming sink whose client has gone away returns True here so the
+   --  generation loop can stop EARLY via a clean, normal exit (identical to
+   --  hitting a stop token) instead of the sink raising mid-decode. Tearing a
+   --  batched generation down through an exception left the shared GPU/KV lane
+   --  state corrupted, crashing the NEXT generation with a CUDA illegal access
+   --  (client-disconnect "abort-poisoning"). A clean early exit takes the
+   --  proven-safe teardown path. Default False (non-streaming sinks never stop).
+   function Stop_Requested (Sink : Token_Sink) return Boolean is (False);
+
    --  Structured chat sink: extends Token_Sink with the events Chat can emit
    --  when its output contains reasoning blocks (OpenAI `reasoning_content`)
    --  and/or tool-call XML blocks (`tool_c...tool_care_close` format).

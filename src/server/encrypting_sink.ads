@@ -27,7 +27,14 @@ package Encrypting_Sink is
       --  Last channel emitted: 0 = Text, 1 = Reasoning, 2 = Tool (we only use
       --  Text vs Reasoning to suppress redundant open markers).
       In_Reasoning : Boolean := False;
+      --  Set once a send fails (client hung up mid-stream). Further sends are
+      --  skipped and the generation loop stops cleanly via Stop_Requested
+      --  instead of the sink raising and corrupting the batch lane.
+      Client_Gone  : Boolean := False;
    end record;
+
+   --  True after the client disconnected: the engine loop exits cleanly.
+   overriding function Stop_Requested (S : Enc_Sink) return Boolean;
 
    overriding procedure Emit           (S : in out Enc_Sink; Piece : String);
    overriding procedure Tick           (S : in out Enc_Sink);

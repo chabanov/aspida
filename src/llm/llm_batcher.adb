@@ -309,9 +309,23 @@ package body LLM_Batcher is
                CRows (I) := Interfaces.C.int (Rows (I));
                CPos (I)  := Interfaces.C.int (Poss (I));
             end loop;
-            LLM_Qwen_GPU.Chain_Forward_Batch
-              (N, CRows.all'Address, CPos.all'Address, CHandles.all'Address,
-               Batch_Log.all'Address);
+            --  Hold Alloc across the forward: a handler tearing its generation
+            --  down (End_Gen / Fattn_Free, esp. clustered client-disconnect
+            --  aborts) mutates the SAME shared GPU vectors this forward reads.
+            --  Free_States already takes Alloc; without it here too, a free
+            --  racing an in-flight forward corrupted device memory -> CUDA
+            --  illegal access. Alloc is uncontended between generations, so a
+            --  per-step acquire is ~free; it only stalls a rare alloc/free by
+            --  one forward step. Release on the GPU-error path too.
+            Alloc.Acquire;
+            begin
+               LLM_Qwen_GPU.Chain_Forward_Batch
+                 (N, CRows.all'Address, CPos.all'Address, CHandles.all'Address,
+                  Batch_Log.all'Address);
+               Alloc.Release;
+            exception
+               when others => Alloc.Release; raise;
+            end;
             --  Delivery: Mark_Done records each live lane's batch slot; the
             --  logits are copied by Wait_Done itself, inside the protected
             --  action, where the caller's buffer is guaranteed alive.

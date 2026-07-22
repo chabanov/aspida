@@ -1616,6 +1616,11 @@ package body LLM_Qwen is
             Produced := Produced + 1;
             N_Hist := N_Hist + 1; Hist (N_Hist) := Tid;
             exit when Step = Max_New_Tokens;
+            --  Client disconnected mid-stream: stop HERE via a clean loop exit
+            --  (Free_States runs on the normal path) rather than letting the
+            --  sink raise and tear the batch lane down mid-decode, which
+            --  corrupted shared GPU state and crashed the next generation.
+            exit when Sink /= null and then Sink.Stop_Requested;
             Last_Logits := Decode (Best_Row);
          end;
       end loop;

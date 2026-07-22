@@ -47,14 +47,24 @@ package body Encrypting_Sink is
          ASCII.LF & "}");
    end Build_Tool_Call_JSON;
 
-   procedure Send_Body (S : Enc_Sink; Tag : U8; Payload : String) is
+   procedure Send_Body (S : in out Enc_Sink; Tag : U8; Payload : String) is
       Msg : Byte_Array (0 .. Payload'Length);
    begin
+      --  Once the client is gone, drop the token silently — the generation
+      --  finishes via Stop_Requested, not by this send raising mid-decode.
+      if S.Client_Gone then return; end if;
       Msg (0) := Tag;
       for I in Payload'Range loop
          Msg (I - Payload'First + 1) := U8 (Character'Pos (Payload (I)));
       end loop;
-      Secure_Channel.Send_Message (S.Ch.all, S.T, Msg);
+      begin
+         Secure_Channel.Send_Message (S.Ch.all, S.T, Msg);
+      exception
+         --  Peer hung up (or the send deadline elapsed): mark it and swallow.
+         --  Raising here would unwind through the batched decode and wedge the
+         --  lane's shared GPU state.
+         when others => S.Client_Gone := True;
+      end;
    end Send_Body;
 
    overriding procedure Emit (S : in out Enc_Sink; Piece : String) is
@@ -68,8 +78,16 @@ package body Encrypting_Sink is
    overriding procedure Tick (S : in out Enc_Sink) is
       Msg : constant Byte_Array (0 .. 0) := [0 => Protocol.Tag_Prefill];
    begin
-      Secure_Channel.Send_Message (S.Ch.all, S.T, Msg);
+      if S.Client_Gone then return; end if;
+      begin
+         Secure_Channel.Send_Message (S.Ch.all, S.T, Msg);
+      exception
+         when others => S.Client_Gone := True;
+      end;
    end Tick;
+
+   overriding function Stop_Requested (S : Enc_Sink) return Boolean is
+     (S.Client_Gone);
 
    overriding procedure On_Reasoning (S : in out Enc_Sink; Piece : String) is
    begin

@@ -611,7 +611,7 @@ procedure Secure_Server is
             Sink : aliased Encrypting_Sink.Enc_Sink :=
               (LLM_Qwen.Chat_Sink with
                  Ch => Ch'Unchecked_Access, T => ST'Unchecked_Access,
-                 In_Reasoning => False);
+                 In_Reasoning => False, Client_Gone => False);
             Prompt : String (1 .. Integer'Max (0, Req'Length - 1));
 
             --  Frame Tag + text into one AEAD record and send it.
