@@ -155,7 +155,12 @@ procedure OpenAI_Proxy is
                            M_Len, P_Len, B_Len : out Natural; Err : out Natural) is
       Buf  : Stream_Element_Array (1 .. 65536);
       Last : Stream_Element_Offset;
-      Data : String (1 .. 1_048_576);
+      --  Must match the caller's RBody size (12 MiB) — this internal read
+      --  buffer, not RBody, was the real ceiling: it was left at 1 MiB when
+      --  RBody was bumped to 12 MiB for image edits, so any img2img request
+      --  carrying a base64 source image (~2-4 MiB) 413'd here even though the
+      --  output buffer could hold it. Lives on the 48 MiB Worker stack.
+      Data : String (1 .. 12_582_912);
       Len  : Natural := 0;
       Hdr_End  : Natural := 0;
       CLen     : Natural := 0;
@@ -348,7 +353,7 @@ procedure OpenAI_Proxy is
 
    --  Serve one HTTP client on its OWN server channel, then close both. All the
    --  channel state (Sock/Ch/CT) is local to this call, so concurrent workers
-   --  never share it. The 1 MB request buffers live on the worker task stack
+   --  never share it. The 12 MiB request buffers live on the worker task stack
    --  (see Worker's Storage_Size).
    procedure Serve (Client : Socket_Type) is
       Sock   : Socket_Type;
