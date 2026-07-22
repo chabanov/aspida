@@ -356,7 +356,10 @@ procedure OpenAI_Proxy is
       Ch     : Secure_Channel.Channel;
       Method : String (1 .. 16);
       Path   : String (1 .. 1024);
-      RBody  : String (1 .. 1_048_576);
+      --  12 MiB: a /v1/images edit request carries the reference image inline
+      --  as a base64 data-uri (a 1024x1024 PNG is ~1-2 MiB encoded); the old
+      --  1 MiB cap truncated those. Sized to the whole request, not per-image.
+      RBody  : String (1 .. 12_582_912);
       ML, PL, BL, Err : Natural;
    begin
       Read_Request (Client, Method, Path, RBody, ML, PL, BL, Err);
@@ -611,8 +614,8 @@ procedure OpenAI_Proxy is
 
    --  Worker pool. Each worker serves one client at a time on its own channel,
    --  so a slow generation or a stuck client on one worker never blocks the
-   --  others. Big stack: Serve holds two 1 MB request buffers.
-   task type Worker with Storage_Size => 16 * 1024 * 1024;
+   --  others. Big stack: Serve holds a 12 MiB request buffer (image edits).
+   task type Worker with Storage_Size => 48 * 1024 * 1024;
    task body Worker is
       Client : Socket_Type;
    begin

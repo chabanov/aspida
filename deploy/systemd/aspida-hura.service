@@ -1,0 +1,22 @@
+[Unit]
+Description=Aspida E2EE inference server (Hura / Ornith-35B Q8_0)
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=/opt/aspida-new
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+Environment=ASPIDA_GPU_LIB=/opt/aspida-new/libaspidagpu.so
+Environment=QWEN_MODEL_PATH=/opt/aspida-models/hura:latest
+Environment=ASPIDA_BIND=0.0.0.0
+Environment=ASPIDA_MAX_LOADED_MODELS=1
+Environment=ASPIDA_MAX_TOKENS=8192
+Environment=ASPIDA_MODELS_DIR=/opt/aspida-models
+Environment=ASPIDA_GPU=1
+Environment=ASPIDA_GPU_RESIDENT=1
+Environment=ASPIDA_PREFILL_SETS=1
+Environment=ASPIDA_BATCH_SERVE=1
+ExecStart=/opt/aspida-new/obj/secure_server 8765
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
