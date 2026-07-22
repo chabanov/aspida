@@ -11,8 +11,21 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <string>
 
 static sd_ctx_t* g_ctx = nullptr;
+
+// Optional few-step distillation LoRA (Qwen-Image-Edit-2511-Lightning). When
+// ASPIDA_IMG_LORA names one, it is applied via the sd.cpp "<lora:name:w>"
+// prompt tag and generation switches to the LoRA's regime (cfg 1.0, ~8 steps)
+// — ~5x faster AND higher-fidelity than the 20-step base. Empty => base model.
+static std::string g_lora_path;   // full path to the .safetensors ("" => base)
+static int         g_lora_steps = 8;
+
+static const char* env_or(const char* k, const char* d) {
+    const char* v = getenv(k);
+    return (v && *v) ? v : d;
+}
 
 extern "C" int aspida_img_init(const char* dit, const char* vae,
                                const char* llm, const char* mmproj) {
@@ -26,6 +39,14 @@ extern "C" int aspida_img_init(const char* dit, const char* vae,
     p.flash_attn           = true;
     p.diffusion_flash_attn = true;
     p.model_args           = "qwen_image_zero_cond_t=true";  // 2511 edit mode
+
+    const char* lname = env_or("ASPIDA_IMG_LORA", "");
+    if (lname[0]) {
+        std::string dir = env_or("ASPIDA_IMG_LORA_DIR", "/opt/sdmodels/lora");
+        g_lora_path  = dir + "/" + lname + ".safetensors";
+        g_lora_steps = atoi(env_or("ASPIDA_IMG_LORA_STEPS", "8"));
+        if (g_lora_steps < 1) g_lora_steps = 8;
+    }
     g_ctx = new_sd_ctx(&p);
     return g_ctx ? 0 : -1;
 }
@@ -37,13 +58,29 @@ extern "C" int aspida_img_generate(const char* prompt, const char* ref_path,
     if (!g_ctx) return -1;
     sd_img_gen_params_t g;
     sd_img_gen_params_init(&g);
+
+    // With the Lightning LoRA active, attach it and switch to the distilled
+    // regime: cfg 1.0 (guidance distilled away) + the LoRA's step count.
+    // Without it, honour the caller's steps/cfg on the base model.
+    int   eff_steps = steps;
+    float eff_cfg   = cfg;
+    sd_lora_t lora;
+    if (!g_lora_path.empty()) {
+        lora.is_high_noise = false;
+        lora.multiplier    = 1.0f;
+        lora.path          = g_lora_path.c_str();
+        g.loras            = &lora;
+        g.lora_count       = 1;
+        eff_steps          = g_lora_steps;
+        eff_cfg            = 1.0f;
+    }
     g.prompt                          = prompt;
     g.width                           = W;
     g.height                          = H;
     g.seed                            = seed;
     g.sample_params.sample_method     = EULER_SAMPLE_METHOD;
-    g.sample_params.sample_steps      = steps;
-    g.sample_params.guidance.txt_cfg  = cfg;
+    g.sample_params.sample_steps      = eff_steps;
+    g.sample_params.guidance.txt_cfg  = eff_cfg;
     g.sample_params.flow_shift        = 3.0f;
 
     sd_image_t ref;

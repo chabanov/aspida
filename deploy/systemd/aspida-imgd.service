@@ -12,6 +12,12 @@ Type=simple
 WorkingDirectory=/opt/imggen-native
 Environment=LD_LIBRARY_PATH=/opt/imggen-native:/usr/local/cuda/lib64
 Environment=ASPIDA_IMGD_PORT=8790
+# Few-step distillation LoRA (Qwen-Image-Edit-2511-Lightning): ~5x faster and
+# higher-fidelity than the 20-step base. Filename WITHOUT extension; the wrapper
+# then runs at cfg 1.0 / 8 steps. Clear ASPIDA_IMG_LORA to fall back to base.
+Environment=ASPIDA_IMG_LORA=Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16
+Environment=ASPIDA_IMG_LORA_DIR=/opt/sdmodels/lora
+Environment=ASPIDA_IMG_LORA_STEPS=8
 # Model paths default to /opt/sdmodels/... inside the daemon; override with
 # ASPIDA_IMG_DIT / ASPIDA_IMG_VAE / ASPIDA_IMG_LLM / ASPIDA_IMG_MMPROJ here.
 ExecStart=/opt/imggen-native/aspida_imgd

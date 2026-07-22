@@ -1,5 +1,8 @@
 #!/bin/bash
+# pipefail so a compile error piped through `tail` still fails the build
+# (else g++ silently links a stale .o and "succeeds" with old code).
 set -e
+set -o pipefail
 SD=/root/fattn_bench/stable-diffusion.cpp
 B=$SD/build-pic
 export PATH=/usr/local/cuda/bin:$PATH
