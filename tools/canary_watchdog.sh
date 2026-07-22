@@ -23,5 +23,14 @@ if [ "$OUT2" = "$GOOD" ]; then
   echo "canary ok on retry ($OUT2)"
   exit 0
 fi
+# Empty sha = request failed or engine still in its post-restart model-load
+# window (returns fast with no content, not a 90s timeout). That is NOT
+# state-poisoning — real drift (e.g. the "!!!!" collapse) returns a
+# NON-EMPTY but wrong sha. Restarting on empty caused a spurious restart
+# loop right after every legitimate restart, so treat empty as inconclusive.
+if [ -z "$OUT2" ]; then
+  echo "canary inconclusive (empty response — engine not ready / request failed); no restart"
+  exit 0
+fi
 echo "canary DRIFT (got '$OUT' then '$OUT2', want $GOOD) — restarting aspida-hura"
 systemctl restart aspida-hura

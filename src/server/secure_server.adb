@@ -684,12 +684,17 @@ procedure Secure_Server is
                end;
 
             elsif Tag = Protocol.Tag_Image then
-               --  Native image gen/edit. Body: {"prompt","size"?,"image"?}.
+               --  Native image gen/edit. Body: {"prompt","size"?,("image"|"image_url")?}.
                declare
                   Req     : constant JSON.Value_Ref := JSON.Parse (Prompt);
                   IPrompt : constant String := JSON.As_String (JSON.Get (Req, "prompt"));
                   Size    : constant String := JSON.As_String (JSON.Get (Req, "size"), "1024x1024");
-                  Img_V   : constant JSON.Value_Ref := JSON.Get (Req, "image");
+                  --  Agent img2img sends the ref as "image_url" (data-uri);
+                  --  manual/API callers use "image". Accept either.
+                  Img_V   : constant JSON.Value_Ref :=
+                    (if JSON.Exists (JSON.Get (Req, "image"))
+                     then JSON.Get (Req, "image")
+                     else JSON.Get (Req, "image_url"));
                   X       : constant Natural := Ada.Strings.Fixed.Index (Size, "x");
                   W, H    : Integer := 1024;
                   Ref     : Unbounded_String := Null_Unbounded_String;
