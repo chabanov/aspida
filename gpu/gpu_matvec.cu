@@ -15,6 +15,9 @@
 #include <ctime>
 #include <unistd.h>
 
+#include <csignal>
+#include <cstdarg>
+#include <unistd.h>
 //  ---- Phase-1 abort-poisoning instrumentation (design 2026-07-23) ----------
 //  Env-gated per-op context probe. cudaPeekAtLastError is host-side, non-
 //  blocking and does NOT clear the sticky error, so ctx_check keeps firing
@@ -22,6 +25,31 @@
 //  visible. Off unless ASPIDA_OP_TRACE is set -> zero prod overhead.
 static long g_alloc_fail = 0;          // checked-alloc failures (STATS)
 static size_t g_vram_low_water = ~0ull; // min free VRAM ever seen (STATS)
+//  Last-entered GPU stage. ggml's CUDA_CHECK aborts inside graph_compute, so
+//  post-op probes never run on the faulting op; this survives via SIGABRT.
+static char g_op_stage[160] = "idle";
+static void optrace_abrt_handler(int sig) {
+    //  async-signal-safe: write() of a preformatted buffer only
+    static const char pre[] = "[OPTRACE-ABRT] last stage: ";
+    ssize_t r;
+    r = write(2, pre, sizeof(pre) - 1);
+    r = write(2, g_op_stage, strlen(g_op_stage));
+    r = write(2, "\n", 1);
+    (void) r; (void) sig;
+    signal(SIGABRT, SIG_DFL);
+    raise(SIGABRT);
+}
+static inline void set_stage(const char *fmt, ...) {
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("ASPIDA_OP_TRACE") ? 1 : 0;
+        if (on) signal(SIGABRT, optrace_abrt_handler);
+    }
+    if (!on) return;
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(g_op_stage, sizeof(g_op_stage), fmt, ap);
+    va_end(ap);
+}
 static inline void op_trace(const char *where) {
     static int on = -1;
     if (on < 0) on = getenv("ASPIDA_OP_TRACE") ? 1 : 0;
@@ -1306,6 +1334,7 @@ extern "C" int aspida_gpu_fattn_new(int max_len, int kvd, int nq) {
 // they leak tens of MB VRAM per request. Slot is reused by _new.
 extern "C" void aspida_gpu_fattn_free(int handle) {
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);   // async-pool churn vs ggml computes
+    set_stage("fattn_free handle-teardown");
     cudaDeviceSynchronize();   // in-flight lane/batcher work may still touch st.K/st.V/st.scores
     ctx_check("fattn_free", false);
     if (handle < 0 || handle >= (int) g_fattn.size()) return;
@@ -1628,6 +1657,7 @@ extern "C" void aspida_gpu_fattn_step(
         dqg, dkt, dvt, dqn, dkn, dqa, dga, st.K, st.V,
         nq, nkv, hd, kvd, d_pos1, rd, base, freq_scale, m_scale,
         yarn_on, corr_lo, corr_hi, dff, use_ff, interleaved, sec_total, st.max_len);
+    set_stage("fattn-attend-decode nq=%d pos=%d", nq, pos);
     k_fattn_attend<<<nq, 256>>>(dqa, dga, st.K, st.V, st.scores, datt,
                                 nq, nkv, hd, kvd, d_pos1, st.max_len);
     op_trace("fattn-attend-decode");

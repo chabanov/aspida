@@ -41,6 +41,7 @@ static ggml_tensor *proj_ggml_weight(const uint8_t *dw, int in, int out) {
 static bool aspida_ggml_proj(const uint8_t *dw, int in, int out,
                              const float *dx, float *dy, int B, cudaStream_t st) {
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
+    set_stage("ggml-proj B=%d in=%d out=%d", B, in, out);
     ggml_tensor *w = proj_ggml_weight(dw, in, out);
     if (!w) return false;
     if (!g_proj_ga) g_proj_ga = ggml_gallocr_new(g_gfa.buft);

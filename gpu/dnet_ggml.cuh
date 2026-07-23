@@ -86,6 +86,7 @@ static bool aspida_ggml_dnet_prefill(
         const float *gate, const float *beta, float *osh,
         int khd, int vhd, int q_dim, int nkh, int nv, int qo, int v_dim, int P, cudaStream_t st) {
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
+    set_stage("ggml-dnet-prefill");
     GgmlGDN &S = g_ggdn;
     if (S.P!=P || S.nkh!=nkh || S.nv!=nv || S.khd!=khd || S.vhd!=vhd)
         if (!ggdn_rebuild(S, nkh, nv, khd, vhd, P)) return false;

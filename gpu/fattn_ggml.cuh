@@ -113,6 +113,7 @@ static bool aspida_ggml_fattn_prefill(
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
     GgmlFA &s = g_gfa;
     int len = pos_start + P;
+    set_stage("ggml-fattn-prefill len=%d P=%d nq=%d nkv=%d", len, P, nq, nkv);
     if (s.P != P || s.len != len || s.nq != nq || s.nkv != nkv || s.hd != hd) {
         if (!gfa_rebuild(s, nq, nkv, hd, P, len)) {
             g_ggml_forward_failed = 1;
