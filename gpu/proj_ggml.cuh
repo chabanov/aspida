@@ -18,7 +18,7 @@
 
 struct GgmlProjW { ggml_context *ctx; ggml_backend_buffer_t buf; ggml_tensor *t; };
 static std::unordered_map<const void *, GgmlProjW> g_proj_wmap;
-static ggml_gallocr_t g_proj_ga = nullptr;
+static thread_local ggml_gallocr_t g_proj_ga = nullptr;   // P3: per-thread
 
 //  Wrap (copy) a device Q8_0 weight [out rows x in cols] into a ggml tensor.
 static ggml_tensor *proj_ggml_weight(const uint8_t *dw, int in, int out) {
@@ -28,7 +28,7 @@ static ggml_tensor *proj_ggml_weight(const uint8_t *dw, int in, int out) {
     struct ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
     ggml_context *ctx = ggml_init(ip);
     ggml_tensor *t = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, in, out);
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, g_gfa.be);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, aspida_ggml_wbe());   // P3
     if (!buf) { ggml_free(ctx); g_proj_wmap[dw] = {nullptr,nullptr,nullptr}; return nullptr; }
     size_t bytes = (size_t) out * (in / 32) * 34;
     cudaMemcpy(t->data, dw, bytes, cudaMemcpyDeviceToDevice);
@@ -56,9 +56,9 @@ static bool aspida_ggml_proj(const uint8_t *dw, int in, int out,
     cudaStreamSynchronize(st);                        // x ready on st
     cudaMemcpy(x->data, dx, (size_t) B * in * 4, cudaMemcpyDeviceToDevice);
     //  First-compute warmup transient (same as dnet_ggml): absorb once.
-    static bool proj_warmed = false;
-    if (!proj_warmed) { ggml_backend_graph_compute(g_gfa.be, gr); cudaDeviceSynchronize(); proj_warmed = true; }
-    ggml_backend_graph_compute(g_gfa.be, gr);
+    static thread_local bool proj_warmed = false;   // P3: warm each thread's backend
+    if (!proj_warmed) { ggml_backend_graph_compute(aspida_ggml_be(), gr); cudaDeviceSynchronize(); proj_warmed = true; }
+    ggml_backend_graph_compute(aspida_ggml_be(), gr);
     cudaDeviceSynchronize();                          // y ready before st copies
     op_trace("ggml-proj");
     cudaMemcpyAsync(dy, y->data, (size_t) B * out * 4, cudaMemcpyDeviceToDevice, st);

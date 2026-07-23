@@ -50,11 +50,11 @@ static ggml_tensor *aspida_ggml_upload_q8(const void *w, long bytes,
     if (it != g_ggml_wcache.end()) return it->second.t;
     if (k <= 0 || m <= 0 || n_mats <= 0 || (k % 32) != 0) return nullptr;
     if ((long) (n_mats * m * (k / 32) * 34) != bytes) return nullptr;
-    if (!aspida_ggml_be()) return nullptr;
+    if (!aspida_ggml_wbe()) return nullptr;   // P3: weights on shared backend
     struct ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, true };
     ggml_context *ctx = ggml_init(ip);
     ggml_tensor *t = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, k, m, n_mats);
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, g_gfa.be);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, aspida_ggml_wbe());   // P3
     if (!buf) { ggml_free(ctx); return nullptr; }
     ggml_backend_tensor_set(t, w, 0, (size_t) bytes);   // H2D into ggml memory
     g_ggml_wcache[w] = { ctx, buf, t };
@@ -77,7 +77,7 @@ struct GgmlMoE {
     //  inputs are re-created per call in a throwaway node context; the gallocr
     //  keeps (and reuses) the actual device buffer across calls.
 };
-static GgmlMoE g_gmoe;
+static thread_local GgmlMoE g_gmoe;   // P3: per-thread moe gallocr
 
 //  Routed-experts MoE for one layer-chunk.  x_b: fp32 [P][dim] (device, ready
 //  on stream st).  ids_dev: i32 [P][top_k] (device, ready on st) — expert ids.
@@ -109,7 +109,7 @@ static const float *aspida_ggml_moe_prefill(
     cudaStreamSynchronize(st);
     cudaMemcpy(x->data,  x_b,     (size_t) P * dim * 4,   cudaMemcpyDeviceToDevice);
     cudaMemcpy(ids->data, ids_dev, (size_t) P * top_k * 4, cudaMemcpyDeviceToDevice);
-    ggml_backend_graph_compute(g_gfa.be, gr);   // MMQ int8 tensor-core mul_mat_id
+    ggml_backend_graph_compute(aspida_ggml_be(), gr);   // MMQ int8 (P3: per-thread be)
     cudaDeviceSynchronize();                    // out ready
     op_trace("ggml-moe-prefill");
     //  The gallocr buffer is SHARED across lanes: the caller's combine kernel
