@@ -3784,7 +3784,14 @@ static int pscr_acquire(){
     if(g_prefill_oom){ std::lock_guard<std::mutex> l2(g_ps_mtx); g_ps_busy[idx]=false; g_ps_cv.notify_one(); return -1; }
     return idx;
 }
-static void pscr_release(int idx){ { std::lock_guard<std::mutex> lk(g_ps_mtx); g_ps_busy[idx]=false; } g_ps_cv.notify_one(); }
+static void pscr_release(int idx){
+    //  P2 (2026-07-23): drain this set's stream BEFORE returning it to the pool,
+    //  so the next generation that reuses its buffers (droute/mg_pos/dmoe_g)
+    //  never races this one's in-flight kernels. The normal exit path already
+    //  cudaStreamSynchronize(st) upstream; making it part of release turns an
+    //  incidental invariant into an enforced one (covers abort/early-exit).
+    cudaStreamSynchronize(g_ps[idx].stream);
+    { std::lock_guard<std::mutex> lk(g_ps_mtx); g_ps_busy[idx]=false; } g_ps_cv.notify_one(); }
 
 // Expert-grouped MoE for chunked prefill. The per-position kernel k_moe_gu_p_b
 // re-reads each expert's weight once PER position that routed to it; at a large
@@ -3796,11 +3803,15 @@ static void pscr_release(int idx){ { std::lock_guard<std::mutex> lk(g_ps_mtx); g
 // positions (and their routing slot) that chose expert e; mg_cnt[e] the count.
 __global__ void k_moe_group(const MoeRoute *__restrict__ route_b, int P, int top_k,
                             int *__restrict__ mg_pos, int *__restrict__ mg_k,
-                            int *__restrict__ mg_cnt, int Pstride) {
+                            int *__restrict__ mg_cnt, int Pstride, int n_exp) {
     int p = blockIdx.x * blockDim.x + threadIdx.x; if (p >= P) return;
     const MoeRoute *route = route_b + p;
     for (int k = 0; k < top_k; ++k) {
         int e = route->idx[k];
+        //  P2 (2026-07-23): clamp before e indexes mg_cnt/mg_pos — a corrupted
+        //  route buffer (abort/lane-reuse) with e outside [0,n_exp) would
+        //  atomicAdd/write out of bounds -> poisoned context.
+        e = e < 0 ? 0 : (e >= n_exp ? n_exp - 1 : e);
         int s = atomicAdd(&mg_cnt[e], 1);
         if (s < Pstride) { mg_pos[(size_t) e * Pstride + s] = p; mg_k[(size_t) e * Pstride + s] = k; }
     }
@@ -3948,11 +3959,18 @@ __global__ void k_moe_combine(const float *__restrict__ d_buf, const MoeRoute *_
 //  MoE Phase B helpers (ggml mul_mat_id prefill) -----------------------------
 //  ids for ggml: i32 [P][top_k] from the routing.
 __global__ void k_moe_ids(const MoeRoute *__restrict__ route_b, int32_t *__restrict__ ids,
-                          int top_k, int P) {
+                          int top_k, int P, int n_exp) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= P * top_k) return;
     int p = i / top_k, k = i - p * top_k;
-    ids[i] = route_b[p].idx[k];
+    //  P2 (2026-07-23): clamp the expert id before mul_mat_id indexes expert
+    //  weights with it. The id buffer (S.mg_pos) is reused for position indices
+    //  (0..P) in the grouped path; a race/reuse mixup would feed a position
+    //  (>> n_exp) here -> OOB read of a non-existent expert -> poisoned CUDA
+    //  context. Clamp -> a corrupted request degrades to a wrong-token instead.
+    int e = route_b[p].idx[k];
+    e = e < 0 ? 0 : (e >= n_exp ? n_exp - 1 : e);
+    ids[i] = e;
 }
 //  Combine for the ggml path: routed slots come from ggml's mm_id output
 //  [p][k][dim] (fp32, contiguous), the shared expert from d_buf slot top_k
@@ -4195,7 +4213,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
             if (grouped && !moe_noggml && !moe_ggml_failed && L.ggt && L.top_k <= MOE_MAXK) {
                 //  ids for mul_mat_id — pmg_pos is unused by the ggml path and
                 //  the mode-1 (shared) kernels never read mg_*, so reuse it.
-                k_moe_ids<<<((size_t)P*L.top_k+255)/256,256,0,st>>>(pdroute, (int32_t*)pmg_pos, L.top_k, P);
+                k_moe_ids<<<((size_t)P*L.top_k+255)/256,256,0,st>>>(pdroute, (int32_t*)pmg_pos, L.top_k, P, L.n_exp);
                 //  shared expert via the existing mode-1 grouped kernels
                 //  (h_b/d_buf slot top_k), overlapped on the aspida stream.
                 dim3 grSh((L.intermed+15)/16,(P+15)/16,1);
@@ -4217,7 +4235,7 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
                 //  Expert-grouped tensor-core MoE: bucket positions by expert
                 //  (once), then one GEMM per expert reading its weight once.
                 cudaMemsetAsync(pmg_cnt, 0, (size_t)L.n_exp*4, st);
-                k_moe_group<<<(P+255)/256,256,0,st>>>(pdroute, P, L.top_k, pmg_pos, pmg_k, pmg_cnt, PCH);
+                k_moe_group<<<(P+255)/256,256,0,st>>>(pdroute, P, L.top_k, pmg_pos, pmg_k, pmg_cnt, PCH, L.n_exp);
                 //  gate+up+SwiGLU -> h_b[p][slot]
                 dim3 grR((L.intermed+15)/16, (PCH+15)/16, L.n_exp);
                 k_moe_gu_grouped<<<grR,32,0,st>>>(L.gdw,L.udw, pnxb, pdhb, pmg_pos,pmg_k,pmg_cnt,
