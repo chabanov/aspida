@@ -44,7 +44,7 @@ static bool aspida_ggml_proj(const uint8_t *dw, int in, int out,
     set_stage("ggml-proj B=%d in=%d out=%d", B, in, out);
     ggml_tensor *w = proj_ggml_weight(dw, in, out);
     if (!w) return false;
-    if (!g_proj_ga) g_proj_ga = ggml_gallocr_new(g_wbuft ? g_wbuft : (aspida_ggml_wbe(), g_wbuft));
+    if (!g_proj_ga) g_proj_ga = ggml_gallocr_new(g_gfa.buft);
     struct ggml_init_params ip = { ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true };
     ggml_context *ctx = ggml_init(ip);
     ggml_tensor *x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, in, B); ggml_set_input(x);

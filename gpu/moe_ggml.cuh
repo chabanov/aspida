@@ -90,7 +90,7 @@ static const float *aspida_ggml_moe_prefill(
     if (!gW || !uW || !dW || !aspida_ggml_be()) return nullptr;
     std::lock_guard<std::recursive_mutex> ggml_lk (g_ggml_mu);
     set_stage("ggml-moe-prefill P=%d top_k=%d dim=%d", P, top_k, dim);
-    if (!g_gmoe.ga) g_gmoe.ga = ggml_gallocr_new(g_wbuft ? g_wbuft : (aspida_ggml_wbe(), g_wbuft));
+    if (!g_gmoe.ga) g_gmoe.ga = ggml_gallocr_new(g_gfa.buft);
     //  node context: tensor structs only (no_alloc); ~10 nodes
     struct ggml_init_params ip = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, true };
     ggml_context *ctx = ggml_init(ip);
