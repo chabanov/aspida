@@ -49,18 +49,6 @@ __global__ void k_ggml_apply_gate(float *__restrict__ out, const float *__restri
 }
 
 // ---- persistent ggml FA state (rebuilt when the (P,len) shape changes) ----
-//  P3 (2026-07-23): SHARED persistent backend for WEIGHT tensors only. Weights
-//  are allocated once and their device pointers are valid from any device-0
-//  backend (shared primary CUDA context) — shadow-proven. Compute uses the
-//  per-thread backend below; keeping weights on ONE stable backend avoids a
-//  dangling buffer if a pool thread ever exits.
-static ggml_backend_t g_wbe = nullptr;
-static ggml_backend_buffer_type_t g_wbuft = nullptr;
-static ggml_backend_t aspida_ggml_wbe() {
-    if (!g_wbe) { g_wbe = ggml_backend_cuda_init(0);
-                  if (g_wbe) g_wbuft = ggml_backend_cuda_buffer_type(0); }
-    return g_wbe;
-}
 struct GgmlFA {
     ggml_backend_t be = nullptr;
     ggml_backend_buffer_type_t buft = nullptr;
@@ -70,10 +58,7 @@ struct GgmlFA {
     ggml_tensor *q = nullptr, *k = nullptr, *v = nullptr, *m = nullptr, *out = nullptr;
     int P = -1, len = -1, nq = 0, nkv = 0, hd = 0;
 };
-//  P3: thread_local — each pool worker thread gets its OWN ggml compute
-//  backend + gallocr + fattn graph state, eliminating the shared-state race
-//  (ggml backend/gallocr are not thread-safe). Created once per pool thread.
-static thread_local GgmlFA g_gfa;
+static GgmlFA g_gfa;
 
 //  ggml backends are NOT thread-safe, and the batcher prefills lanes
 //  CONCURRENTLY (per-lane Chain_Prefill threads). Every helper that touches

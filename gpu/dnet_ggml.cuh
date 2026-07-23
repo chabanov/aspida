@@ -56,7 +56,7 @@ struct GgmlGDN {
     ggml_tensor *q=nullptr,*k=nullptr,*v=nullptr,*g=nullptr,*b=nullptr,*s=nullptr,*out=nullptr;
     int P=-1, nkh=0, nv=0, khd=0, vhd=0;
 };
-static thread_local GgmlGDN g_ggdn;   // P3: per-thread dnet state+gallocr
+static GgmlGDN g_ggdn;
 
 static bool ggdn_rebuild(GgmlGDN &S, int nkh, int nv, int khd, int vhd, int P) {
     if (!aspida_ggml_be()) return false;   // reuse the shared ggml cuda backend
@@ -104,9 +104,9 @@ static bool aspida_ggml_dnet_prefill(
     // warmup transient (lazy module/kernel load) that races the result. The op
     // is functional (reads S.s, writes S.out; never mutates its inputs), so we
     // absorb it by computing twice on the first call — the second is warm+correct.
-    static thread_local bool gdn_warmed = false;   // P3: warm each thread's backend
-    if (!gdn_warmed) { ggml_backend_graph_compute(aspida_ggml_be(), S.gr); cudaDeviceSynchronize(); gdn_warmed = true; }
-    ggml_backend_graph_compute(aspida_ggml_be(), S.gr);
+    static bool gdn_warmed = false;
+    if (!gdn_warmed) { ggml_backend_graph_compute(g_gfa.be, S.gr); cudaDeviceSynchronize(); gdn_warmed = true; }
+    ggml_backend_graph_compute(g_gfa.be, S.gr);
     cudaDeviceSynchronize();   // ggml output ready before the st-stream copies (race fix)
     op_trace("ggml-dnet-prefill");
     // out = [vhd, nv, P] (== aspida osh [t][h*vhd+v]); new state = [vhd,vhd,nv] after
