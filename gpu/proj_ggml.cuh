@@ -59,6 +59,7 @@ static bool aspida_ggml_proj(const uint8_t *dw, int in, int out,
     if (!proj_warmed) { ggml_backend_graph_compute(g_gfa.be, gr); cudaDeviceSynchronize(); proj_warmed = true; }
     ggml_backend_graph_compute(g_gfa.be, gr);
     cudaDeviceSynchronize();                          // y ready before st copies
+    op_trace("ggml-proj");
     cudaMemcpyAsync(dy, y->data, (size_t) B * out * 4, cudaMemcpyDeviceToDevice, st);
     cudaStreamSynchronize(st);   // y lives in the shared gallocr pool — consume before unlock
     ggml_free(ctx);

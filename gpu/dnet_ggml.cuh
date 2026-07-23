@@ -107,6 +107,7 @@ static bool aspida_ggml_dnet_prefill(
     if (!gdn_warmed) { ggml_backend_graph_compute(g_gfa.be, S.gr); cudaDeviceSynchronize(); gdn_warmed = true; }
     ggml_backend_graph_compute(g_gfa.be, S.gr);
     cudaDeviceSynchronize();   // ggml output ready before the st-stream copies (race fix)
+    op_trace("ggml-dnet-prefill");
     // out = [vhd, nv, P] (== aspida osh [t][h*vhd+v]); new state = [vhd,vhd,nv] after
     const float *go = (const float *) S.out->data;
     size_t attn_elems = (size_t) vhd * nv * P;

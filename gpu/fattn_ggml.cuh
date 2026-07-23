@@ -130,7 +130,8 @@ static bool aspida_ggml_fattn_prefill(
     k_ggml_build_mask<<<((size_t) P * len + bs - 1) / bs, bs>>>((__half *) s.m->data, len, P, pos_start);
     cudaDeviceSynchronize();                 // inputs ready before ggml (own stream)
     ggml_backend_graph_compute(s.be, s.gr);  // <-- fattn-mma (ncols2=8 + cp_async)
-    cudaDeviceSynchronize();   // ggml output ready (compute runs on ggml's own stream)
+    cudaDeviceSynchronize();
+    op_trace("ggml-fattn-prefill");   // ggml output ready (compute runs on ggml's own stream)
     // ggml FA output layout == aspida [t][h*hd+d]; copy out then fold the gate.
     cudaMemcpy(out, s.out->data, (size_t) P * nq * hd * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaDeviceSynchronize();   // D2D is async on the legacy stream — complete before unlock

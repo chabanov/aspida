@@ -110,6 +110,7 @@ static const float *aspida_ggml_moe_prefill(
     cudaMemcpy(ids->data, ids_dev, (size_t) P * top_k * 4, cudaMemcpyDeviceToDevice);
     ggml_backend_graph_compute(g_gfa.be, gr);   // MMQ int8 tensor-core mul_mat_id
     cudaDeviceSynchronize();                    // out ready
+    op_trace("ggml-moe-prefill");
     //  The gallocr buffer is SHARED across lanes: the caller's combine kernel
     //  runs on `st` AFTER we release g_ggml_mu, by which time another lane may
     //  have reused the buffer. Copy into the caller's private scratch and

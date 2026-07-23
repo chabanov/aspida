@@ -14,6 +14,28 @@
 #include <cstdio>
 #include <ctime>
 #include <unistd.h>
+
+//  ---- Phase-1 abort-poisoning instrumentation (design 2026-07-23) ----------
+//  Env-gated per-op context probe. cudaPeekAtLastError is host-side, non-
+//  blocking and does NOT clear the sticky error, so ctx_check keeps firing
+//  exactly as before; this only NAMES the first op after which the error is
+//  visible. Off unless ASPIDA_OP_TRACE is set -> zero prod overhead.
+static long g_alloc_fail = 0;          // checked-alloc failures (STATS)
+static size_t g_vram_low_water = ~0ull; // min free VRAM ever seen (STATS)
+static inline void op_trace(const char *where) {
+    static int on = -1;
+    if (on < 0) on = getenv("ASPIDA_OP_TRACE") ? 1 : 0;
+    if (!on) return;
+    cudaError_t e = cudaPeekAtLastError();
+    if (e != cudaSuccess) {
+        static volatile int reported = 0;
+        if (!reported) {
+            reported = 1;
+            fprintf(stderr, "[OPTRACE] FIRST context error surfaced after op '%s': %s\n",
+                    where, cudaGetErrorString(e));
+        }
+    }
+}
 #include "fattn_ggml.cuh"   // Phase B: prefill full-attn via llama.cpp fattn-mma (ggml link-and-call)
 #include "moe_ggml.cuh"
 #include "dnet_ggml.cuh"
@@ -413,8 +435,26 @@ static std::unordered_map<const void *, WCacheEnt> g_wcache;
 static uint8_t *upload_weight(const void *w, long wbytes) {
     auto it = g_wcache.find(w);
     if (it != g_wcache.end()) return it->second.dw;
-    uint8_t *dw; cudaMalloc(&dw, wbytes);
-    cudaMemcpy(dw, w, wbytes, cudaMemcpyHostToDevice);
+    uint8_t *dw = nullptr;
+    cudaError_t me = cudaMalloc(&dw, wbytes);
+    if (me != cudaSuccess || !dw) {
+        //  Candidate-A attribution: an unchecked failure here used to hand a
+        //  garbage pointer to the next kernel launch (-> illegal access ->
+        //  poisoned context). Log loudly and return null; the caller's launch
+        //  still faults the same way, but the [ALLOCFAIL] line names the cause.
+        ++g_alloc_fail;
+        size_t mfree = 0, mtot = 0; cudaMemGetInfo(&mfree, &mtot);
+        fprintf(stderr, "[ALLOCFAIL] upload_weight %ld B: %s (vram free %.2f GB)\n",
+                wbytes, cudaGetErrorString(me), mfree / 1073741824.0);
+        return nullptr;
+    }
+    cudaError_t ce = cudaMemcpy(dw, w, wbytes, cudaMemcpyHostToDevice);
+    if (ce != cudaSuccess) {
+        ++g_alloc_fail;
+        fprintf(stderr, "[ALLOCFAIL] upload_weight memcpy %ld B: %s\n",
+                wbytes, cudaGetErrorString(ce));
+    }
+    op_trace("upload_weight");
     g_wcache[w] = { dw, wbytes }; return dw;
 }
 
@@ -1590,6 +1630,7 @@ extern "C" void aspida_gpu_fattn_step(
         yarn_on, corr_lo, corr_hi, dff, use_ff, interleaved, sec_total, st.max_len);
     k_fattn_attend<<<nq, 256>>>(dqa, dga, st.K, st.V, st.scores, datt,
                                 nq, nkv, hd, kvd, d_pos1, st.max_len);
+    op_trace("fattn-attend-decode");
     launch_mv_any(dow, o_k, att, dim, datt, dout);
     cudaMemcpy(out, dout, (size_t) dim * 4, cudaMemcpyDeviceToHost);
 }
@@ -3919,6 +3960,9 @@ extern "C" void aspida_gpu_chain_prefill(int lane, int P, const int *rows, int p
         static long stats_reqs = 0;
         if (pos_start == 0 && ++stats_reqs % 20 == 0) {
             size_t mfree = 0, mtot = 0; cudaMemGetInfo(&mfree, &mtot);
+            if (mfree < g_vram_low_water) g_vram_low_water = mfree;
+            fprintf(stderr, "[STATS+] alloc_fail=%ld vram_low_water=%.2fGB\n",
+                    g_alloc_fail, g_vram_low_water / 1073741824.0);
             fprintf(stderr, "[STATS] reqs=%ld dnet=%zu(free %zu) fattn=%zu(free %zu) "
                     "dsnap=%zu fsnap=%zu vram_free=%.2fGB\n",
                     stats_reqs, g_dnet.size(), g_dnet_free.size(),
